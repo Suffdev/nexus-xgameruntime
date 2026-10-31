@@ -23,6 +23,7 @@ const probes = [
     ['nexus_gamesave-sync', 283], ['nexus_gamesave-transfer', 263], ['nexus_gamesave-files', 25],
     ['nexus_gamesave-file-paths', 55],
     ['nexus_game-invitations', 56, ['--component']],
+    ['nexus_connectivity-events', 359],
 ];
 const binaries = ['xgameruntime.dll', 'test_xgameruntime.exe', 'test_nexus_configuration.exe', 'test_nexus_timer.exe', 'test_nexus_save.exe', 'test_nexus_user.exe', 'test_nexus_async_identity.exe', 'nexus_user-privilege.exe', 'nexus_auth-metadata.exe', 'nexus_store-entitlements.exe', 'nexus_runtime-init.exe', ...probes.map(([name]) => name + '.exe')];
 const hash = file => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
