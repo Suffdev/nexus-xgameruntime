@@ -9,12 +9,21 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <map>
 static unsigned checks, failures, requests, blob_gets, writes;
 static BOOL fail_second;
 static BOOL fail_promote;
 static unsigned metadata_case;
 static unsigned listing_case;
 static const char *listing_override;
+static bool resolve_enabled, reject_lock, fail_backup_copy, fail_conflict_promote, fail_upload_atom, fail_release;
+static unsigned dialog_calls, save_puts, atom_puts, mutation;
+static SaveConflictChoice selected_choice = SaveConflictChoice::Cancel;
+static std::string server_metadata, server_time;
+static std::map<std::string, std::string> server_atoms;
+static char backup_root[2048];
+struct XGameSaveProvider;
+static XGameSaveProvider *conflict_provider;
 static const char *remote_time = "2026-10-22T12:00:00Z";
 #define CHECK( name, expr )                                                                                            \
     do                                                                                                                 \
@@ -36,6 +45,8 @@ public:
     HRESULT DirectRequest( const WCHAR *, const WCHAR *, const WCHAR *, const void *, DWORD, DWORD *, BYTE **,
                            SIZE_T * ) override;
     void CloseUser( XUserHandle ) override {}
+    bool CanResolveConflicts() const override { return resolve_enabled; }
+    SaveConflictChoice ResolveConflict( const WCHAR *details ) override;
 };
 static ClosedSaveTransport closedTransport;
 HRESULT ClosedSaveTransport::Authorization( XUserHandle user, const char *relying, char **auth )
@@ -65,7 +76,29 @@ HRESULT ClosedSaveTransport::SignedRequest( XUserHandle user, const char *method
     if ( strcmp( method, "GET" ) )
     {
         ++writes;
-        return E_ACCESSDENIED;
+        if ( !resolve_enabled ) return E_ACCESSDENIED;
+        if ( strstr( url, "/lock?" ) )
+        {
+            *status = ( !strcmp( method, "PUT" ) && reject_lock ) || ( !strcmp( method, "DELETE" ) && fail_release ) ? 503 : 200;
+            response = "{}";
+        }
+        else if ( !strcmp( method, "PUT" ) && strstr( url, "/Save,savedgame?" ) )
+        {
+            ++save_puts;
+            server_metadata.assign( ( const char * )body, count );
+            const char *time = strstr( url, "clientFileTime=" ) + 15;
+            server_time.assign( time, strcspn( time, "&" ) ); remote_time = server_time.c_str();
+            *status = 200; response = "{}";
+        }
+        else if ( !strcmp( method, "PUT" ) && strstr( url, ",binary" ) )
+        {
+            ++atom_puts;
+            *status = fail_upload_atom ? 503 : 200; response = "{}";
+            if ( !fail_upload_atom ) server_atoms[strrchr( url, '/' ) + 1].assign( ( const char * )body, count );
+        }
+        else return E_ACCESSDENIED;
+        *size = strlen( response ); *out = ( BYTE * )strdup( response );
+        return *out ? S_OK : E_OUTOFMEMORY;
     }
     if ( !strcmp( url, "https://fixture.invalid" ) )
     {
@@ -95,12 +128,12 @@ HRESULT ClosedSaveTransport::SignedRequest( XUserHandle user, const char *method
                                 "{\"atoms\":{\"one\":17}}",
                                 "{\"atoms\":{\"one\":\"\"}}",
                                 "{\"atoms\":{\"one\":\"atom-A\",}}" };
-        response = cases[metadata_case];
+        response = resolve_enabled && !server_metadata.empty() ? server_metadata.c_str() : cases[metadata_case];
     }
     else if ( !strcmp( url, "https://fixture.invalid/atom-A" ) )
     {
         ++blob_gets;
-        response = "remote-A";
+        response = resolve_enabled && mutation == 1 && dialog_calls ? "changedA" : "remote-A";
     }
     else if ( !strcmp( url, "https://fixture.invalid/atom-B" ) )
     {
@@ -113,6 +146,8 @@ HRESULT ClosedSaveTransport::SignedRequest( XUserHandle user, const char *method
         else
             response = "remote-B";
     }
+    else if ( resolve_enabled && server_atoms.count( strrchr( url, '/' ) + 1 ) )
+        response = server_atoms[strrchr( url, '/' ) + 1].c_str();
     else
         return E_ACCESSDENIED;
     if ( *status != 503 ) *status = 200;
@@ -124,6 +159,9 @@ HRESULT ClosedSaveTransport::SignedRequest( XUserHandle user, const char *method
 }
 static BOOL WINAPI test_move( const WCHAR *from, const WCHAR *to, DWORD flags )
 {
+    if ( ( fail_backup_copy && wcsstr( from, L"\\.conflict-" ) && wcsstr( from, L"\\local\\" ) ) ||
+         ( fail_conflict_promote && !( flags & MOVEFILE_REPLACE_EXISTING ) && wcsstr( from, L"\\selected\\" ) ) )
+    { SetLastError( ERROR_DISK_FULL ); return FALSE; }
     if ( fail_promote && !( flags & MOVEFILE_REPLACE_EXISTING ) && wcsstr( from, L"\\.incoming-" ) )
     {
         SetLastError( ERROR_ACCESS_DENIED );
@@ -371,6 +409,172 @@ static void run_provider( BOOL files )
     free( provider.auth );
     CHECK( "no-network-writes", writes == 0 );
 }
+static void check_bytes( XGameSaveProvider *provider, const char *name, const char *expected )
+{
+    char path[2048]; BYTE *data = NULL; SIZE_T size = 0;
+    CHECK( "conflict-blob-path", blob_path( provider, "Save", name, path, sizeof( path ) ) );
+    HRESULT hr = read_file( path, &data, &size );
+    CHECK( "conflict-exact-progress", hr == S_OK && size == strlen( expected ) && !memcmp( data, expected, size ) );
+    free( data );
+}
+
+SaveConflictChoice ClosedSaveTransport::ResolveConflict( const WCHAR *details )
+{
+    ++dialog_calls;
+    CHECK( "conflict-explicit-choice-text", wcsstr( details, L"LOCAL:" ) && wcsstr( details, L"CLOUD:" ) &&
+           wcsstr( details, L"Cancel" ) && wcsstr( details, L"Both versions are backed up" ) );
+    const WCHAR *path = wcsstr( details, L"backed up in:\n" );
+    CHECK( "conflict-backup-location-shown", path != NULL );
+    if ( !path ) return SaveConflictChoice::Cancel;
+    path += wcslen( L"backed up in:\n" );
+    const WCHAR *end = wcsstr( path, L"\n\n" );
+    CHECK( "conflict-backup-location-ended", end != NULL );
+    if ( !end ) return SaveConflictChoice::Cancel;
+    memset( backup_root, 0, sizeof( backup_root ) );
+    CHECK( "conflict-backup-location-utf8", WideCharToMultiByte( CP_UTF8, 0, path, end - path,
+            backup_root, sizeof( backup_root ) - 1, NULL, NULL ) > 0 );
+    XGameSaveProvider local = { 0 }, cloud = { 0 };
+    local.files = cloud.files = conflict_provider->files;
+    snprintf( local.root, sizeof( local.root ), "%s\\local", backup_root );
+    snprintf( cloud.root, sizeof( cloud.root ), "%s\\cloud", backup_root );
+    // Consent is never requested before both real byte copies are durable.
+    check_bytes( &local, "one", "local-A" ); check_bytes( &local, "two", "local-B" );
+    check_bytes( &cloud, "one", "remote-A" ); check_bytes( &cloud, "two", "remote-B" );
+    container_state state = { 0 };
+    CHECK( "conflict-local-backup-index", load_state( &local, "Save", &state ) == S_OK && state.dirty );
+    free_state( &state );
+    CHECK( "conflict-cloud-backup-index", load_state( &cloud, "Save", &state ) == S_OK && !state.dirty );
+    free_state( &state );
+    if ( mutation == 2 ) remote_time = "2026-10-23T12:00:00Z";
+    if ( mutation == 3 )
+    {
+        char file[2048]; blob_path( conflict_provider, "Save", "one", file, sizeof( file ) );
+        CHECK( "conflict-simulated-local-edit", write_file( file, "changed", 7 ) == S_OK );
+    }
+    if ( mutation == 4 ) listing_override = "{\"blobs\":[]}";
+    if ( mutation == 5 ) server_metadata = "{\"atoms\":{\"one\":\"atom-B\",\"two\":\"atom-A\"}}";
+    if ( mutation == 6 ) listing_override = "{\"blobs\":[{\"fileName\":\"Save,savedgame\",\"displayName\":\"Save\",\"clientFileTime\":\"2026-10-22T12:00:00Z\"},{\"fileName\":\"Other,savedgame\",\"clientFileTime\":\"2026-10-22T12:00:00Z\"}]}";
+    return selected_choice;
+}
+
+static void run_conflicts( BOOL files )
+{
+    for ( unsigned scenario = 0; scenario < 20; scenario++ )
+    {
+        WCHAR temp[MAX_PATH]; char path[1024]; XGameSaveProvider provider = { 0 };
+        printf( "CASE conflict %s %u\n", files ? "files" : "blobs", scenario );
+        resolve_enabled = true; reject_lock = fail_backup_copy = fail_conflict_promote = fail_upload_atom = fail_release = false;
+        dialog_calls = save_puts = atom_puts = mutation = 0; backup_root[0] = 0;
+        server_atoms.clear(); server_metadata.clear(); server_time.clear();
+        remote_time = "2026-10-22T12:00:00Z"; listing_override = NULL; listing_case = metadata_case = 0;
+        fail_second = fail_promote = FALSE; SetEnvironmentVariableA( "XODUS_SAVE_SYNC", NULL );
+        selected_choice = scenario == 0 ? SaveConflictChoice::Cancel : scenario == 2 || scenario == 11 || scenario == 14 || scenario == 16 || scenario == 19 ? SaveConflictChoice::Cloud : SaveConflictChoice::Local;
+        if ( scenario >= 3 && scenario <= 7 ) mutation = scenario - 2;
+        if ( scenario == 8 ) reject_lock = true;
+        if ( scenario == 9 ) fail_backup_copy = true;
+        if ( scenario == 10 ) fail_second = TRUE;
+        if ( scenario == 11 ) fail_conflict_promote = true;
+        if ( scenario == 12 ) fail_upload_atom = true;
+        if ( scenario == 13 || scenario == 14 || scenario == 18 ) fail_release = true;
+        if ( scenario == 17 ) selected_choice = static_cast<SaveConflictChoice>( 99 );
+        CHECK( "conflict-temp-path", GetTempPathW( MAX_PATH, temp ) > 0 );
+        CHECK( "conflict-temp-utf8", WideCharToMultiByte( CP_UTF8, 0, temp, -1, path, sizeof( path ), NULL, NULL ) > 0 );
+        snprintf( provider.root, sizeof( provider.root ), "%snexus-conflict-%lu-%I64u-%u-%u", path,
+                  GetCurrentProcessId(), GetTickCount64(), files, scenario );
+        provider.files = files; provider.cloud = TRUE; provider.user = reinterpret_cast<XUserHandle>( 1 );
+        provider.transport = &closedTransport; provider.quota = SAVE_QUOTA;
+        strcpy( provider.base, "https://fixture.invalid" );
+        InitializeCriticalSection( &provider.cs ); create_directories( provider.root ); seed( &provider, TRUE );
+        if ( scenario == 19 )
+        {
+            mutation = 6;
+            container_state other = { 0 }; other.name = strdup( "Other" ); other.display = strdup( "Other" );
+            strcpy( other.remote, "2026-10-22T12:00:00Z" );
+            char folder[2048]; container_dir( &provider, "Other", folder, sizeof( folder ) ); files_mkdir( folder );
+            CHECK( "conflict-other-container-seeded", save_state( &provider, &other ) == S_OK ); free_state( &other );
+        }
+        conflict_provider = &provider;
+        provider.session_lock = scenario == 15 || scenario == 16 || scenario == 18;
+        provider.locked = scenario == 18;
+        HRESULT hr = cloud_sync( &provider );
+        CHECK( "conflict-no-choice-before-backups", dialog_calls == ( scenario == 9 || scenario == 10 || scenario == 18 ? 0u : 1u ) );
+        if ( scenario == 1 || scenario == 2 || scenario == 15 || scenario == 16 || scenario == 19 )
+        {
+            CHECK( "conflict-choice-applied", hr == S_OK );
+            check_bytes( &provider, "one", selected_choice == SaveConflictChoice::Local ? "local-A" : "remote-A" );
+            check_bytes( &provider, "two", selected_choice == SaveConflictChoice::Local ? "local-B" : "remote-B" );
+            container_state state = { 0 };
+            CHECK( "conflict-resolved-clean", load_state( &provider, "Save", &state ) == S_OK && !state.dirty );
+            free_state( &state );
+            CHECK( "conflict-cloud-write-only-for-local-choice", save_puts == ( selected_choice == SaveConflictChoice::Local ? 1u : 0u ) );
+            CHECK( "conflict-upload-includes-all-local-blobs", atom_puts == ( selected_choice == SaveConflictChoice::Local ? 2u : 0u ) );
+            if ( selected_choice == SaveConflictChoice::Local )
+            {
+                bool a = false, b = false;
+                for ( const auto &item : server_atoms ) { a |= item.second == "local-A"; b |= item.second == "local-B"; }
+                CHECK( "conflict-cloud-has-actual-local-progress", a && b );
+            }
+            CHECK( "conflict-next-start-no-loop", cloud_sync( &provider ) == S_OK && dialog_calls == 1 );
+        }
+        else if ( scenario == 13 || scenario == 14 )
+        {
+            CHECK( "conflict-release-failure-reported", FAILED( hr ) );
+            CHECK( "conflict-release-retains-lock", provider.locked );
+            CHECK( "conflict-release-retains-notification", provider.session_uploaded == ( scenario == 13 ) );
+            check_bytes( &provider, "one", scenario == 13 ? "local-A" : "remote-A" );
+            check_bytes( &provider, "two", scenario == 13 ? "local-B" : "remote-B" );
+            container_state state = { 0 };
+            CHECK( "conflict-release-retry-baseline", load_state( &provider, "Save", &state ) == S_OK &&
+                   state.dirty == ( scenario == 13 ) && !strcmp( state.remote, remote_time ) );
+            free_state( &state );
+            fail_release = false;
+            CHECK( "conflict-release-retry-succeeds", cloud_unlock( &provider, FALSE ) == S_OK && !provider.locked );
+            CHECK( "conflict-release-retry-no-conflict", cloud_sync( &provider ) == S_OK && dialog_calls == 1 );
+        }
+        else
+        {
+            CHECK( "conflict-cancel-change-failure-rejected", FAILED( hr ) );
+            CHECK( "conflict-failure-never-commits-cloud", save_puts == 0 );
+            check_bytes( &provider, "one", mutation == 3 ? "changed" : "local-A" );
+            check_bytes( &provider, "two", "local-B" );
+            container_state state = { 0 };
+            CHECK( "conflict-failure-keeps-dirty", load_state( &provider, "Save", &state ) == S_OK && state.dirty );
+            free_state( &state );
+        }
+        if ( backup_root[0] )
+        {
+            XGameSaveProvider backup = { 0 }; backup.files = files;
+            snprintf( backup.root, sizeof( backup.root ), "%s\\local", backup_root );
+            check_bytes( &backup, "one", "local-A" ); check_bytes( &backup, "two", "local-B" );
+            snprintf( backup.root, sizeof( backup.root ), "%s\\cloud", backup_root );
+            check_bytes( &backup, "one", "remote-A" ); check_bytes( &backup, "two", "remote-B" );
+        }
+        CHECK( "conflict-session-contract-preserved", provider.session_lock ==
+               ( scenario == 15 || scenario == 16 || scenario == 18 ) );
+        if ( scenario == 15 || scenario == 16 )
+        {
+            CHECK( "conflict-session-still-owns-lock", provider.locked );
+            CHECK( "conflict-session-defers-upload-notification", provider.session_uploaded == ( scenario == 15 ) );
+            provider.session_lock = FALSE;
+            CHECK( "conflict-session-final-release", cloud_unlock( &provider, FALSE ) == S_OK && !provider.locked );
+        }
+        unsigned count = 0;
+        if ( scenario == 19 ) enumerate_local( &provider, []( XGameSaveProvider *, const char *, void *context ) -> BOOL {
+            ++*( unsigned * )context; return TRUE;
+        }, &count );
+        else enumerate_local( &provider, count_local, &count );
+        CHECK( "conflict-recovery-never-uploaded-as-container", count == ( scenario == 19 ? 2u : 1u ) );
+        if ( scenario == 19 )
+        {
+            container_state other = { 0 };
+            CHECK( "conflict-fresh-list-prevents-stale-deletion", load_state( &provider, "Other", &other ) == S_OK && !other.dirty );
+            free_state( &other );
+        }
+        free( provider.auth ); DeleteCriticalSection( &provider.cs );
+    }
+    resolve_enabled = false; listing_override = NULL;
+}
+
 int main( void )
 {
     InitializeLogging();
@@ -380,6 +584,8 @@ int main( void )
     CHECK( "actual-config", nexus::InitializeGameConfiguration( &options ) == S_OK );
     run_provider( FALSE );
     run_provider( TRUE );
+    run_conflicts( FALSE );
+    run_conflicts( TRUE );
     printf( "CHECKS %u FAILURES %u\n", checks, failures );
     return failures ? 1 : 0;
 }

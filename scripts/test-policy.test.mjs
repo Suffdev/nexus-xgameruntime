@@ -429,3 +429,14 @@ test('64-bit atomics use Atomic64 so i386 accesses stay locked under FEX without
     assert.equal(i386.match(/__atomic_compare_exchange_n\(/g).length,4);
     assert.ok(i386.includes('"nexus-fex-safe-i386-atomics-v1"'));
 });
+
+
+test('save conflicts retain explicit choices, backups and native regression coverage',()=>{
+    const entry=JSON.parse(read('tests/Nexus/save-contracts.lock.json')).sync;
+    const source=read('tests/Nexus/gamesave-sync.cpp');
+    const added=source.slice(source.indexOf('static void check_bytes'));
+    assert.deepEqual([...added.matchAll(/\bCHECK\(\s*"(conflict-[^"\n]+)"/g)].map(m=>m[1]),entry.conflictChecks);
+    assert.match(read('scripts/test-component.mjs'),new RegExp("\\['nexus_gamesave-sync', "+entry.conflictNativeChecks+"\\]"));
+    assert.match(source,/run_conflicts\( FALSE \)/);assert.match(source,/run_conflicts\( TRUE \)/);
+    assert.doesNotMatch(read('src/xgameruntime.def'),/SaveConflict|ResolveConflict/);
+});

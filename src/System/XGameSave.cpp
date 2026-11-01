@@ -120,6 +120,8 @@ struct XGameSaveProvider
     struct save_upload *uploads;
 };
 
+static SaveConflictChoice show_save_conflict( const WCHAR *details );
+
 class DefaultSaveTransport final : public SaveTransport
 {
 public:
@@ -142,6 +144,8 @@ public:
     {
         x_user_impl->XUserCloseHandle( user );
     }
+    bool CanResolveConflicts() const override { return true; }
+    SaveConflictChoice ResolveConflict( const WCHAR *details ) override { return show_save_conflict( details ); }
 };
 static SaveTransport &GetSaveTransport( XGameSaveProvider *provider )
 {
@@ -1348,6 +1352,10 @@ static HRESULT force_upload( struct XGameSaveProvider *provider, struct containe
 
 static HRESULT files_cloud_download( struct XGameSaveProvider *, const char *, const char *, const char * );
 
+static HRESULT files_validate_download( const container_state *state );
+
+#include "GameSave/Conflicts.h"
+
 static HRESULT cloud_sync( struct XGameSaveProvider *provider )
 {
     struct remote_container *remote = NULL;
@@ -1358,11 +1366,13 @@ static HRESULT cloud_sync( struct XGameSaveProvider *provider )
     BYTE *buffer;
     DWORD status;
     HRESULT hr;
+    BOOL refresh = FALSE;
 
     if ( FAILED( hr = GetSaveTransport( provider )
                           .Authorization( provider->user, "http://xboxlive.com", &provider->auth ) ) )
         return hr;
 
+list_again:
     if ( FAILED( hr = cloud_request( provider, "GET", "", NULL, NULL, 0, &status, &buffer, &size ) ) ) return hr;
     if ( status == 404 )
     {
@@ -1460,9 +1470,11 @@ static HRESULT cloud_sync( struct XGameSaveProvider *provider )
         BOOL remoteChanged = !exists || strcmp( state.remote, remote[i].time ? remote[i].time : "" );
         if ( exists && state.dirty && remoteChanged && mode == SYNC_AUTO )
         {
-            /* Never silently overwrite either side of a save conflict. */
+            /* Only an explicit choice with recovery copies can replace either
+             * side. A cancelled/stale/failed resolution retains local data. */
+            hr = resolve_cloud_conflict( provider, &state, remote[i].display, remote[i].time );
             free_state( &state );
-            hr = E_GS_CONTAINER_NOT_IN_SYNC;
+            refresh = SUCCEEDED( hr );
             goto done;
         }
         if ( mode == SYNC_UPLOAD )
@@ -1488,7 +1500,7 @@ static HRESULT cloud_sync( struct XGameSaveProvider *provider )
 done:
     if ( remote )
     {
-        if ( SUCCEEDED( hr ) )
+        if ( SUCCEEDED( hr ) && !refresh )
         {
             struct local_sync_context sync = { remote, S_OK };
             enumerate_local( provider, sync_local_callback, &sync );
@@ -1508,6 +1520,13 @@ done:
         struct local_sync_context sync = { &empty, S_OK };
         enumerate_local( provider, sync_local_callback, &sync );
         hr = sync.hr;
+    }
+    if ( refresh )
+    {
+        // The choice may have taken minutes. Never delete or upload other
+        // containers using the listing from before the user made a choice.
+        remote = NULL; count = capacity = listed = 0; refresh = FALSE;
+        goto list_again;
     }
     return hr;
 }
