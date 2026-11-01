@@ -172,7 +172,8 @@ test('save migration preserves every original assertion and exercises actual C++
     {
         const source=read('tests/Nexus/gamesave-'+name+'.cpp');
         const checks=[...source.matchAll(/\bCHECK\(\s*"([^"\n]+)"/g)].map(m=>m[1]);
-        assert.deepEqual(checks.filter(x=>x!=='actual-config'),lock[name].originalChecks);
+        // New regressions may extend the fixture; every original assertion stays in order.
+        assert.deepEqual(checks.filter(x=>lock[name].originalChecks.includes(x)),lock[name].originalChecks);
         assert.equal(lock[name].requiredNativeChecks,lock[name].originalNativeChecks+1);
         assert.ok(source.includes('#include "../../src/System/XGameSave.cpp"'));
         assert.doesNotMatch(source,/#include "xgamesave\.c"|IXUserImplVtbl/);
@@ -193,6 +194,15 @@ test('file saves retain all ABI assertions and load their actual C++ helper DLL'
     assert.match(read('scripts/test-component.mjs'),/save-child-drain/);
     for(const file of ['scripts/test-component.mjs','scripts/test-authentication.mjs','scripts/test-saves.mjs'])
         assert.match(read(file),/XUSER_\|NEXUS_\|XGAMERUNTIME_/);
+});
+
+test('save commit recovery retains dirty revisions and tests cold relaunch conflicts',()=>{
+    const fixture=read('tests/Nexus/gamesave-commit.cpp');
+    assert.match(fixture,/#include "gamesave-transfer.cpp"/);
+    for(const label of ['commit-release-error-visible','commit-relaunch-can-sync','commit-real-conflict-preserved','commit-real-conflict-no-write','newer-local-not-acknowledged','acknowledged-remote-base-durable','newer-local-relaunch-upload'])
+        assert.ok(fixture.includes('"'+label+'"'),label);
+    assert.match(read('tests/CMakeLists.txt'),/foreach\(probe sync transfer commit\)/);
+    assert.match(read('scripts/test-component.mjs'),/\['nexus_gamesave-commit', 107\]/);
 });
 
 test('save result APIs never inspect opaque async storage or share operation identities',()=>{
@@ -276,7 +286,7 @@ test('current game licenses require proof-bound genuine SKU and support safe can
     assert.doesNotMatch(source,/4102444800|0010|isActive\s*=\s*TRUE[\s\S]*return E_NOTIMPL/);
     assert.match(read('src/System/Store/Entitled.h').replace(/\s+/g,''),/InterlockedCompareExchange\(&context->terminal,1,0\)/);
     assert.match(read('tests/Nexus/store-entitlements.cpp').replace(/\s+/g,''),/VirtualFree\(block,0,MEM_RELEASE\)/);
-    assert.match(read('scripts/test-store.mjs'),/\['store-entitlements',992\]/);
+    assert.match(read('scripts/test-store.mjs'),/\['store-entitlements',1116\]/);
     assert.match(read('scripts/test-store.mjs'),/realAccounts:false,realCloud:false,fullRuntime:false/);
 });
 
@@ -418,4 +428,15 @@ test('64-bit atomics use Atomic64 so i386 accesses stay locked under FEX without
     assert.doesNotMatch(i386,/__atomic_(load|store|exchange|fetch)|std::atomic</);
     assert.equal(i386.match(/__atomic_compare_exchange_n\(/g).length,4);
     assert.ok(i386.includes('"nexus-fex-safe-i386-atomics-v1"'));
+});
+
+
+test('save conflicts retain explicit choices, backups and native regression coverage',()=>{
+    const entry=JSON.parse(read('tests/Nexus/save-contracts.lock.json')).sync;
+    const source=read('tests/Nexus/gamesave-sync.cpp');
+    const added=source.slice(source.indexOf('static void check_bytes'));
+    assert.deepEqual([...added.matchAll(/\bCHECK\(\s*"(conflict-[^"\n]+)"/g)].map(m=>m[1]),entry.conflictChecks);
+    assert.match(read('scripts/test-component.mjs'),new RegExp("\\['nexus_gamesave-sync', "+entry.conflictNativeChecks+"\\]"));
+    assert.match(source,/run_conflicts\( FALSE \)/);assert.match(source,/run_conflicts\( TRUE \)/);
+    assert.doesNotMatch(read('src/xgameruntime.def'),/SaveConflict|ResolveConflict/);
 });

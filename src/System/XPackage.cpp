@@ -28,6 +28,7 @@
 #include "Package/Chunks.h"
 #include "Package/Monitors.h"
 #include "Package/InstalledEvents.h"
+#include "Package/Mount.h"
 
 static HRESULT enumerate_current_package( XPackageKind, XPackageEnumerationScope, void *,
                                           XPackageEnumerationCallback * );
@@ -349,26 +350,25 @@ BOOLEAN WINAPI XPackageImpl::XPackageUnregisterPackageInstalled( XTaskQueueRegis
 HRESULT WINAPI XPackageImpl::XPackageMountLegacy( const char *identifier, XPackageMountHandle *mount )
 {
 
-    if ( !mount ) return E_INVALIDARG;
-    *mount = NULL;
-    if ( !identifier || !identifier[0] ) return E_INVALIDARG;
-    /* Do not turn an installation lookup into a licensed mount. */
-    return E_NOTIMPL;
+    return package_mount_legacy( identifier, mount );
 }
 
 HRESULT WINAPI XPackageImpl::XPackageGetMountPathSize( XPackageMountHandle mount, SIZE_T *pathSize )
 {
 
-    return E_NOTIMPL;
+    return package_mount_path_size( mount, pathSize );
 }
 
 HRESULT WINAPI XPackageImpl::XPackageGetMountPath( XPackageMountHandle mount, SIZE_T pathSize, char *path )
 {
 
-    return E_NOTIMPL;
+    return package_mount_path( mount, pathSize, path );
 }
 
-void WINAPI XPackageImpl::XPackageCloseMountHandle( XPackageMountHandle mount ) {}
+void WINAPI XPackageImpl::XPackageCloseMountHandle( XPackageMountHandle mount )
+{
+    package_mount_close( mount );
+}
 
 HRESULT WINAPI XPackageImpl::XPackageGetIdentifierLegacy( const char *store, SIZE_T size, char *identifier )
 {

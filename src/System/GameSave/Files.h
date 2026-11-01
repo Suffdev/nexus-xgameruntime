@@ -405,6 +405,16 @@ static HRESULT files_export( struct XGameSaveProvider *provider, const char *fol
 
 /* Download into a distinct cache tree. A truncated/failed transfer must not
  * erase the last usable cache. Successful swaps retain a recovery backup. */
+static HRESULT files_validate_download( const container_state *state )
+{
+    if ( !files_component( state->name, TRUE ) ) return E_GS_INVALID_CONTAINER_NAME;
+    for ( UINT32 i = 0; i < state->count; i++ )
+        if ( !files_component( state->blobs[i].name, FALSE ) || state->blobs[i].size > FILES_MAX_BLOB ||
+             strlen( state->name ) + strlen( state->blobs[i].name ) + 1 >= 260 )
+            return E_GS_INVALID_CONTAINER_NAME;
+    return S_OK;
+}
+
 static HRESULT files_cloud_download( struct XGameSaveProvider *provider, const char *name, const char *display,
                                      const char *remoteTime )
 {
@@ -425,10 +435,7 @@ static HRESULT files_cloud_download( struct XGameSaveProvider *provider, const c
     if ( SUCCEEDED( hr ) )
     {
         hr = load_state( provider, name, &state );
-        for ( UINT32 i = 0; SUCCEEDED( hr ) && i < state.count; i++ )
-            if ( !files_component( state.blobs[i].name, FALSE ) || state.blobs[i].size > FILES_MAX_BLOB ||
-                 strlen( name ) + strlen( state.blobs[i].name ) + 1 >= 260 )
-                hr = E_GS_INVALID_CONTAINER_NAME;
+        if ( SUCCEEDED( hr ) ) hr = files_validate_download( &state );
         free_state( &state );
     }
     if ( !container_dir( provider, name, incoming, sizeof( incoming ) ) ) hr = E_OUTOFMEMORY;
