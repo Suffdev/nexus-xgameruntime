@@ -361,6 +361,18 @@ static struct entitled_snapshot *test_metadata( void )
         CHECK( "only-owned-sku",
                snapshot->products[0].skusCount == 1 && !strcmp( snapshot->products[0].skus[0].skuId, "0010" ) );
         CHECK( "normal-sku-not-trial", !snapshot->products[0].skus[0].isTrial );
+        /* An enumerating consumer may copy the currency string directly even
+         * when collection metadata does not include a purchasable price. */
+        const auto &product_price = snapshot->products[0].price;
+        const auto &sku_price = snapshot->products[0].skus[0].price;
+        CHECK( "entitled-product-currency-readable", product_price.currencyCode != nullptr );
+        CHECK( "entitled-sku-currency-readable", sku_price.currencyCode != nullptr );
+        CHECK( "entitled-product-currency-unknown", product_price.currencyCode &&
+               std::string( product_price.currencyCode ).empty() );
+        CHECK( "entitled-sku-currency-unknown", sku_price.currencyCode &&
+               std::string( sku_price.currencyCode ).empty() );
+        CHECK( "entitled-no-invented-price", !product_price.formattedPrice[0] &&
+               !sku_price.formattedPrice[0] && !product_price.isOnSale && !sku_price.isOnSale );
         CHECK( "xml-escape", !strcmp( snapshot->products[0].title, "Synthetic & add-on" ) );
         CHECK( "package-metadata", snapshot->products[0].hasDigitalDownload );
         CHECK( "developer-offer-token", !strcmp( snapshot->products[0].inAppOfferToken, "Synthetic offer" ) );

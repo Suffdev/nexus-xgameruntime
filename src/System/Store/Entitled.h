@@ -359,6 +359,14 @@ static HRESULT entitled_parse( const char *response, UINT16 size, struct entitle
         XStoreProduct *p;
         if ( node->type != XML_ELEMENT_NODE || strcmp( ( char * )node->name, "Product" ) ) continue;
         p = &snapshot->products[i++];
+        /* Collection metadata carries ownership, not an advertised price.
+         * Keep the string readable without inventing a currency or offer. */
+        p->price.currencyCode = strdup( "" );
+        if ( !p->price.currencyCode )
+        {
+            hr = E_OUTOFMEMORY;
+            goto done;
+        }
         p->storeId = entitled_text( node, "StoreId" );
         p->title = entitled_text( node, "Title" );
         p->description = entitled_text( node, "Description" );
@@ -416,6 +424,12 @@ static HRESULT entitled_parse( const char *response, UINT16 size, struct entitle
             XStoreSku *s;
             if ( sku_node->type != XML_ELEMENT_NODE || strcmp( ( char * )sku_node->name, "Sku" ) ) continue;
             s = &p->skus[j++];
+            s->price.currencyCode = strdup( "" );
+            if ( !s->price.currencyCode )
+            {
+                hr = E_OUTOFMEMORY;
+                goto done;
+            }
             s->skuId = entitled_text( sku_node, "SkuId" );
             s->title = entitled_text( sku_node, "Title" );
             s->description = entitled_text( sku_node, "Description" );
