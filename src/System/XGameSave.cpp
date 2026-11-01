@@ -1353,7 +1353,7 @@ static HRESULT cloud_sync( struct XGameSaveProvider *provider )
     struct remote_container *remote = NULL;
     enum sync_mode mode;
     const char *blobs, *item;
-    UINT32 count = 0, capacity = 0;
+    UINT32 count = 0, capacity = 0, listed = 0;
     SIZE_T size;
     BYTE *buffer;
     DWORD status;
@@ -1392,6 +1392,7 @@ static HRESULT cloud_sync( struct XGameSaveProvider *provider )
             hr = HRESULT_FROM_WIN32( ERROR_INVALID_DATA );
             break;
         }
+        listed++;
         if ( ( comma = strstr( fileName, ",savedgame" ) ) && !comma[10] )
         {
             *comma = 0;
@@ -1443,8 +1444,13 @@ static HRESULT cloud_sync( struct XGameSaveProvider *provider )
             break;
         }
     }
+    if ( SUCCEEDED( hr ) ) hr = save_listing_complete( ( char * )buffer, listed );
     free( buffer );
-    if ( FAILED( hr ) ) goto done;
+    if ( FAILED( hr ) )
+    {
+        WARN( "cloud save listing is incomplete or invalid; local saves retained, hr %#lx\n", hr );
+        goto done;
+    }
 
     mode = sync_mode();
     for ( UINT32 i = 0; i < count; i++ )

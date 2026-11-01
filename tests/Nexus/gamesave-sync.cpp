@@ -14,6 +14,7 @@ static BOOL fail_second;
 static BOOL fail_promote;
 static unsigned metadata_case;
 static unsigned listing_case;
+static const char *listing_override;
 static const char *remote_time = "2026-10-22T12:00:00Z";
 #define CHECK( name, expr )                                                                                            \
     do                                                                                                                 \
@@ -84,6 +85,7 @@ HRESULT ClosedSaveTransport::SignedRequest( XUserHandle user, const char *method
                                     "{\"blobs\":[]}garbage" };
             response = cases[listing_case];
         }
+        if ( listing_override ) response = listing_override;
     }
     else if ( !strcmp( url, "https://fixture.invalid/Save,savedgame" ) )
     {
@@ -238,6 +240,77 @@ static void run_provider( BOOL files )
         provider.auth = NULL;
     }
     listing_case = 0;
+    /* An omitted container is deletion evidence only for an authoritative,
+     * complete listing. Exercise the actual sync path before it touches data. */
+    const char *partial[] = {
+        "{\"blobs\":[],\"pagingInfo\":{\"continuationToken\":\"next-page\",\"totalItems\":1}}",
+        "{\"blobs\":[],\"pagingInfo\":{\"continuationToken\":null,\"totalItems\":1}}",
+        "{\"blobs\":[],\"pagingInfo\":{\"continuationToken\":\"\",\"totalItems\":1}}",
+        "{\"blobs\":[],\"pagingInfo\":{\"continuationToken\":\"next-page\"}}",
+        "{\"blobs\":[],\"pagingInfo\":{\"continuationToken\":17}}",
+        "{\"blobs\":[],\"pagingInfo\":{\"totalItems\":-1}}",
+        "{\"blobs\":[],\"pagingInfo\":{\"totalItems\":1.5}}",
+        "{\"blobs\":[],\"pagingInfo\":{\"totalItems\":\"0\"}}",
+        "{\"blobs\":[],\"pagingInfo\":{\"totalItems\":18446744073709551616}}",
+        "{\"blobs\":[],\"pagingInfo\":[]}",
+        "{\"blobs\":[],\"pagingInfo\":false}",
+        "{\"blobs\":[],\"pagingInfo\":{\"continuationToken\":null,\"continuationToken\":\"next-page\"}}",
+        "{\"blobs\":[],\"pagingInfo\":{\"totalItems\":0,\"totalItems\":1}}",
+        "{\"blobs\":[],\"pagingInfo\":null,\"pagingInfo\":{\"continuationToken\":\"next\"}}",
+        "{\"blobs\":[],\"blobs\":[]}",
+        "{\"blobs\":[],\"pagingInfo\":{\"totalItems\":0 \"continuationToken\":\"\"}}",
+        "{\"blobs\":[],\"pagingInfo\":{\"totalItems\":0,}}",
+        "{\"blobs\":[],\"pagingInfo\":{\"totalItems\":null}}",
+        "{\"blobs\":[],\"pagingInfo\":{\"continuationToken\":false}}",
+        "{\"blobs\":[],\"pagingInfo\":{\"totalItems\":0e0}}",
+        "{\"blobs\":[] \"pagingInfo\":{\"totalItems\":0}}",
+    };
+    for ( const char *mode : { "auto", "download", "upload" } )
+        for ( unsigned dirty = 0; dirty < 2; dirty++ )
+            for ( unsigned i = 0; i < ARRAY_SIZE( partial ); i++ )
+            {
+                printf( "CASE incomplete listing %u dirty=%u mode=%s\n", i, dirty, mode );
+                seed( &provider, dirty );
+                listing_override = partial[i];
+                blob_gets = writes = requests = 0;
+                SetEnvironmentVariableA( "XODUS_SAVE_SYNC", mode );
+                hr = cloud_sync( &provider );
+                CHECK( "incomplete-listing-fails-closed", FAILED( hr ) );
+                CHECK( "incomplete-listing-no-data-requests", requests == 1 && !blob_gets && !writes );
+                preserved( &provider, dirty );
+                free( provider.auth );
+                provider.auth = NULL;
+            }
+    const char *complete[] = {
+        "{\"blobs\":[{\"fileName\":\"Save,savedgame\",\"clientFileTime\":\"2026-10-20T12:00:00Z\"}],\"pagingInfo\":{\"continuationToken\":null,\"totalItems\":1}}",
+        "{\"blobs\":[{\"fileName\":\"Save,savedgame\",\"clientFileTime\":\"2026-10-20T12:00:00Z\"}],\"pagingInfo\":{\"continuationToken\":\"\",\"totalItems\":1}}",
+        "{\"blobs\":[{\"fileName\":\"Save,savedgame\",\"clientFileTime\":\"2026-10-20T12:00:00Z\"}],\"pagingInfo\":null}",
+        "{\"blobs\":[{\"fileName\":\"Save,savedgame\",\"clientFileTime\":\"2026-10-20T12:00:00Z\"},{\"fileName\":\"Other,binary\"}],\"pagingInfo\":{\"totalItems\":2}}",
+    };
+    SetEnvironmentVariableA( "XODUS_SAVE_SYNC", "auto" );
+    for ( const char *listing : complete )
+    {
+        listing_override = listing;
+        seed( &provider, FALSE );
+        blob_gets = writes = requests = 0;
+        CHECK( "complete-page-syncs", cloud_sync( &provider ) == S_OK );
+        CHECK( "complete-page-no-mutations", requests == 1 && !blob_gets && !writes );
+        preserved( &provider, FALSE );
+        free( provider.auth );
+        provider.auth = NULL;
+    }
+    listing_override = "{\"blobs\":[],\"pagingInfo\":{\"continuationToken\":null,\"totalItems\":0}}";
+    seed( &provider, FALSE );
+    CHECK( "complete-empty-syncs", cloud_sync( &provider ) == S_OK );
+    {
+        struct container_state removed;
+        hr = load_state( &provider, "Save", &removed );
+        CHECK( "complete-empty-honors-remote-deletion", FAILED( hr ) );
+        free_state( &removed );
+    }
+    free( provider.auth );
+    provider.auth = NULL;
+    listing_override = NULL;
     seed( &provider, TRUE );
     fail_second = FALSE;
     blob_gets = writes = 0;
