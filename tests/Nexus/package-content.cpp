@@ -375,6 +375,34 @@ static void actual_runtime( const char *child, BOOL knownGame = TRUE )
                    kind == XPackageKind::Content );
         latest->Release();
     }
+    WCHAR mount_root[MAX_PATH], mount_layout[MAX_PATH];
+    content_join( folder, L"own-one", mount_root );
+    content_join( mount_root, L"layout_00000001-1111-2222-3333-444444444444.xml", mount_layout );
+    write_text( mount_layout, "<Package><Chunk><FileGroup SourcePath=\".\" Include=\"MicrosoftGame.Config\" DestinationPath=\"\\\"/>"
+        "<FileGroup SourcePath=\".\" Include=\"*.png\" DestinationPath=\"\\\"/></Chunk></Package>" );
+    content_package mount_content{};
+    package_mount_plan mount_mapping;
+    CHECK( "runtime-mount-source-projection-valid", content_load( mount_root, &mount_content ) &&
+        package_mount_read_plan( mount_content, mount_mapping ) == S_OK && mount_mapping.files.size() == 2 );
+    // A deliberately invalid bridge configuration fails before socket creation.
+    // This exercises the production mount/license path without an account or a
+    // service, and must never be treated as proof of an owned DLC.
+    char absent_transport[65];
+    CHECK( "runtime-mount-no-inherited-transport", !GetEnvironmentVariableA( "XODUS_BRIDGE_PORT", absent_transport, sizeof( absent_transport ) ) &&
+        !GetEnvironmentVariableA( "XODUS_BRIDGE_KEY", absent_transport, sizeof( absent_transport ) ) );
+    CHECK( "runtime-mount-closed-transport", SetEnvironmentVariableA( "XODUS_BRIDGE_PORT", "0" ) &&
+        SetEnvironmentVariableA( "XODUS_BRIDGE_KEY", "0000000000000000000000000000000000000000000000000000000000000000" ) );
+    XPackageMountHandle no_license = ( XPackageMountHandle )1;
+    HRESULT mount_error = package->XPackageMountLegacy( "00000001111122223333444444444444", &no_license );
+    printf( "MOUNT_NO_LICENSE hr=%08lx\n", mount_error );
+    CHECK( "runtime-mount-no-license-no-handle", mount_error == E_INVALIDARG && !no_license );
+    CHECK( "runtime-mount-restores-transport", SetEnvironmentVariableA( "XODUS_BRIDGE_PORT", NULL ) &&
+        SetEnvironmentVariableA( "XODUS_BRIDGE_KEY", NULL ) );
+    SIZE_T invalid_size = 123;
+    CHECK( "runtime-mount-foreign-size", package->XPackageGetMountPathSize( ( XPackageMountHandle )1, &invalid_size ) == E_INVALIDARG && !invalid_size );
+    char invalid_path[8] = "keep";
+    CHECK( "runtime-mount-foreign-path", package->XPackageGetMountPath( ( XPackageMountHandle )1, sizeof( invalid_path ), invalid_path ) == E_INVALIDARG && !invalid_path[0] );
+    package->XPackageCloseMountHandle( ( XPackageMountHandle )1 );
     expected = 2;
     visits = 0;
     stop_early = FALSE;
@@ -412,6 +440,169 @@ static void actual_runtime( const char *child, BOOL knownGame = TRUE )
     }
 }
 
+struct mount_fixture_license
+{
+    BOOL active = TRUE;
+    unsigned closes = 0;
+};
+static BOOL mount_fixture_valid( void *context ) { return ( ( mount_fixture_license * )context )->active; }
+static void mount_fixture_close( void *context ) { ++( ( mount_fixture_license * )context )->closes; }
+static package_mount_right mount_fixture_right( mount_fixture_license &license )
+{
+    return { &license, mount_fixture_valid, mount_fixture_close };
+}
+static BOOL mount_fixture_bytes( const std::wstring &path, const char *expected )
+{
+    HANDLE file = CreateFileW( path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL, OPEN_EXISTING, 0, NULL );
+    if ( file == INVALID_HANDLE_VALUE ) return FALSE;
+    char bytes[128]{}; DWORD size = 0;
+    BOOL ok = ReadFile( file, bytes, sizeof( bytes ) - 1, &size, NULL ) && size == strlen( expected ) &&
+        !memcmp( bytes, expected, size );
+    CloseHandle( file ); return ok;
+}
+static void test_mount_projection()
+{
+    configure( main_config );
+    fixture( L"mount-content", "Nexus.Mount", "D00000000009", "Nexus.Base", "B00000000001", 0x30, FALSE );
+    WCHAR root[MAX_PATH], source[MAX_PATH], path[MAX_PATH], layout[MAX_PATH];
+    content_join( folder, L"mount-content", root );
+    content_join( root, L"SRC", source );
+    CHECK( "mount-source-directory", CreateDirectoryW( source, NULL ) );
+    content_join( source, L"alpha.dat", path ); write_text( path, "alpha content" );
+    content_join( source, L"beta.dat", path ); write_text( path, "beta content" );
+    content_join( root, L"Extras", source );
+    CHECK( "mount-extra-directory", CreateDirectoryW( source, NULL ) );
+    content_join( source, L"gamma.dat", path ); write_text( path, "gamma content" );
+    content_join( root, L"layout_00000030-1111-2222-3333-444444444444.xml", layout );
+    const char *mapping = "<Package><Chunk Id=\"1000\"><FileGroup SourcePath=\"SRC\" Include=\"*.dat\" DestinationPath=\"\\Data\"/>"
+        "<FileGroup SourcePath=\"Extras\" Include=\"gamma.dat\" DestinationPath=\"\\Data\"/></Chunk></Package>";
+    write_text( layout, mapping );
+    content_package package{};
+    CHECK( "mount-valid-content", content_load( root, &package ) && package.content );
+    package_mount_plan plan;
+    CHECK( "mount-plan-projects-groups", package_mount_read_plan( package, plan ) == S_OK &&
+        plan.groups == 2 && plan.files.size() == 3 );
+    CHECK( "mount-plan-preserves-source-names", plan.destinations.count( L"Data\\alpha.dat" ) &&
+        plan.destinations.count( L"Data\\beta.dat" ) && plan.destinations.count( L"Data\\gamma.dat" ) );
+    mount_fixture_license unmanaged;
+    XPackageMountHandle unmanaged_mount = ( XPackageMountHandle )1;
+    CHECK( "mount-unmanaged-copy-refused", package_mount_create( package, mount_fixture_right( unmanaged ),
+        &unmanaged_mount ) == E_NOTIMPL && !unmanaged_mount && unmanaged.closes == 1 );
+    WCHAR workspace[MAX_PATH];
+    content_join( folder, L"mount-workspace", workspace );
+    CHECK( "mount-managed-workspace-created", CreateDirectoryW( workspace, NULL ) );
+    CHECK( "mount-managed-workspace-published", SetEnvironmentVariableW( L"XODUS_MOUNT_ROOT", workspace ) );
+    mount_fixture_license first, second;
+    XPackageMountHandle mount = NULL, other = NULL;
+    CHECK( "mount-create-private-view", package_mount_create( package, mount_fixture_right( first ), &mount ) == S_OK && mount );
+    CHECK( "mount-second-independent-view", package_mount_create( package, mount_fixture_right( second ), &other ) == S_OK && other && mount != other );
+    if ( mount && other )
+    {
+        IXPackageImpl *api = GetPackageInterface();
+        SIZE_T size = 0;
+        CHECK( "mount-size-includes-terminator", api->XPackageGetMountPathSize( mount, &size ) == S_OK && size > 1 && size < MAX_PATH * 4 );
+        std::vector<char> buffer( size + 2, '!' );
+        CHECK( "mount-small-buffer-refused", api->XPackageGetMountPath( mount, size - 1, buffer.data() + 1 ) == E_NOT_SUFFICIENT_BUFFER &&
+            buffer[0] == '!' && !buffer[1] && buffer[size] == '!' );
+        CHECK( "mount-path-buffer-guards", api->XPackageGetMountPath( mount, size, buffer.data() + 1 ) == S_OK &&
+            buffer[0] == '!' && !buffer[size] && buffer[size+1] == '!' );
+        WCHAR wide[MAX_PATH];
+        CHECK( "mount-path-utf8", MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, buffer.data() + 1, -1, wide, MAX_PATH ) > 0 );
+        std::wstring view = wide;
+        CHECK( "mount-view-under-managed-root", view.rfind( std::wstring( workspace ) + L"\\", 0 ) == 0 );
+        CHECK( "mount-view-not-original-root", CompareStringOrdinal( root, -1, view.c_str(), -1, TRUE ) != CSTR_EQUAL );
+        CHECK( "mount-alpha-mapped", mount_fixture_bytes( view + L"\\Data\\alpha.dat", "alpha content" ) );
+        CHECK( "mount-beta-mapped", mount_fixture_bytes( view + L"\\Data\\beta.dat", "beta content" ) );
+        CHECK( "mount-groups-merged", mount_fixture_bytes( view + L"\\Data\\gamma.dat", "gamma content" ) );
+        CHECK( "mount-physical-source-hidden", GetFileAttributesW( ( view + L"\\SRC" ).c_str() ) == INVALID_FILE_ATTRIBUTES );
+        CHECK( "mount-unmapped-metadata-hidden", GetFileAttributesW( ( view + L"\\MicrosoftGame.Config" ).c_str() ) == INVALID_FILE_ATTRIBUTES );
+        CHECK( "mount-assets-readonly", GetFileAttributesW( ( view + L"\\Data\\alpha.dat" ).c_str() ) & FILE_ATTRIBUTE_READONLY );
+        HANDLE write = CreateFileW( ( view + L"\\Data\\alpha.dat" ).c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+            NULL, OPEN_EXISTING, 0, NULL );
+        CHECK( "mount-write-denied", write == INVALID_HANDLE_VALUE );
+        if ( write != INVALID_HANDLE_VALUE ) CloseHandle( write );
+        char other_path[MAX_PATH * 4];
+        CHECK( "mount-independent-path", package_mount_path( other, sizeof( other_path ), other_path ) == S_OK &&
+            strcmp( other_path, buffer.data() + 1 ) );
+        HANDLE original_file = CreateFileW( ( std::wstring( root ) + L"\\SRC\\alpha.dat" ).c_str(), FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL );
+        HANDLE projected_file = CreateFileW( ( view + L"\\Data\\alpha.dat" ).c_str(), FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL );
+        BY_HANDLE_FILE_INFORMATION original_info{}, projected_info{};
+        BOOL inspected = original_file != INVALID_HANDLE_VALUE && projected_file != INVALID_HANDLE_VALUE &&
+            GetFileInformationByHandle( original_file, &original_info ) && GetFileInformationByHandle( projected_file, &projected_info );
+        CHECK( "mount-projection-not-a-hardlink", inspected && ( original_info.dwVolumeSerialNumber != projected_info.dwVolumeSerialNumber ||
+            original_info.nFileIndexHigh != projected_info.nFileIndexHigh || original_info.nFileIndexLow != projected_info.nFileIndexLow ) );
+        if ( original_file != INVALID_HANDLE_VALUE ) CloseHandle( original_file );
+        if ( projected_file != INVALID_HANDLE_VALUE ) CloseHandle( projected_file );
+        CHECK( "mount-cleanup-fixture-link", CreateSymbolicLinkW( ( view + L"\\outside-link" ).c_str(),
+            ( std::wstring( root ) + L"\\SRC" ).c_str(), SYMBOLIC_LINK_FLAG_DIRECTORY | SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE ) );
+        first.active = FALSE;
+        size = 99;
+        CHECK( "mount-expired-license-no-path-size", api->XPackageGetMountPathSize( mount, &size ) == E_ACCESSDENIED && !size );
+        char denied[16] = "sentinel";
+        CHECK( "mount-expired-license-no-path", api->XPackageGetMountPath( mount, sizeof( denied ), denied ) == E_ACCESSDENIED && !denied[0] );
+        api->XPackageCloseMountHandle( mount );
+        CHECK( "mount-close-removes-private-view", GetFileAttributesW( view.c_str() ) == INVALID_FILE_ATTRIBUTES && first.closes == 1 );
+        CHECK( "mount-close-keeps-other-view", package_mount_path( other, sizeof( other_path ), other_path ) == S_OK && !second.closes );
+        api->XPackageCloseMountHandle( mount );
+        CHECK( "mount-close-idempotent", first.closes == 1 );
+        package_mount_close( other );
+        CHECK( "mount-second-license-closed", second.closes == 1 );
+    }
+    else
+    {
+        package_mount_close( mount ); package_mount_close( other );
+    }
+    SIZE_T absent = 123;
+    CHECK( "mount-foreign-size-refused", package_mount_path_size( ( XPackageMountHandle )1, &absent ) == E_INVALIDARG && !absent );
+    char absent_path[8] = "keep";
+    CHECK( "mount-foreign-path-refused", package_mount_path( ( XPackageMountHandle )1, sizeof( absent_path ), absent_path ) == E_INVALIDARG && !absent_path[0] );
+    package_mount_close( ( XPackageMountHandle )1 );
+    CHECK( "mount-original-alpha-preserved", mount_fixture_bytes( std::wstring( root ) + L"\\SRC\\alpha.dat", "alpha content" ) );
+    CHECK( "mount-original-gamma-preserved", mount_fixture_bytes( std::wstring( root ) + L"\\Extras\\gamma.dat", "gamma content" ) );
+    CHECK( "mount-original-not-made-readonly", !( GetFileAttributesW( ( std::wstring( root ) + L"\\SRC\\alpha.dat" ).c_str() ) & FILE_ATTRIBUTE_READONLY ) );
+    mount_fixture_license unowned; unowned.active = FALSE;
+    mount = ( XPackageMountHandle )1;
+    CHECK( "mount-unowned-rejected", package_mount_create( package, mount_fixture_right( unowned ), &mount ) == E_ACCESSDENIED && !mount && unowned.closes == 1 );
+    content_package base = package; base.content = FALSE;
+    mount_fixture_license base_right;
+    CHECK( "mount-game-package-rejected", package_mount_create( base, mount_fixture_right( base_right ), &mount ) == E_ACCESSDENIED && !mount && base_right.closes == 1 );
+    std::wstring normalized;
+    CHECK( "mount-logical-root", package_mount_relative( "\\", TRUE, normalized ) && normalized.empty() );
+    CHECK( "mount-logical-subdirectory", package_mount_relative( "\\Data\\Maps", TRUE, normalized ) && normalized == L"Data\\Maps" );
+    CHECK( "mount-destination-traversal-rejected", !package_mount_relative( "\\..\\outside", TRUE, normalized ) );
+    CHECK( "mount-drive-destination-rejected", !package_mount_relative( "C:\\outside", TRUE, normalized ) );
+    CHECK( "mount-unc-destination-rejected", !package_mount_relative( "\\\\server\\share", TRUE, normalized ) );
+    CHECK( "mount-trailing-dot-rejected", !package_mount_relative( "Data.\\x", TRUE, normalized ) );
+    CHECK( "mount-source-traversal-rejected", !package_mount_relative( "SRC\\..\\outside", FALSE, normalized ) );
+    write_text( layout, "<Package><Chunk><FileGroup SourcePath=\"SRC\" Include=\"*.dat\" DestinationPath=\"\\..\\outside\"/></Chunk></Package>" );
+    mount_fixture_license invalid;
+    CHECK( "mount-invalid-layout-no-publication", package_mount_create( package, mount_fixture_right( invalid ), &mount ) == E_INVALIDARG && !mount && invalid.closes == 1 );
+    content_join( root, L"Alias", path );
+    CHECK( "mount-source-link-fixture", CreateSymbolicLinkW( path, ( std::wstring( root ) + L"\\SRC" ).c_str(),
+        SYMBOLIC_LINK_FLAG_DIRECTORY | SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE ) );
+    write_text( layout, "<Package><Chunk><FileGroup SourcePath=\"Alias\" Include=\"*.dat\" DestinationPath=\"\\Data\"/></Chunk></Package>" );
+    mount_fixture_license linked;
+    CHECK( "mount-linked-source-rejected", FAILED( package_mount_create( package, mount_fixture_right( linked ), &mount ) ) &&
+        !mount && linked.closes == 1 );
+    CHECK( "mount-source-link-unlinked", RemoveDirectoryW( path ) );
+    content_join( root, L"Extras\\alpha.dat", path ); write_text( path, "different asset" );
+    write_text( layout, "<Package><Chunk><FileGroup SourcePath=\"SRC\" Include=\"alpha.dat\" DestinationPath=\"\\Data\"/>"
+        "<FileGroup SourcePath=\"Extras\" Include=\"alpha.dat\" DestinationPath=\"\\data\"/></Chunk></Package>" );
+    mount_fixture_license collision;
+    CHECK( "mount-destination-case-collision-refused", package_mount_create( package, mount_fixture_right( collision ), &mount ) ==
+        HRESULT_FROM_WIN32( ERROR_INVALID_DATA ) && !mount && collision.closes == 1 );
+    CHECK( "mount-no-original-deletion-through-link", mount_fixture_bytes( std::wstring( root ) + L"\\SRC\\alpha.dat", "alpha content" ) );
+    write_text( layout, mapping );
+    CHECK( "mount-registry-drained", !package_mounts );
+    CHECK( "mount-managed-workspace-cleared", SetEnvironmentVariableW( L"XODUS_MOUNT_ROOT", NULL ) );
+    CHECK( "mount-managed-workspace-empty", RemoveDirectoryW( workspace ) );
+    // Keep subsequent discovery independent of this additional synthetic package.
+    DeleteFileW( layout );
+}
+
 int main( int argc, char **argv )
 {
     WCHAR temporary[MAX_PATH];
@@ -427,6 +618,7 @@ int main( int argc, char **argv )
     helpers();
     actual_runtime( NULL );
     current_fixtures();
+    test_mount_projection();
     printf( "CHECKS %u FAILURES %u\n", checks, failures );
     return failures ? 1 : 0;
 }

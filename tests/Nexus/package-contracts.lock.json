@@ -9,8 +9,8 @@
   },
   "reviewedProbeUpdates": {
     "package-legacy-probe.c": {
-      "sha256": "12a9a7e5b7803a1c4353b3fa1efd4ee361a109e2e9a582ad3de0feb5c68991c1",
-      "reason": "Installed-content callbacks are supported: check all inherited slots, unregister, no replay and invalid inputs instead of the obsolete E_NOTIMPL expectation."
+      "sha256": "8e4ca535e7f741b5f11610b44fa5ff241a4068d7801ebe51394bd3de2de0c6fd",
+      "reason": "Installed-content callbacks are supported: check all inherited slots, unregister, no replay and invalid inputs instead of the obsolete E_NOTIMPL expectation.; licensed content mounts reject a base game with E_ACCESSDENIED, retaining the raw inherited mount slot and null-handle assertion; adds matching Appx identity/application metadata so this denial exercises an actual base package instead of a registration-only directory"
     }
   }
 }

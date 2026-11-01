@@ -41,6 +41,8 @@ static const GUID current_iids[] = {
 static const char config[] = "<Game><Identity Name=\"Nexus.Legacy\" Publisher=\"CN=Probe\" Version=\"1.2.3.4\"/>"
     "<StoreId>B00000000001</StoreId><TitleId>DEADBEEF</TitleId>"
     "<ShellVisuals DefaultDisplayName=\"Legacy fixture\"/></Game>";
+static const char appx[] = "<Package><Identity Name=\"Nexus.Legacy\" Publisher=\"CN=Probe\" Version=\"1.2.3.4\"/>"
+    "<Applications><Application Id=\"Probe\" Executable=\"probe.exe\"/></Applications></Package>";
 static const char id[] = "0123456789abcdef0123456789abcdef";
 static unsigned checks, failures, visits;
 #define CHECK(x) do { ++checks; if (!(x)) { ++failures; printf("FAIL %d: %s\n", __LINE__, #x); } } while (0)
@@ -100,7 +102,7 @@ static void exercise(Package *package)
     CHECK(identifier(package, "B00000000002", 33, buffer + 1) == E_INVALIDARG);
     CHECK(identifier(package, NULL, 33, buffer + 1) == E_INVALIDARG);
     CHECK(identifier(package, "B00000000001", 33, NULL) == E_INVALIDARG);
-    CHECK(((Mount)package->vtable[23])(package, id, &mount) == E_NOTIMPL && !mount);
+    CHECK(((Mount)package->vtable[23])(package, id, &mount) == E_ACCESSDENIED && !mount);
     CHECK(((Mount)package->vtable[23])(package, id, NULL) == E_INVALIDARG);
     /* Every inherited registration slot supports installed-content events. */
     for (i = 0; i < sizeof(slots)/sizeof(slots[0]); ++i) {
@@ -167,7 +169,7 @@ int main(int argc, char **argv)
 {
     if (argc == 2 && !strcmp(argv[1], "--child")) child();
     else {
-        WCHAR temporary[MAX_PATH], root[MAX_PATH], own[MAX_PATH], exe[MAX_PATH], xml[MAX_PATH], layout[MAX_PATH], command[MAX_PATH + 32];
+        WCHAR temporary[MAX_PATH], root[MAX_PATH], own[MAX_PATH], exe[MAX_PATH], xml[MAX_PATH], manifest[MAX_PATH], layout[MAX_PATH], command[MAX_PATH + 32];
         STARTUPINFOW startup = {0}; PROCESS_INFORMATION process = {0};
         DWORD code = 1, wait;
         CHECK(GetTempPathW(MAX_PATH, temporary) && GetTempFileNameW(temporary, L"nxl", 0, root));
@@ -176,8 +178,9 @@ int main(int argc, char **argv)
         CHECK(GetModuleFileNameW(NULL, own, MAX_PATH));
         swprintf(exe, MAX_PATH, L"%ls\\probe.exe", root);
         swprintf(xml, MAX_PATH, L"%ls\\MicrosoftGame.config", root);
+        swprintf(manifest, MAX_PATH, L"%ls\\appxmanifest.xml", root);
         swprintf(layout, MAX_PATH, L"%ls\\layout_01234567-89ab-cdef-0123-456789abcdef.xml", root);
-        CHECK(CopyFileW(own, exe, TRUE)); CHECK(write_text(xml, config)); CHECK(write_text(layout, "<Package/>"));
+        CHECK(CopyFileW(own, exe, TRUE)); CHECK(write_text(xml, config)); CHECK(write_text(manifest, appx)); CHECK(write_text(layout, "<Package/>"));
         startup.cb = sizeof(startup); swprintf(command, MAX_PATH + 32, L"\"%ls\" --child", exe);
         CHECK(CreateProcessW(exe, command, NULL, NULL, FALSE, 0, NULL, root, &startup, &process));
         if (process.hProcess) {
@@ -186,7 +189,7 @@ int main(int argc, char **argv)
             CHECK(GetExitCodeProcess(process.hProcess, &code) && code == 0);
             CloseHandle(process.hThread); CloseHandle(process.hProcess);
         }
-        CHECK(DeleteFileW(exe)); CHECK(DeleteFileW(xml)); CHECK(DeleteFileW(layout)); CHECK(RemoveDirectoryW(root));
+        CHECK(DeleteFileW(exe)); CHECK(DeleteFileW(xml)); CHECK(DeleteFileW(manifest)); CHECK(DeleteFileW(layout)); CHECK(RemoveDirectoryW(root));
     }
     printf("CHECKS %u FAILURES %u (legacy package)\n", checks, failures);
     return failures ? 1 : 0;
