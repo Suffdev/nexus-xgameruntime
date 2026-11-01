@@ -56,6 +56,72 @@ static BOOL save_json_object_complete( const char *data, SIZE_T size )
     return complete && !quoted && !depth;
 }
 
+/* A first page is not an authoritative deletion set. Until continuation
+ * requests are supported, reject explicit pagination before any local/cloud
+ * mutation. Missing paging metadata retains the legacy service contract. */
+static HRESULT save_listing_complete( const char *response, UINT32 listed )
+{
+    const char *p = response, *value, *paging = NULL;
+    char *key;
+    UINT blobs = 0, pages = 0, tokens = 0, totals = 0;
+    BOOL pending = FALSE;
+    UINT64 total = 0;
+    const HRESULT invalid = HRESULT_FROM_WIN32( ERROR_INVALID_DATA );
+
+    while ( json_object_next( &p, &key, &value ) )
+    {
+        if ( !strcmp( key, "blobs" ) ) blobs++;
+        if ( !strcmp( key, "pagingInfo" ) )
+        {
+            paging = value;
+            pages++;
+        }
+        free( key );
+        p = json_ws( p );
+        if ( *p != ',' && *p != '}' ) return invalid;
+        if ( *p == ',' && *json_ws( p + 1 ) != '"' ) return invalid;
+    }
+    if ( blobs != 1 || pages > 1 || *json_ws( p ) != '}' ) return invalid;
+    if ( !paging ) return S_OK;
+    if ( !strncmp( paging, "null", 4 ) && strchr( ",}", *json_ws( paging + 4 ) ) ) return S_OK;
+    if ( *paging != '{' ) return invalid;
+
+    p = paging;
+    while ( json_object_next( &p, &key, &value ) )
+    {
+        BOOL token = !strcmp( key, "continuationToken" ), count = !strcmp( key, "totalItems" );
+        free( key );
+        p = json_ws( p );
+        if ( *p != ',' && *p != '}' ) return invalid;
+        if ( *p == ',' && *json_ws( p + 1 ) != '"' ) return invalid;
+        if ( token )
+        {
+            if ( ++tokens > 1 ) return invalid;
+            if ( *value == '"' )
+                pending = value[1] != '"';
+            else if ( strncmp( value, "null", 4 ) || !strchr( ",}", *json_ws( value + 4 ) ) )
+                return invalid;
+        }
+        if ( count )
+        {
+            const char *number = value;
+            if ( ++totals > 1 || *number < '0' || *number > '9' ) return invalid;
+            if ( *number == '0' && number[1] >= '0' && number[1] <= '9' ) return invalid;
+            while ( *number >= '0' && *number <= '9' )
+            {
+                total = total * 10 + *number++ - '0';
+                if ( total > UINT_MAX ) return invalid;
+            }
+            if ( !strchr( ",}", *json_ws( number ) ) ) return invalid;
+        }
+    }
+    p = json_ws( p );
+    if ( *p == '{' ) p = json_ws( p + 1 );
+    if ( *p != '}' ) return invalid;
+    if ( pending || ( totals && total > listed ) ) return HRESULT_FROM_WIN32( ERROR_MORE_DATA );
+    return totals && total != listed ? invalid : S_OK;
+}
+
 static HRESULT cloud_download( struct XGameSaveProvider *provider, const char *name, const char *display,
                                const char *remote_time )
 {

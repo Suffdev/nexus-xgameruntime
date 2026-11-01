@@ -363,140 +363,23 @@ HRESULT WINAPI XNetworkingImpl::XNetworkingGetConnectivityHint( XNetworkingConne
     return hr;
 }
 
-struct connectivity_registration
+static HRESULT connectivity_read_hint( XNetworkingConnectivityHint *hint )
 {
-    struct connectivity_registration *next;
-    LONG ref;
-    UINT64 token;
-    XTaskQueueHandle queue;
-    void *context;
-    XNetworkingConnectivityHintChangedCallback *callback;
-    BOOL removed, running;
-    DWORD callback_thread;
-};
-
-static SRWLOCK connectivity_lock = SRWLOCK_INIT;
-static CONDITION_VARIABLE connectivity_changed = CONDITION_VARIABLE_INIT;
-static struct connectivity_registration *connectivity_registrations;
-static UINT64 connectivity_next_token;
-
-static void connectivity_release( struct connectivity_registration *registration )
-{
-    if ( !InterlockedDecrement( &registration->ref ) )
-    {
-        ( x_threading_impl )->XTaskQueueCloseHandle( registration->queue );
-        free( registration );
-    }
+    return GetNetworkingInterface()->XNetworkingGetConnectivityHint( hint );
 }
-
-static void CALLBACK connectivity_initial_callback( void *context, BOOLEAN canceled )
-{
-    auto registration = static_cast<connectivity_registration *>( context );
-    XNetworkingConnectivityHint hint{};
-    BOOL deliver;
-
-    AcquireSRWLockExclusive( &connectivity_lock );
-    deliver = !canceled && !registration->removed;
-    if ( deliver )
-    {
-        registration->running = TRUE;
-        registration->callback_thread = GetCurrentThreadId();
-    }
-    ReleaseSRWLockExclusive( &connectivity_lock );
-    if ( deliver )
-    {
-        GetNetworkingInterface()->XNetworkingGetConnectivityHint( &hint );
-        registration->callback( registration->context, &hint );
-        AcquireSRWLockExclusive( &connectivity_lock );
-        registration->running = FALSE;
-        WakeAllConditionVariable( &connectivity_changed );
-        ReleaseSRWLockExclusive( &connectivity_lock );
-    }
-    connectivity_release( registration );
-}
+#include "Networking/ConnectivityEvents.h"
 
 HRESULT WINAPI XNetworkingImpl::XNetworkingRegisterConnectivityHintChanged(
     XTaskQueueHandle queue, void *context, XNetworkingConnectivityHintChangedCallback *callback,
     XTaskQueueRegistrationToken *token )
 {
-    struct connectivity_registration *registration;
-    HRESULT hr;
-
-    ( void )0;
-    if ( !callback || !token ) return E_POINTER;
-    token->token = 0;
-    if ( !( registration = static_cast<std::remove_reference_t<decltype( registration )>>(
-                calloc( 1, sizeof( *registration ) ) ) ) )
-        return E_OUTOFMEMORY;
-    if ( queue )
-        hr = ( x_threading_impl )->XTaskQueueDuplicateHandle( queue, &registration->queue );
-    else
-        hr = ( x_threading_impl )->XTaskQueueGetCurrentProcessTaskQueue( &registration->queue ) ? S_OK : E_FAIL;
-    if ( FAILED( hr ) )
-    {
-        free( registration );
-        return hr;
-    }
-    registration->context = context;
-    registration->callback = callback;
-    /* Local call, registration list and queued notification each own a ref.
-     * An Immediate completion may unregister itself before Submit returns. */
-    registration->ref = 3;
-    AcquireSRWLockExclusive( &connectivity_lock );
-    registration->token = token->token = ++connectivity_next_token;
-    registration->next = connectivity_registrations;
-    connectivity_registrations = registration;
-    ReleaseSRWLockExclusive( &connectivity_lock );
-    /* GDK guarantees an initial notification on the completion port. Without
-     * it middleware can wait indefinitely before making its first request. */
-    hr = ( x_threading_impl )
-             ->XTaskQueueSubmitCallback( registration->queue, XTaskQueuePort::Completion, registration,
-                                         connectivity_initial_callback );
-    if ( FAILED( hr ) )
-    {
-        struct connectivity_registration **cursor;
-        BOOL removed = FALSE;
-        AcquireSRWLockExclusive( &connectivity_lock );
-        for ( cursor = &connectivity_registrations; *cursor && *cursor != registration; cursor = &( *cursor )->next )
-            ;
-        if ( *cursor )
-        {
-            *cursor = registration->next;
-            registration->removed = TRUE;
-            removed = TRUE;
-        }
-        ReleaseSRWLockExclusive( &connectivity_lock );
-        if ( removed ) connectivity_release( registration ); /* list */
-        connectivity_release( registration );                /* submission failed */
-        token->token = 0;
-    }
-    connectivity_release( registration ); /* local */
-    return hr;
+    return connectivity_register( queue, context, callback, token );
 }
 
 BOOLEAN WINAPI XNetworkingImpl::XNetworkingUnregisterConnectivityHintChanged( XTaskQueueRegistrationToken token,
                                                                               BOOLEAN wait )
 {
-    struct connectivity_registration **cursor, *registration;
-    ( void )0;
-    AcquireSRWLockExclusive( &connectivity_lock );
-    for ( cursor = &connectivity_registrations; *cursor && ( *cursor )->token != token.token;
-          cursor = &( *cursor )->next )
-        ;
-    if ( !( registration = *cursor ) )
-    {
-        ReleaseSRWLockExclusive( &connectivity_lock );
-        return FALSE;
-    }
-    *cursor = registration->next;
-    registration->removed = TRUE;
-    /* Queued notifications are suppressed, so a manual queue need not be
-     * pumped to unregister. Wait only for a callback already in progress. */
-    while ( wait && registration->running && registration->callback_thread != GetCurrentThreadId() )
-        SleepConditionVariableSRW( &connectivity_changed, &connectivity_lock, INFINITE, 0 );
-    ReleaseSRWLockExclusive( &connectivity_lock );
-    connectivity_release( registration );
-    return TRUE;
+    return connectivity_unregister( token, wait );
 }
 
 HRESULT WINAPI XNetworkingImpl::XNetworkingQueryConfigurationSetting(

@@ -13,16 +13,18 @@ const probes = [
     ['nexus_token-endpoint', 36],
     ['nexus_store-context', 61],
     ['nexus_store-license-map', 90],
+    ['nexus_store-public-fetch', 98],
     ['nexus_user-device-association',6309], ['nexus_user-audio',334], ['nexus_windows-account-metadata',1713],
     ['nexus_game-relaunch',64], ['nexus_game-relaunch-search', 116], ['nexus_async-provider-contract',116], ['nexus_system_device_id', 332], ['nexus_async-schedule', 16],
     ['nexus_async-completion-lifetime', 2805], ['nexus_taskqueue-teardown', 20],
     ['nexus_taskqueue-close', 1137], ['nexus_taskqueue-contract', 1374],
-    ['nexus_package-identity', 15], ['nexus_package-legacy', 139], ['nexus_package-chunks', 312],
-    ['nexus_package-content',332], ['nexus_package-installed',110], ['nexus_package-monitors', 362], ['nexus_package-progress-bytes', 115],
+    ['nexus_package-identity', 15], ['nexus_package-legacy', 175], ['nexus_package-chunks', 312],
+    ['nexus_package-content',423], ['nexus_package-installed',110], ['nexus_package-monitors', 362], ['nexus_package-progress-bytes', 115],
     ['nexus_package-selection', 750],
-    ['nexus_gamesave-sync', 283], ['nexus_gamesave-transfer', 263], ['nexus_gamesave-files', 25],
+    ['nexus_gamesave-sync', 4073], ['nexus_gamesave-conflict-ui', 51], ['nexus_gamesave-transfer', 263], ['nexus_gamesave-commit', 107], ['nexus_gamesave-files', 25],
     ['nexus_gamesave-file-paths', 55],
     ['nexus_game-invitations', 56, ['--component']],
+    ['nexus_connectivity-events', 359],
 ];
 const binaries = ['xgameruntime.dll', 'test_xgameruntime.exe', 'test_nexus_configuration.exe', 'test_nexus_timer.exe', 'test_nexus_save.exe', 'test_nexus_user.exe', 'test_nexus_async_identity.exe', 'nexus_user-privilege.exe', 'nexus_auth-metadata.exe', 'nexus_store-entitlements.exe', 'nexus_runtime-init.exe', ...probes.map(([name]) => name + '.exe')];
 const hash = file => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');

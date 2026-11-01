@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <string>
 #include <libxml/parser.h>
 #include <libxml/tree.h>
 #include "../../src/private.h"
@@ -78,6 +79,7 @@ HRESULT xpackage_query_content_store( const char *identifier, SIZE_T size, char 
     strcpy( store, "B00000000001" );
     return S_OK;
 }
+#include "../../src/System/Store/Catalog.h"
 #include "../../src/System/Store/PackageLicense.h"
 #include "../../src/System/Store/AddonLicense.h"
 #include "../../src/System/Store/StoreLicenseProjection.h"
@@ -359,6 +361,18 @@ static struct entitled_snapshot *test_metadata( void )
         CHECK( "only-owned-sku",
                snapshot->products[0].skusCount == 1 && !strcmp( snapshot->products[0].skus[0].skuId, "0010" ) );
         CHECK( "normal-sku-not-trial", !snapshot->products[0].skus[0].isTrial );
+        /* An enumerating consumer may copy the currency string directly even
+         * when collection metadata does not include a purchasable price. */
+        const auto &product_price = snapshot->products[0].price;
+        const auto &sku_price = snapshot->products[0].skus[0].price;
+        CHECK( "entitled-product-currency-readable", product_price.currencyCode != nullptr );
+        CHECK( "entitled-sku-currency-readable", sku_price.currencyCode != nullptr );
+        CHECK( "entitled-product-currency-unknown", product_price.currencyCode &&
+               std::string( product_price.currencyCode ).empty() );
+        CHECK( "entitled-sku-currency-unknown", sku_price.currencyCode &&
+               std::string( sku_price.currencyCode ).empty() );
+        CHECK( "entitled-no-invented-price", !product_price.formattedPrice[0] &&
+               !sku_price.formattedPrice[0] && !product_price.isOnSale && !sku_price.isOnSale );
         CHECK( "xml-escape", !strcmp( snapshot->products[0].title, "Synthetic & add-on" ) );
         CHECK( "package-metadata", snapshot->products[0].hasDigitalDownload );
         CHECK( "developer-offer-token", !strcmp( snapshot->products[0].inAppOfferToken, "Synthetic offer" ) );
@@ -693,6 +707,10 @@ static void test_package_licenses( void )
     {
         struct package_license_async acquired = { 0 };
         XAsyncProviderData data = { 0 };
+        UINT64 xuid;
+        CHECK( "license-result-live-store", entitled_store_create( NULL, &acquired.store_context ) == S_OK );
+        CHECK( "license-result-live-generation",
+               entitled_store_identity( acquired.store_context, &xuid, &acquired.store_serial ) == S_OK );
         acquired.license = license;
         data.context = &acquired;
         CHECK( "license-result-buffer-required",
@@ -702,6 +720,7 @@ static void test_package_licenses( void )
         CHECK( "license-provider-result-transfer", package_license_provider( XAsyncOp::GetResult, &data ) == S_OK &&
                                                        result == license && !acquired.license );
         CHECK( "license-provider-result-once", package_license_provider( XAsyncOp::GetResult, &data ) == E_INVALIDARG );
+        entitled_store_close( acquired.store_context );
     }
     CHECK( "license-valid", package_license_valid( license ) );
     CHECK( "license-foreign-invalid", !package_license_valid( ( void * )1 ) );
@@ -849,6 +868,51 @@ done:
     ( threads )->Release();
 }
 
+/* Result handoff must still belong to the Store context that initiated it.
+ * The positive license is the same receipt-bound fixture used above. */
+static void test_package_result_context( void )
+{
+    IXThreadingImpl *threads = NULL;
+    CHECK( "package-context-threading",
+           FixtureQueryApiImpl( CLSID_XThreadingImpl, IID_IXThreadingImpl, ( void ** )&threads ) == S_OK && threads );
+    if ( !threads ) return;
+    for ( UINT mode = 0; mode < 2; ++mode )
+    {
+        struct package_license_async context = { 0 };
+        XStoreContextHandle store = NULL;
+        XStoreLicenseHandle result = NULL;
+        XAsyncProviderData data = { 0 };
+        UINT64 xuid;
+        context.durable = mode;
+        CHECK( "package-context-create", entitled_store_create( NULL, &store ) == S_OK );
+        context.store_context = store;
+        CHECK( "package-context-identity", entitled_store_identity( store, &xuid, &context.store_serial ) == S_OK );
+        CHECK( "package-context-license", package_license_create( threads, time( NULL ) + 60, &context.license ) == S_OK );
+        if ( !context.license ) { entitled_store_close( store ); continue; }
+        data.context = &context;
+        data.buffer = &result;
+        data.bufferSize = sizeof( result );
+        CHECK( "package-context-live", package_license_context_valid( &context ) );
+        context.store_serial++;
+        CHECK( "package-context-wrong-generation", !package_license_context_valid( &context ) );
+        CHECK( "package-context-rejects-wrong-generation",
+               package_license_provider( XAsyncOp::GetResult, &data ) == E_INVALIDARG && !result && context.license );
+        if ( result ) { package_license_close( result ); result = NULL; }
+        context.store_serial--;
+        if ( !context.license )
+            CHECK( "package-context-fresh-closed-proof",
+                   package_license_create( threads, time( NULL ) + 60, &context.license ) == S_OK );
+        entitled_store_close( store );
+        CHECK( "package-context-closed", !package_license_context_valid( &context ) );
+        CHECK( "package-context-rejects-closed",
+               package_license_provider( XAsyncOp::GetResult, &data ) == E_INVALIDARG && !result && context.license );
+        if ( result ) { package_license_close( result ); result = NULL; }
+        if ( context.license ) package_license_dispose( context.license );
+    }
+    CHECK( "package-context-no-live-licenses", !package_licenses );
+    ( threads )->Release();
+}
+
 static void test_durable_acquisition( void )
 {
     IXThreadingImpl *threads = NULL;
@@ -873,12 +937,12 @@ static void test_durable_acquisition( void )
     context.durable = TRUE;
     context.store_context = store;
     CHECK( "durable-store-identity", entitled_store_identity( store, &xuid, &context.store_serial ) == S_OK );
-    CHECK( "durable-store-live", durable_license_context_valid( &context ) );
+    CHECK( "durable-store-live", package_license_context_valid( &context ) );
     context.store_serial++;
-    CHECK( "durable-wrong-generation", !durable_license_context_valid( &context ) );
+    CHECK( "durable-wrong-generation", !package_license_context_valid( &context ) );
     context.store_serial--;
     entitled_store_close( store );
-    CHECK( "durable-store-closed", !durable_license_context_valid( &context ) );
+    CHECK( "durable-store-closed", !package_license_context_valid( &context ) );
     for ( mode = 0; mode < 3; mode++ )
     {
         ResetEvent( bridge_started );
@@ -1699,6 +1763,182 @@ static void test_cancel_can_free_async_block_before_network_finishes()
     threads->Release();
 }
 
+static HRESULT catalog_fixture_fetch( const char *request, LONG *canceled, entitled_snapshot **out )
+{
+    *out = ( entitled_snapshot * )calloc( 1, sizeof( **out ) );
+    if ( !*out ) return E_OUTOFMEMORY;
+    (*out)->refs = 1;
+    (*out)->valid_until = time( NULL ) + 60;
+    return S_OK;
+}
+
+static void test_public_catalog_async()
+{
+    IXThreadingImpl *threads = NULL;
+    XTaskQueueHandle queue = NULL;
+    CHECK( "catalog-async-threading", FixtureQueryApiImpl( CLSID_XThreadingImpl, IID_IXThreadingImpl,
+        ( void ** )&threads ) == S_OK );
+    if ( !threads ) return;
+    CHECK( "catalog-async-queue", threads->XTaskQueueCreate( XTaskQueueDispatchMode::Manual,
+        XTaskQueueDispatchMode::Manual, &queue ) == S_OK );
+    if ( !queue ) { threads->Release(); return; }
+    for ( UINT32 mode = 0; mode < 8; ++mode )
+    {
+        XStoreContextHandle store = NULL;
+        UINT64 xuid, serial;
+        CHECK( "catalog-async-context", entitled_store_create( NULL, &store ) == S_OK &&
+            entitled_store_identity( store, &xuid, &serial ) == S_OK );
+        entitled_async *context = ( entitled_async * )calloc( 1, sizeof( *context ) );
+        context->store = store; context->store_serial = serial + ( mode % 4 == 2 );
+        context->identity = mode < 4 ? &catalog_identity : &catalog_package_identity; context->fetch = catalog_fixture_fetch; context->page_size = 100;
+        XAsyncBlock block{};
+        block.queue = queue; block.callback = complete; callbacks = 0;
+        CHECK( "catalog-async-begin", entitled_start( context, &block, FALSE ) == S_OK );
+        if ( mode % 4 == 1 ) entitled_store_close( store );
+        if ( mode % 4 == 3 ) threads->XAsyncCancel( &block );
+        threads->XTaskQueueDispatch( queue, XTaskQueuePort::Work, 0 );
+        dispatch_until_complete( threads, queue, &block );
+        CHECK( "catalog-async-completion-once", callbacks == 1 );
+        XStoreProductQueryHandle handle = ( void * )1;
+        if ( mode % 4 == 0 )
+        {
+            CHECK( "catalog-async-distinct-result-identity", entitled_result( &block, &handle, FALSE ) == E_INVALIDARG && !handle );
+            if ( mode >= 4 ) CHECK( "catalog-package-distinct-result-identity", catalog_result( &block, &handle ) == E_INVALIDARG && !handle );
+            CHECK( "catalog-async-public-result", catalog_result( &block, &handle,
+                mode < 4 ? &catalog_identity : &catalog_package_identity ) == S_OK && handle );
+            if ( handle )
+            {
+                enumerated = 0;
+                CHECK( "catalog-async-enumerate-empty", entitled_enumerate( handle, NULL, enumerate ) == S_OK && !enumerated );
+                CHECK( "catalog-async-no-pages", !entitled_has_more( handle ) );
+                entitled_page_close( handle );
+            }
+        }
+        else CHECK( "catalog-async-invalid-delivery-refused", FAILED( catalog_result( &block, &handle, mode < 4 ? &catalog_identity : &catalog_package_identity ) ) && !handle );
+        if ( mode % 4 != 1 ) entitled_store_close( store );
+    }
+    ULONGLONG deadline = GetTickCount64() + 3000;
+    while ( entitled_worker_count && GetTickCount64() < deadline ) Sleep( 1 );
+    CHECK( "catalog-async-workers-drained", !entitled_worker_count );
+    threads->XTaskQueueCloseHandle( queue ); threads->Release();
+    callbacks = 0;
+}
+
+static const char catalog_fixture[] = R"json({"Products":[{
+ "ProductId":"B00000000002","ProductType":"Durable","IsInUserCollection":true,"Properties":{"InAppOfferToken":"synthetic-offer"},
+ "LocalizedProperties":[{"ProductTitle":"Public DLC","ProductDescription":"Public description","Language":"en-US",
+ "Images":[{"Uri":"//store-images.s-microsoft.com/synthetic","Height":300,"Width":400,"Caption":null,"ImagePurpose":"BoxArt"}]}],
+ "DisplaySkuAvailabilities":[{"Sku":{"SkuId":"0010","IsInUserCollection":true,"Properties":{"IsTrial":false,"Packages":[{}]}},
+ "Availabilities":[{"AvailabilityId":"B00000000003","Actions":["Purchase","Browse","Details"],
+ "Conditions":{"StartDate":"1753-01-01T00:00:00.0000000Z","EndDate":"9998-12-30T00:00:00.0000000Z",
+ "ClientConditions":{"AllowedPlatforms":[{"PlatformName":"Windows.Desktop"}]}},
+ "OrderManagementData":{"Price":{"CurrencyCode":"USD","ListPrice":7.99,"MSRP":14.99}}}]},
+ {"Sku":{"SkuId":"0020","Properties":{"IsTrial":true}},"Availabilities":[]}]}]})json";
+
+static void test_public_catalog()
+{
+    const char *ids[] = { "B00000000002" }, *purchase[] = { "Purchase" }, *license[] = { "License" };
+    entitled_snapshot *snapshot = NULL;
+    CHECK( "catalog-public-parse", catalog_parse( ( BYTE * )catalog_fixture, strlen( catalog_fixture ), ids, 1,
+        31, NULL, 0, &snapshot ) == S_OK && snapshot && snapshot->count == 1 );
+    if ( snapshot && snapshot->count )
+    {
+        XStoreProduct *p = &snapshot->products[0];
+        CHECK( "catalog-never-license-proof", !snapshot->proof_until );
+        CHECK( "catalog-unowned-product-not-granted", !p->isInUserCollection );
+        CHECK( "catalog-unowned-skus-not-granted", p->skusCount == 2 && !p->skus[0].isInUserCollection &&
+            !p->skus[1].isInUserCollection && !p->skus[0].collectionData.endDate );
+        CHECK( "catalog-public-title-description", !strcmp( p->title, "Public DLC" ) && !strcmp( p->description, "Public description" ) );
+        CHECK( "catalog-public-offer-token", !strcmp( p->inAppOfferToken, "synthetic-offer" ) );
+        CHECK( "catalog-full-and-trial-skus", p->skusCount == 2 && !p->skus[0].isTrial && p->skus[1].isTrial );
+        CHECK( "catalog-public-download", p->hasDigitalDownload );
+        CHECK( "catalog-public-price", fabs( p->price.price - 7.99 ) < .001 && fabs( p->price.basePrice - 14.99 ) < .001 );
+        CHECK( "catalog-price-currency-explicit", p->price.currencyCode && !strcmp( p->price.currencyCode, "USD" ) &&
+            !strcmp( p->price.formattedPrice, "7.99 USD" ) );
+        CHECK( "catalog-sale-date", p->price.isOnSale && p->price.saleEndDate > time( NULL ) );
+        CHECK( "catalog-purchase-not-bundle-free", p->skus[0].availabilitiesCount == 1 &&
+            fabs( p->skus[0].price.price - 7.99 ) < .001 && !p->skus[1].price.currencyCode );
+        CHECK( "catalog-public-image", p->imagesCount == 1 && p->images[0].height == 300 && p->images[0].width == 400 &&
+            !strcmp( p->images[0].uri, "https://store-images.s-microsoft.com/synthetic" ) && !strcmp( p->images[0].caption, "" ) );
+        entitled_snapshot owned{};
+        XStoreProduct owned_product{};
+        XStoreSku owned_sku{};
+        owned.count = 1; owned.products = &owned_product;
+        owned.valid_until = time( NULL ) + 30;
+        owned_product.storeId = "B00000000002"; owned_product.skusCount = 1; owned_product.skus = &owned_sku;
+        owned_sku.skuId = "0010"; owned_sku.isInUserCollection = TRUE;
+        owned_sku.collectionData.endDate = time( NULL ) + 3600;
+        CHECK( "catalog-rejects-unverified-ownership", catalog_join_collection( snapshot, &owned ) == E_ACCESSDENIED && !p->isInUserCollection );
+        owned.proof_until = time( NULL ) + 3600;
+        owned_sku.skuId = "0030";
+        CHECK( "catalog-no-different-sku-grant", catalog_join_collection( snapshot, &owned ) == S_OK && !p->isInUserCollection );
+        owned_sku.skuId = "0010"; owned_product.storeId = "B00000000004";
+        CHECK( "catalog-no-different-product-grant", catalog_join_collection( snapshot, &owned ) == S_OK && !p->isInUserCollection );
+        owned_product.storeId = "B00000000002";
+        CHECK( "catalog-verified-exact-sku-owned", catalog_join_collection( snapshot, &owned ) == S_OK && p->isInUserCollection &&
+            p->skus[0].isInUserCollection && !p->skus[1].isInUserCollection );
+        CHECK( "catalog-owned-expiry-bound", snapshot->valid_until == owned.valid_until &&
+            p->skus[0].collectionData.endDate == owned_sku.collectionData.endDate && !snapshot->proof_until );
+    }
+    if ( snapshot ) entitled_snapshot_release( snapshot ); snapshot = NULL;
+    CHECK( "catalog-kind-filter", catalog_parse( ( BYTE * )catalog_fixture, strlen( catalog_fixture ), ids, 1,
+        4, NULL, 0, &snapshot ) == S_OK && snapshot && !snapshot->count );
+    if ( snapshot ) entitled_snapshot_release( snapshot ); snapshot = NULL;
+    CHECK( "catalog-action-purchase", catalog_parse( ( BYTE * )catalog_fixture, strlen( catalog_fixture ), ids, 1,
+        2, purchase, 1, &snapshot ) == S_OK && snapshot && snapshot->count == 1 );
+    if ( snapshot ) entitled_snapshot_release( snapshot ); snapshot = NULL;
+    CHECK( "catalog-action-missing", catalog_parse( ( BYTE * )catalog_fixture, strlen( catalog_fixture ), ids, 1,
+        2, license, 1, &snapshot ) == S_OK && snapshot && !snapshot->count );
+    if ( snapshot ) entitled_snapshot_release( snapshot ); snapshot = NULL;
+    const char *foreign[] = { "B00000000099" };
+    CHECK( "catalog-rejects-foreign-response", FAILED( catalog_parse( ( BYTE * )catalog_fixture, strlen( catalog_fixture ),
+        foreign, 1, 31, NULL, 0, &snapshot ) ) && !snapshot );
+    CHECK( "catalog-rejects-malformed", FAILED( catalog_parse( ( BYTE * )"{}", 2, ids, 1, 31, NULL, 0, &snapshot ) ) && !snapshot );
+    CHECK( "catalog-empty-response", catalog_parse( ( BYTE * )"{\"Products\":[]}", 15, ids, 1, 31, NULL, 0, &snapshot ) == S_OK && snapshot && !snapshot->count );
+    if ( snapshot ) entitled_snapshot_release( snapshot ); snapshot = NULL;
+    char *changed = strdup( catalog_fixture );
+    memcpy( strstr( changed, "7.99" ), "-1.0", 4 );
+    CHECK( "catalog-rejects-negative-price", FAILED( catalog_parse( ( BYTE * )changed, strlen( changed ), ids, 1, 31, NULL, 0, &snapshot ) ) && !snapshot );
+    free( changed );
+    changed = strdup( catalog_fixture );
+    memcpy( strstr( changed, "Windows.Desktop" ), "Windows.Xbox   ", 15 );
+    CHECK( "catalog-excludes-console-offer", catalog_parse( ( BYTE * )changed, strlen( changed ), ids, 1, 2,
+        purchase, 1, &snapshot ) == S_OK && snapshot && !snapshot->count );
+    if ( snapshot ) entitled_snapshot_release( snapshot ); snapshot = NULL;
+    free( changed );
+    std::string conditional = catalog_fixture;
+    conditional.insert( conditional.find( "\"Conditions\":{" ) + strlen( "\"Conditions\":{" ),
+        "\"EligibilityPredicateIds\":[\"RequiresSubscription\"]," );
+    CHECK( "catalog-account-conditional-price-not-advertised", catalog_parse( ( BYTE * )conditional.data(),
+        conditional.size(), ids, 1, 2, purchase, 1, &snapshot ) == S_OK && snapshot && !snapshot->count );
+    if ( snapshot ) entitled_snapshot_release( snapshot ); snapshot = NULL;
+    std::string fractional = catalog_fixture;
+    fractional.replace( fractional.find( "7.99" ), 4, "7.999" );
+    CHECK( "catalog-preserves-fractional-price", catalog_parse( ( BYTE * )fractional.data(), fractional.size(), ids,
+        1, 2, NULL, 0, &snapshot ) == S_OK && snapshot && snapshot->count == 1 &&
+        fabs( snapshot->products[0].price.price - 7.999 ) < .00001 &&
+        !strcmp( snapshot->products[0].price.formattedPrice, "7.999 USD" ) );
+    if ( snapshot ) entitled_snapshot_release( snapshot ); snapshot = NULL;
+    std::string expired = catalog_fixture;
+    expired.replace( expired.find( "9998-12-30" ), 10, "2000-01-01" );
+    CHECK( "catalog-expired-offer-filtered", catalog_parse( ( BYTE * )expired.data(), expired.size(), ids, 1,
+        2, purchase, 1, &snapshot ) == S_OK && snapshot && !snapshot->count );
+    if ( snapshot ) entitled_snapshot_release( snapshot ); snapshot = NULL;
+    CHECK( "catalog-delisted-listing-retained", catalog_parse( ( BYTE * )expired.data(), expired.size(), ids, 1,
+        2, NULL, 0, &snapshot ) == S_OK && snapshot && snapshot->count == 1 &&
+        !snapshot->products[0].skus[0].availabilitiesCount && !snapshot->products[0].isInUserCollection );
+    if ( snapshot ) entitled_snapshot_release( snapshot ); snapshot = NULL;
+    XStoreContextHandle store = NULL;
+    XAsyncBlock async{};
+    CHECK( "catalog-context", entitled_store_create( NULL, &store ) == S_OK );
+    const char *bad_filter[] = { "Purchase&evil=1" };
+    CHECK( "catalog-rejects-action-injection", catalog_begin( store, 31, ids, 1, bad_filter, 1, &async ) == E_INVALIDARG );
+    CHECK( "catalog-rejects-null-action", catalog_begin( store, 31, ids, 1, foreign, 1, &async ) == E_INVALIDARG );
+    CHECK( "catalog-package-foreign-identifier", catalog_package_begin( store, 31, "foreign-package", &async ) == E_GAMEPACKAGE_NO_PACKAGE_IDENTIFIER );
+    CHECK( "catalog-package-null-async", catalog_package_begin( store, 31, "00000001111122223333444444444444", NULL ) == E_INVALIDARG );
+    entitled_store_close( store );
+}
+
 int main( void )
 {
     HMODULE dll = LoadLibraryA( "xgameruntime.dll" );
@@ -1766,6 +2006,35 @@ int main( void )
             }
             ( threads )->Release();
         }
+        XAsyncBlock public_query = { 0 };
+        const char *public_ids[] = { "B00000000002" };
+        const char *bad_ids[] = { "bad/id" };
+        CHECK( "runtime-public-invalid-context", store_api->XStoreQueryProductsAsync( ( void * )1,
+            XStoreProductKind::Durable, public_ids, 1, NULL, 0, &public_query ) == E_INVALIDARG );
+        CHECK( "runtime-public-invalid-kind", store_api->XStoreQueryProductsAsync( store,
+            ( XStoreProductKind )32, public_ids, 1, NULL, 0, &public_query ) == E_INVALIDARG );
+        CHECK( "runtime-public-empty-ids", store_api->XStoreQueryProductsAsync( store,
+            XStoreProductKind::Durable, NULL, 0, NULL, 0, &public_query ) == E_INVALIDARG );
+        CHECK( "runtime-public-invalid-id", store_api->XStoreQueryProductsAsync( store,
+            XStoreProductKind::Durable, bad_ids, 1, NULL, 0, &public_query ) == E_INVALIDARG );
+        CHECK( "runtime-public-over-limit", store_api->XStoreQueryProductsAsync( store,
+            XStoreProductKind::Durable, public_ids, 101, NULL, 0, &public_query ) == E_INVALIDARG );
+        CHECK( "runtime-public-null-filters", store_api->XStoreQueryProductsAsync( store,
+            XStoreProductKind::Durable, public_ids, 1, NULL, 1, &public_query ) == E_INVALIDARG );
+        CHECK( "runtime-public-null-result", store_api->XStoreQueryProductsResult( NULL, NULL ) == E_INVALIDARG );
+        XStoreProductQueryHandle public_result = ( void * )1;
+        CHECK( "runtime-public-clears-result", store_api->XStoreQueryProductsResult( &public_query,
+            &public_result ) != S_OK && !public_result );
+        CHECK( "runtime-public-package-invalid-context", store_api->XStoreQueryProductForPackageAsync( ( void * )1,
+            XStoreProductKind::Durable, "00000001111122223333444444444444", &public_query ) == E_INVALIDARG );
+        CHECK( "runtime-public-package-invalid-kind", store_api->XStoreQueryProductForPackageAsync( store,
+            ( XStoreProductKind )32, "00000001111122223333444444444444", &public_query ) == E_INVALIDARG );
+        CHECK( "runtime-public-package-null-identifier", store_api->XStoreQueryProductForPackageAsync( store,
+            XStoreProductKind::Durable, NULL, &public_query ) == E_INVALIDARG );
+        CHECK( "runtime-public-package-null-result", store_api->XStoreQueryProductForPackageResult( NULL, NULL ) == E_INVALIDARG );
+        public_result = ( void * )1;
+        CHECK( "runtime-public-package-clears-result", store_api->XStoreQueryProductForPackageResult( &public_query,
+            &public_result ) == E_INVALIDARG && !public_result );
         XAsyncBlock invalid_license = { 0 };
         CHECK( "runtime-current-game-invalid-context",
                store_api->XStoreQueryGameLicenseAsync( ( void * )1, &invalid_license ) == E_INVALIDARG );
@@ -1797,10 +2066,13 @@ int main( void )
     bridge_started = CreateEventA( NULL, TRUE, FALSE, NULL );
     bridge_gate = CreateEventA( NULL, TRUE, FALSE, NULL );
     test_current_game_license();
+    test_public_catalog();
+    test_public_catalog_async();
     test_related_hints();
     test_receipts();
     test_async( test_metadata() );
     test_package_licenses();
+    test_package_result_context();
     test_durable_acquisition();
     test_addon_licenses();
     test_game_licenses();
