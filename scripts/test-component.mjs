@@ -13,6 +13,7 @@ const probes = [
     ['nexus_token-endpoint', 36],
     ['nexus_store-context', 61],
     ['nexus_store-license-map', 90],
+    ['nexus_store-public-fetch', 98],
     ['nexus_user-device-association',6309], ['nexus_user-audio',334], ['nexus_windows-account-metadata',1713],
     ['nexus_game-relaunch',64], ['nexus_game-relaunch-search', 116], ['nexus_async-provider-contract',116], ['nexus_system_device_id', 332], ['nexus_async-schedule', 16],
     ['nexus_async-completion-lifetime', 2805], ['nexus_taskqueue-teardown', 20],

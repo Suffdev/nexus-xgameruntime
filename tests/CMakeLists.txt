@@ -1,4 +1,4 @@
-foreach(probe IN ITEMS auth-rejection-metadata token-endpoint)
+foreach(probe IN ITEMS auth-rejection-metadata token-endpoint store-public-fetch)
     add_executable(nexus_${probe} Nexus/${probe}.cpp)
     add_dependencies(nexus_${probe} xgameruntime-idl)
     target_include_directories(nexus_${probe} PRIVATE "${IDL_BINARY_DIR}" "${PROJECT_SOURCE_DIR}/include")
@@ -7,6 +7,7 @@ foreach(probe IN ITEMS auth-rejection-metadata token-endpoint)
     target_link_options(nexus_${probe} PRIVATE -static -static-libgcc -static-libstdc++)
     set_target_properties(nexus_${probe} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 endforeach()
+target_link_libraries(nexus_store-public-fetch PRIVATE winhttp)
 
 configure_file(Nexus/MicrosoftGame.config "${CMAKE_BINARY_DIR}/bin/MicrosoftGame.config" COPYONLY)
 

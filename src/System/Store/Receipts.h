@@ -143,61 +143,10 @@ done:
 
 /* Fixed official hosts only, normal certificate/hostname verification, no
  * redirects or arbitrary token URLs. No Authorization or receipt is sent here. */
+#include "PublicMetadata.h"
 static HRESULT receipt_public_get( const WCHAR *host, const WCHAR *path, SIZE_T limit, BYTE **out, SIZE_T *length )
 {
-    HINTERNET session = NULL, connection = NULL, request = NULL;
-    DWORD status, size = sizeof( status ), available, read, redirect = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
-    BYTE *buffer = NULL, *grown;
-    ULONGLONG start = GetTickCount64();
-    HRESULT hr = E_FAIL;
-    *out = NULL;
-    *length = 0;
-    if ( wcscmp( host, L"licensing.mp.microsoft.com" ) && wcscmp( host, L"displaycatalog.mp.microsoft.com" ) )
-        return E_INVALIDARG;
-    if ( !( session = WinHttpOpen( L"Xodus-Nexus-runtime/1", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, NULL, NULL, 0 ) ) )
-        goto done;
-    if ( !WinHttpSetTimeouts( session, 5000, 5000, 10000, 10000 ) ) goto done;
-    if ( !( connection = WinHttpConnect( session, host, INTERNET_DEFAULT_HTTPS_PORT, 0 ) ) ||
-         !( request = WinHttpOpenRequest( connection, L"GET", path, NULL, NULL, WINHTTP_DEFAULT_ACCEPT_TYPES,
-                                          WINHTTP_FLAG_SECURE ) ) )
-        goto done;
-    if ( !WinHttpSetOption( request, WINHTTP_OPTION_REDIRECT_POLICY, &redirect, sizeof( redirect ) ) ||
-         !WinHttpSendRequest( request, NULL, 0, NULL, 0, 0, 0 ) || !WinHttpReceiveResponse( request, NULL ) ||
-         !WinHttpQueryHeaders( request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, NULL, &status, &size,
-                               NULL ) ||
-         status != 200 )
-        goto done;
-    do
-    {
-        if ( GetTickCount64() - start > 20000 || !WinHttpQueryDataAvailable( request, &available ) ) goto done;
-        if ( !available ) break;
-        if ( available > limit || *length > limit - available )
-        {
-            hr = HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
-            goto done;
-        }
-        if ( !( grown = static_cast<std::remove_reference_t<decltype( grown )>>(
-                    realloc( buffer, *length + available + 1 ) ) ) )
-        {
-            hr = E_OUTOFMEMORY;
-            goto done;
-        }
-        buffer = grown;
-        if ( !WinHttpReadData( request, buffer + *length, available, &read ) || !read ) goto done;
-        *length += read;
-        buffer[*length] = 0;
-    } while ( TRUE );
-    if ( !*length ) goto done;
-    *out = buffer;
-    buffer = NULL;
-    hr = S_OK;
-done:
-    free( buffer );
-    if ( request ) WinHttpCloseHandle( request );
-    if ( connection ) WinHttpCloseHandle( connection );
-    if ( session ) WinHttpCloseHandle( session );
-    if ( FAILED( hr ) ) *length = 0;
-    return hr;
+    return nexus::store::FetchPublicMetadata( host, path, limit, out, length );
 }
 
 static BOOL receipt_cert_id( const char *id )
