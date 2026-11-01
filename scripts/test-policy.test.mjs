@@ -195,6 +195,15 @@ test('file saves retain all ABI assertions and load their actual C++ helper DLL'
         assert.match(read(file),/XUSER_\|NEXUS_\|XGAMERUNTIME_/);
 });
 
+test('save commit recovery retains dirty revisions and tests cold relaunch conflicts',()=>{
+    const fixture=read('tests/Nexus/gamesave-commit.cpp');
+    assert.match(fixture,/#include "gamesave-transfer.cpp"/);
+    for(const label of ['commit-release-error-visible','commit-relaunch-can-sync','commit-real-conflict-preserved','commit-real-conflict-no-write','newer-local-not-acknowledged','acknowledged-remote-base-durable','newer-local-relaunch-upload'])
+        assert.ok(fixture.includes('"'+label+'"'),label);
+    assert.match(read('tests/CMakeLists.txt'),/foreach\(probe sync transfer commit\)/);
+    assert.match(read('scripts/test-component.mjs'),/\['nexus_gamesave-commit', 107\]/);
+});
+
 test('save result APIs never inspect opaque async storage or share operation identities',()=>{
     const source=read('src/System/XGameSave.cpp');
     assert.doesNotMatch(source,/async->internal/);

@@ -985,6 +985,27 @@ static HRESULT upload_large_atom( struct XGameSaveProvider *provider, const char
     return hr;
 }
 
+/* The metadata PUT acknowledges a new remote baseline independently of the
+ * session-release notification. Persist only that baseline, keeping dirty
+ * data and the current local revision until the entire upload succeeds. An
+ * older in-flight snapshot must never acknowledge a newer local write. */
+static HRESULT record_cloud_commit( struct XGameSaveProvider *provider, const struct container_state *uploaded )
+{
+    struct container_state current;
+    HRESULT hr;
+
+    EnterCriticalSection( &provider->cs );
+    hr = load_state( provider, uploaded->name, &current );
+    if ( SUCCEEDED( hr ) )
+    {
+        lstrcpynA( current.remote, uploaded->remote, sizeof( current.remote ) );
+        hr = save_state( provider, &current );
+    }
+    free_state( &current );
+    LeaveCriticalSection( &provider->cs );
+    return hr;
+}
+
 static HRESULT cloud_upload_data( struct XGameSaveProvider *provider, struct container_state *state, BYTE **snapshot,
                                   SIZE_T *snapshot_sizes )
 {
@@ -1069,7 +1090,12 @@ static HRESULT cloud_upload_data( struct XGameSaveProvider *provider, struct con
     free( buffer );
     if ( SUCCEEDED( hr ) && ( status < 200 || status >= 300 ) ) hr = E_FAIL;
     if ( SUCCEEDED( hr ) )
-        hr = cloud_unlock( provider, TRUE );
+    {
+        lstrcpynA( state->remote, timestamp, sizeof( state->remote ) );
+        HRESULT persisted = record_cloud_commit( provider, state );
+        HRESULT released = cloud_unlock( provider, TRUE );
+        hr = FAILED( persisted ) ? persisted : released;
+    }
     else
         cloud_unlock( provider, FALSE );
     if ( SUCCEEDED( hr ) )
