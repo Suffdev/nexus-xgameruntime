@@ -352,11 +352,11 @@ static HRESULT durable_license_from_snapshot( struct entitled_snapshot *snapshot
     return store_license_from_snapshot( snapshot, store, threading, FALSE, out );
 }
 
-static BOOL durable_license_context_valid( struct package_license_async *context )
+static BOOL package_license_context_valid( struct package_license_async *context )
 {
     UINT64 xuid, serial;
-    return !context->durable || ( SUCCEEDED( entitled_store_identity( context->store_context, &xuid, &serial ) ) &&
-                                  serial == context->store_serial );
+    return SUCCEEDED( entitled_store_identity( context->store_context, &xuid, &serial ) ) &&
+           serial == context->store_serial;
 }
 
 static DWORD WINAPI package_license_acquire_worker( void *arg )
@@ -366,7 +366,7 @@ static DWORD WINAPI package_license_acquire_worker( void *arg )
     HRESULT hr = E_ABORT;
     if ( !InterlockedCompareExchange( &context->canceled, 0, 0 ) )
         hr = entitled_fetch( context->request, &context->canceled, &snapshot );
-    if ( SUCCEEDED( hr ) && !durable_license_context_valid( context ) ) hr = E_INVALIDARG;
+    if ( SUCCEEDED( hr ) && !package_license_context_valid( context ) ) hr = E_INVALIDARG;
     if ( SUCCEEDED( hr ) )
         hr = context->durable
                  ? durable_license_from_snapshot( snapshot, context->store, context->threading, &context->license )
@@ -403,7 +403,7 @@ static HRESULT WINAPI package_license_provider( XAsyncOp op, const XAsyncProvide
         return E_PENDING;
     case XAsyncOp::GetResult:
         if ( !data->buffer || data->bufferSize < sizeof( void * ) || !context->license ) return E_INVALIDARG;
-        if ( !durable_license_context_valid( context ) ) return E_INVALIDARG;
+        if ( !package_license_context_valid( context ) ) return E_INVALIDARG;
         if ( !package_license_valid_object( context->license ) ) return E_ACCESSDENIED;
         AcquireSRWLockExclusive( &package_license_lock );
         context->license->next = package_licenses;
@@ -427,14 +427,16 @@ static HRESULT WINAPI package_license_provider( XAsyncOp op, const XAsyncProvide
 static HRESULT package_license_begin( XStoreContextHandle store, const char *identifier, XAsyncBlock *async )
 {
     struct package_license_async *context;
-    UINT64 xuid;
+    UINT64 xuid, serial;
     HRESULT hr;
     if ( !async || !identifier ) return E_INVALIDARG;
-    if ( FAILED( hr = entitled_store_user( store, &xuid ) ) ) return hr;
+    if ( FAILED( hr = entitled_store_identity( store, &xuid, &serial ) ) ) return hr;
     if ( !entitled_id( GetStoreProductId() ) ) return E_GAME_MISSING_GAME_CONFIG;
     if ( !( context = static_cast<std::remove_reference_t<decltype( context )>>( calloc( 1, sizeof( *context ) ) ) ) )
         return E_OUTOFMEMORY;
     context->refs = 1;
+    context->store_context = store;
+    context->store_serial = serial;
     if ( FAILED( hr = xpackage_query_content_store( identifier, sizeof( context->store ), context->store ) ) )
     {
         free( context );

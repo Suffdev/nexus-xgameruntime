@@ -693,6 +693,10 @@ static void test_package_licenses( void )
     {
         struct package_license_async acquired = { 0 };
         XAsyncProviderData data = { 0 };
+        UINT64 xuid;
+        CHECK( "license-result-live-store", entitled_store_create( NULL, &acquired.store_context ) == S_OK );
+        CHECK( "license-result-live-generation",
+               entitled_store_identity( acquired.store_context, &xuid, &acquired.store_serial ) == S_OK );
         acquired.license = license;
         data.context = &acquired;
         CHECK( "license-result-buffer-required",
@@ -702,6 +706,7 @@ static void test_package_licenses( void )
         CHECK( "license-provider-result-transfer", package_license_provider( XAsyncOp::GetResult, &data ) == S_OK &&
                                                        result == license && !acquired.license );
         CHECK( "license-provider-result-once", package_license_provider( XAsyncOp::GetResult, &data ) == E_INVALIDARG );
+        entitled_store_close( acquired.store_context );
     }
     CHECK( "license-valid", package_license_valid( license ) );
     CHECK( "license-foreign-invalid", !package_license_valid( ( void * )1 ) );
@@ -849,6 +854,51 @@ done:
     ( threads )->Release();
 }
 
+/* Result handoff must still belong to the Store context that initiated it.
+ * The positive license is the same receipt-bound fixture used above. */
+static void test_package_result_context( void )
+{
+    IXThreadingImpl *threads = NULL;
+    CHECK( "package-context-threading",
+           FixtureQueryApiImpl( CLSID_XThreadingImpl, IID_IXThreadingImpl, ( void ** )&threads ) == S_OK && threads );
+    if ( !threads ) return;
+    for ( UINT mode = 0; mode < 2; ++mode )
+    {
+        struct package_license_async context = { 0 };
+        XStoreContextHandle store = NULL;
+        XStoreLicenseHandle result = NULL;
+        XAsyncProviderData data = { 0 };
+        UINT64 xuid;
+        context.durable = mode;
+        CHECK( "package-context-create", entitled_store_create( NULL, &store ) == S_OK );
+        context.store_context = store;
+        CHECK( "package-context-identity", entitled_store_identity( store, &xuid, &context.store_serial ) == S_OK );
+        CHECK( "package-context-license", package_license_create( threads, time( NULL ) + 60, &context.license ) == S_OK );
+        if ( !context.license ) { entitled_store_close( store ); continue; }
+        data.context = &context;
+        data.buffer = &result;
+        data.bufferSize = sizeof( result );
+        CHECK( "package-context-live", package_license_context_valid( &context ) );
+        context.store_serial++;
+        CHECK( "package-context-wrong-generation", !package_license_context_valid( &context ) );
+        CHECK( "package-context-rejects-wrong-generation",
+               package_license_provider( XAsyncOp::GetResult, &data ) == E_INVALIDARG && !result && context.license );
+        if ( result ) { package_license_close( result ); result = NULL; }
+        context.store_serial--;
+        if ( !context.license )
+            CHECK( "package-context-fresh-closed-proof",
+                   package_license_create( threads, time( NULL ) + 60, &context.license ) == S_OK );
+        entitled_store_close( store );
+        CHECK( "package-context-closed", !package_license_context_valid( &context ) );
+        CHECK( "package-context-rejects-closed",
+               package_license_provider( XAsyncOp::GetResult, &data ) == E_INVALIDARG && !result && context.license );
+        if ( result ) { package_license_close( result ); result = NULL; }
+        if ( context.license ) package_license_dispose( context.license );
+    }
+    CHECK( "package-context-no-live-licenses", !package_licenses );
+    ( threads )->Release();
+}
+
 static void test_durable_acquisition( void )
 {
     IXThreadingImpl *threads = NULL;
@@ -873,12 +923,12 @@ static void test_durable_acquisition( void )
     context.durable = TRUE;
     context.store_context = store;
     CHECK( "durable-store-identity", entitled_store_identity( store, &xuid, &context.store_serial ) == S_OK );
-    CHECK( "durable-store-live", durable_license_context_valid( &context ) );
+    CHECK( "durable-store-live", package_license_context_valid( &context ) );
     context.store_serial++;
-    CHECK( "durable-wrong-generation", !durable_license_context_valid( &context ) );
+    CHECK( "durable-wrong-generation", !package_license_context_valid( &context ) );
     context.store_serial--;
     entitled_store_close( store );
-    CHECK( "durable-store-closed", !durable_license_context_valid( &context ) );
+    CHECK( "durable-store-closed", !package_license_context_valid( &context ) );
     for ( mode = 0; mode < 3; mode++ )
     {
         ResetEvent( bridge_started );
@@ -1801,6 +1851,7 @@ int main( void )
     test_receipts();
     test_async( test_metadata() );
     test_package_licenses();
+    test_package_result_context();
     test_durable_acquisition();
     test_addon_licenses();
     test_game_licenses();

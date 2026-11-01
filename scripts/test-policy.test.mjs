@@ -285,7 +285,7 @@ test('current game licenses require proof-bound genuine SKU and support safe can
     assert.doesNotMatch(source,/4102444800|0010|isActive\s*=\s*TRUE[\s\S]*return E_NOTIMPL/);
     assert.match(read('src/System/Store/Entitled.h').replace(/\s+/g,''),/InterlockedCompareExchange\(&context->terminal,1,0\)/);
     assert.match(read('tests/Nexus/store-entitlements.cpp').replace(/\s+/g,''),/VirtualFree\(block,0,MEM_RELEASE\)/);
-    assert.match(read('scripts/test-store.mjs'),/\['store-entitlements',992\]/);
+    assert.match(read('scripts/test-store.mjs'),/\['store-entitlements',1021\]/);
     assert.match(read('scripts/test-store.mjs'),/realAccounts:false,realCloud:false,fullRuntime:false/);
 });
 
