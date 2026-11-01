@@ -157,6 +157,17 @@ struct entitled_page
 static SRWLOCK entitled_pages_lock = SRWLOCK_INIT;
 static struct entitled_page *entitled_pages;
 
+static void store_images_free( XStoreImage *images, UINT32 count )
+{
+    for ( UINT32 i = 0; i < count; ++i )
+    {
+        free( ( char * )images[i].uri );
+        free( ( char * )images[i].caption );
+        free( ( char * )images[i].imagePurposeTag );
+    }
+    free( images );
+}
+
 static void entitled_snapshot_release( struct entitled_snapshot *snapshot )
 {
     UINT32 i, j;
@@ -169,12 +180,23 @@ static void entitled_snapshot_release( struct entitled_snapshot *snapshot )
         free( ( char * )p->description );
         free( ( char * )p->language );
         free( ( char * )p->inAppOfferToken );
+        free( p->linkUri );
+        free( ( char * )p->price.currencyCode );
+        store_images_free( p->images, p->imagesCount );
         for ( j = 0; j < p->skusCount; j++ )
         {
             free( ( char * )p->skus[j].skuId );
             free( ( char * )p->skus[j].title );
             free( ( char * )p->skus[j].description );
             free( ( char * )p->skus[j].language );
+            free( ( char * )p->skus[j].price.currencyCode );
+            store_images_free( p->skus[j].images, p->skus[j].imagesCount );
+            for ( UINT32 k = 0; k < p->skus[j].availabilitiesCount; ++k )
+            {
+                free( ( char * )p->skus[j].availabilities[k].availabilityId );
+                free( ( char * )p->skus[j].availabilities[k].price.currencyCode );
+            }
+            free( p->skus[j].availabilities );
         }
         free( p->skus );
     }
@@ -337,6 +359,14 @@ static HRESULT entitled_parse( const char *response, UINT16 size, struct entitle
         XStoreProduct *p;
         if ( node->type != XML_ELEMENT_NODE || strcmp( ( char * )node->name, "Product" ) ) continue;
         p = &snapshot->products[i++];
+        /* Collection metadata carries ownership, not an advertised price.
+         * Keep the string readable without inventing a currency or offer. */
+        p->price.currencyCode = strdup( "" );
+        if ( !p->price.currencyCode )
+        {
+            hr = E_OUTOFMEMORY;
+            goto done;
+        }
         p->storeId = entitled_text( node, "StoreId" );
         p->title = entitled_text( node, "Title" );
         p->description = entitled_text( node, "Description" );
@@ -394,6 +424,12 @@ static HRESULT entitled_parse( const char *response, UINT16 size, struct entitle
             XStoreSku *s;
             if ( sku_node->type != XML_ELEMENT_NODE || strcmp( ( char * )sku_node->name, "Sku" ) ) continue;
             s = &p->skus[j++];
+            s->price.currencyCode = strdup( "" );
+            if ( !s->price.currencyCode )
+            {
+                hr = E_OUTOFMEMORY;
+                goto done;
+            }
             s->skuId = entitled_text( sku_node, "SkuId" );
             s->title = entitled_text( sku_node, "Title" );
             s->description = entitled_text( sku_node, "Description" );
@@ -449,6 +485,8 @@ struct entitled_async
     struct entitled_page *page;
     IXThreadingImpl *threading;
     XAsyncBlock *async;
+    const void *identity;
+    HRESULT ( *fetch )( const char *, LONG *, struct entitled_snapshot ** );
 };
 static const char entitled_identity{};
 static const char entitled_next_identity{};
@@ -479,10 +517,11 @@ static DWORD WINAPI entitled_worker( void *arg )
     struct entitled_snapshot *snapshot = NULL;
     HRESULT hr = E_ABORT;
     if ( !InterlockedCompareExchange( &context->canceled, 0, 0 ) )
-        hr = entitled_fetch( context->request, &context->canceled, &snapshot );
+        hr = context->fetch ? context->fetch( context->request, &context->canceled, &snapshot )
+                            : entitled_fetch( context->request, &context->canceled, &snapshot );
     if ( SUCCEEDED( hr ) )
     {
-        if ( !InterlockedCompareExchange( &context->canceled, 0, 0 ) )
+        if ( !context->fetch && !InterlockedCompareExchange( &context->canceled, 0, 0 ) )
             game_license_observe( context->store_serial, context->refresh, snapshot );
         if ( !( context->page = static_cast<std::remove_reference_t<decltype( context->page )>>(
                     calloc( 1, sizeof( *context->page ) ) ) ) )
@@ -547,6 +586,12 @@ static HRESULT WINAPI entitled_provider( XAsyncOp op, const XAsyncProviderData *
         CloseHandle( worker );
         return E_PENDING;
     case XAsyncOp::GetResult:
+        if ( context->fetch )
+        {
+            UINT64 xuid, serial;
+            if ( FAILED( entitled_store_identity( context->store, &xuid, &serial ) ) ||
+                 serial != context->store_serial ) return E_INVALIDARG;
+        }
         if ( context->game )
         {
             UINT64 xuid, serial;
@@ -599,7 +644,8 @@ static HRESULT entitled_start( struct entitled_async *context, XAsyncBlock *asyn
     InterlockedExchange( &context->begin_active, 1 );
     hr = ( context->threading )
              ->XAsyncBegin( async, context,
-                            context->game ? &entitled_game_identity
+                            context->identity ? context->identity
+                            : context->game ? &entitled_game_identity
                             : next        ? &entitled_next_identity
                                           : &entitled_identity,
                             "XStoreEntitledProducts", entitled_provider );
