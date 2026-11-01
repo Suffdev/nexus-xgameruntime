@@ -29,6 +29,7 @@
 
 static const char *GetStoreProductId();
 #include "Store/Entitled.h"
+#include "Store/Catalog.h"
 #include "Store/PackageLicense.h"
 #include "Store/AddonLicense.h"
 #include "Store/StoreContext.h"
@@ -67,15 +68,15 @@ HRESULT WINAPI XStoreImpl::XStoreQueryProductsAsync( const XStoreContextHandle s
                                                      SIZE_T storeIdsCount, const char **actionFilters,
                                                      SIZE_T actionFiltersCount, XAsyncBlock *async )
 {
-    ( void )0;
-    NEXUS_STORE_META( 33, E_NOTIMPL, 0, NULL );
-    return E_NOTIMPL;
+    HRESULT hr = catalog_begin( storeContextHandle, static_cast<UINT32>( productKinds ), storeIds,
+                                storeIdsCount, actionFilters, actionFiltersCount, async );
+    NEXUS_STORE_META( 33, hr, 0, NULL );
+    return hr;
 }
 
 HRESULT WINAPI XStoreImpl::XStoreQueryProductsResult( XAsyncBlock *async, XStoreProductQueryHandle *productQueryHandle )
 {
-    ( void )0;
-    return E_NOTIMPL;
+    return catalog_result( async, productQueryHandle );
 }
 
 HRESULT WINAPI XStoreImpl::XStoreQueryEntitledProductsAsync( const XStoreContextHandle storeContextHandle,
@@ -109,15 +110,13 @@ HRESULT WINAPI XStoreImpl::XStoreQueryProductForPackageAsync( const XStoreContex
                                                               XStoreProductKind productKinds,
                                                               const char *packageIdentifier, XAsyncBlock *async )
 {
-    ( void )0;
-    return E_NOTIMPL;
+    return catalog_package_begin( storeContextHandle, static_cast<UINT32>( productKinds ), packageIdentifier, async );
 }
 
 HRESULT WINAPI XStoreImpl::XStoreQueryProductForPackageResult( XAsyncBlock *async,
                                                                XStoreProductQueryHandle *productQueryHandle )
 {
-    ( void )0;
-    return E_NOTIMPL;
+    return catalog_result( async, productQueryHandle, &catalog_package_identity );
 }
 
 HRESULT WINAPI XStoreImpl::XStoreEnumerateProductsQuery( const XStoreProductQueryHandle productQueryHandle,

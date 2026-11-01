@@ -38,7 +38,7 @@ try{
  const key='HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Services.Store.StoreContext';
  run('register-context',engine,['reg.exe','add',key,'/v','DllPath','/t','REG_SZ','/d','C:\\windows\\system32\\xgameruntime.dll','/f','/reg:'+view]);
  run('register-threading',engine,['reg.exe','add',key,'/v','ThreadingModel','/t','REG_DWORD','/d','0','/f','/reg:'+view]);
- for(const [name,minimum]of [['store-entitlements',1021],['package-content',332],['store-context',61],['store-context-raw',11]]){
+ for(const [name,minimum]of [['store-entitlements',1111],['package-content',332],['store-context',61],['store-context-raw',11]]){
   const output=run(name,engine,[path.join(bin,'nexus_'+name+'.exe')]);
   const summary=output.match(/(?:^|\n)CHECKS (\d+) FAILURES (\d+)/);
   if(!summary||Number(summary[1])<minimum||Number(summary[2])||/(?:^|\n)FAIL /.test(output))throw Error(name+' lost required coverage');
