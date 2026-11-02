@@ -235,6 +235,11 @@ public:
     {
         return xodus_request( type, body, size, response, responseSize );
     }
+    HRESULT BackendCancellable( UINT16 type, const char *body, UINT16 size, char **response, UINT16 *responseSize,
+                                const std::atomic<bool> &cancel ) override
+    {
+        return xodus_request( type, body, size, response, responseSize, 95000, &cancel );
+    }
     HRESULT Http( const WCHAR *method, const WCHAR *url, char *body, const WCHAR *headers, const WCHAR **accept,
                   BYTE **response, SIZE_T *responseSize ) override
     {

@@ -209,7 +209,7 @@ test('backend framing has a shared total deadline and mandatory stalled transpor
     const source=read('src/System/User/BackendRequest.h');
     assert.match(read('src/System/XUser.cpp'),/#include "User\/BackendRequest.h"/);
     assert.match(source,/DWORD timeoutMilliseconds = 95000/);
-    assert.match(source,/backend_deadline deadline\( timeoutMilliseconds \)/);
+    assert.match(source,/backend_deadline deadline\( timeoutMilliseconds, cancellation \)/);
     assert.doesNotMatch(source,/type == 5|SO_RCVTIMEO|SO_SNDTIMEO/);
     assert.match(read('scripts/test-component.mjs'),/\['nexus_backend-request', 356\]/);
     const fixture=read('tests/Nexus/backend-request.cpp');
@@ -503,4 +503,23 @@ test('remote save fencing requires synthetic ABA, crash and concurrent local-wri
         'fence-stale-conflict-choice-rejected','fence-generation-durable-not-per-read',
         'fence-files-zero-readd-dirty-new-revision','fence-files-overflow-keeps-old-bytes'])
         assert.ok(fixture.includes('"'+label+'"'),label);
+});
+
+
+test('MSA caller cancellation requires actual production socket and lifetime coverage',()=>{
+    assert.match(read('scripts/test-component.mjs'),/\['nexus_backend-cancellation', 211\]/);
+    assert.match(read('tests/CMakeLists.txt'),/target_link_libraries\(nexus_backend-cancellation PRIVATE ws2_32\)/);
+    const fixture=read('tests/Nexus/backend-cancellation.cpp');
+    for(const label of ['cancel-worker-exits-without-server-release','cancel-peer-sees-eof-before-release',
+        'cancel-result-is-abort','cancel-publishes-no-output','precancel-no-connection',
+        'independent-call-still-pending-after-other-cleanup','post-cancel-valid-output',
+        'complete-race-only-full-success-or-empty-abort','sliced-deadline-keeps-one-total-budget'])
+        assert.ok(fixture.includes('"'+label+'"'),label);
+    for(const name of ['CooperativeTicketCancellationStopsWorkerBeforePeerRelease',
+        'LegacyBackendFallbackWaitsForOwnerThenDiscardsCanceledResponse',
+        'CancelSignInCompletesBeforeBlockedTransportReturns','CancelledBlockCanBeReusedWhileTransportIsStillBlocked']){
+        assert.ok(read('tests/Nexus/test_user.cpp').includes('TEST( NexusAuthentication, '+name+' )'));
+        assert.ok(read('scripts/test-authentication.mjs').includes("'"+name+"'"));
+    }
+    assert.match(read('scripts/test-authentication.mjs'),/if\(!cancellationPassed\)proof.passed=false/);
 });

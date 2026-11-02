@@ -57,7 +57,7 @@ public:
     }
     bool currentFails = false, titleToken = true;
     std::string currentEndpoints = Endpoints();
-    bool blockBackend = false;
+    bool blockBackend = false, cooperativeBackend = false;
     bool blockAuthorization = false, refuseAuthorization = false;
     DWORD authorizationThread = 0;
     HANDLE authorizationEntered = CreateEventW( nullptr, TRUE, FALSE, nullptr );
@@ -99,6 +99,31 @@ public:
             SetEvent( backendEntered );
             if ( WaitForSingleObject( backendContinue, 5000 ) != WAIT_OBJECT_0 ) return E_ABORT;
         }
+        return BackendReply( type, body, size, response, length );
+    }
+    HRESULT BackendCancellable( UINT16 type, const char *body, UINT16 size, char **response, UINT16 *length,
+                                const std::atomic<bool> &cancel ) override
+    {
+        if ( !cooperativeBackend ) return UserTransport::BackendCancellable( type, body, size, response, length, cancel );
+        *response = nullptr; *length = 0;
+        if ( cancel.load() ) return E_ABORT;
+        ++backendCalls;
+        if ( blockBackend )
+        {
+            SetEvent( backendEntered );
+            for ( ;; )
+            {
+                if ( cancel.load() ) return E_ABORT;
+                DWORD wait = WaitForSingleObject( backendContinue, 50 );
+                if ( wait == WAIT_OBJECT_0 ) break;
+                if ( wait != WAIT_TIMEOUT ) return E_FAIL;
+            }
+        }
+        if ( cancel.load() ) return E_ABORT;
+        return BackendReply( type, body, size, response, length );
+    }
+    HRESULT BackendReply( UINT16 type, const char *body, UINT16 size, char **response, UINT16 *length )
+    {
         if ( type != 3 || !body || !size || !strstr( body, "<MSATokenRequest>" ) )
         {
             ++unexpected;
@@ -674,6 +699,49 @@ TEST( NexusAuthentication, CancelSignInCompletesBeforeBlockedTransportReturns )
         users.XUserCloseHandle( result );
     threading->XTaskQueueCloseHandle( queue );
     threading->Release();
+}
+
+TEST( NexusAuthentication, CooperativeTicketCancellationStopsWorkerBeforePeerRelease )
+{
+    Apartment apartment; SyntheticTransport transport;
+    transport.blockBackend = transport.cooperativeBackend = true;
+    XUserImpl users( transport ); IXThreadingImpl *threads = nullptr;
+    ASSERT_EQ( QueryApiImpl( CLSID_XThreadingImpl, __uuidof( IXThreadingImpl ), reinterpret_cast<void **>( &threads ) ), S_OK );
+    XTaskQueueHandle queue = nullptr;
+    ASSERT_EQ( threads->XTaskQueueCreate( XTaskQueueDispatchMode::ThreadPool, XTaskQueueDispatchMode::Manual, &queue ), S_OK );
+    unsigned callbacks = 0; XAsyncBlock block{}; block.queue = queue; block.context = &callbacks;
+    block.callback = []( XAsyncBlock *done ) WINAPI { ++*static_cast<unsigned *>( done->context ); };
+    ASSERT_EQ( users.XUserAddAsync( XUserAddOptions::AddDefaultUserSilently, &block ), S_OK );
+    EXPECT_EQ( WaitForSingleObject( transport.backendEntered, 3000 ), WAIT_OBJECT_0 );
+    threads->XAsyncCancel( &block );
+    EXPECT_EQ( threads->XAsyncGetStatus( &block, FALSE ), E_ABORT );
+    EXPECT_EQ( WaitForUserSignInWorkers( 1500 ), S_OK );
+    EXPECT_EQ( WaitForSingleObject( transport.backendContinue, 0 ), WAIT_TIMEOUT );
+    EXPECT_EQ( callbacks, 0u ); // Manual dispatch remains the caller's decision.
+    EXPECT_TRUE( threads->XTaskQueueDispatch( queue, XTaskQueuePort::Completion, 2000 ) );
+    EXPECT_EQ( callbacks, 1u ); EXPECT_EQ( threads->XAsyncGetStatus( &block, FALSE ), E_ABORT );
+    EXPECT_EQ( transport.backendCalls, 1u ); EXPECT_EQ( transport.httpCalls, 1u ); EXPECT_EQ( transport.rawCalls, 0u );
+    SetEvent( transport.backendContinue ); EXPECT_EQ( WaitForUserSignInWorkers( 3000 ), S_OK );
+    threads->XTaskQueueCloseHandle( queue ); threads->Release();
+}
+TEST( NexusAuthentication, LegacyBackendFallbackWaitsForOwnerThenDiscardsCanceledResponse )
+{
+    SyntheticTransport transport; transport.blockBackend = true;
+    std::atomic<bool> cancel{ false }; char *response = nullptr; UINT16 length = 0;
+    auto pending = std::async( std::launch::async, [&] {
+        return transport.BackendCancellable( 3, "<MSATokenRequest>", 17, &response, &length, cancel );
+    } );
+    EXPECT_EQ( WaitForSingleObject( transport.backendEntered, 2000 ), WAIT_OBJECT_0 ); cancel = true;
+    EXPECT_EQ( pending.wait_for( std::chrono::milliseconds( 100 ) ), std::future_status::timeout );
+    SetEvent( transport.backendContinue );
+    ASSERT_EQ( pending.wait_for( std::chrono::milliseconds( 2000 ) ), std::future_status::ready );
+    EXPECT_EQ( pending.get(), E_ABORT ); EXPECT_EQ( response, nullptr ); EXPECT_EQ( length, 0u );
+    SyntheticTransport independent; std::atomic<bool> active{ false };
+    EXPECT_EQ( independent.BackendCancellable( 3, "<MSATokenRequest>", 17, &response, &length, active ), S_OK );
+    EXPECT_NE( response, nullptr ); EXPECT_GT( length, 0u ); free( response );
+    response = nullptr; length = 0; auto before = independent.backendCalls;
+    EXPECT_EQ( independent.BackendCancellable( 3, "<MSATokenRequest>", 17, &response, &length, cancel ), E_ABORT );
+    EXPECT_EQ( independent.backendCalls, before ); EXPECT_EQ( response, nullptr ); EXPECT_EQ( length, 0u );
 }
 
 TEST( NexusAuthentication, AsyncResultTransfersRealIdentityAndChecksOperationIdentity )

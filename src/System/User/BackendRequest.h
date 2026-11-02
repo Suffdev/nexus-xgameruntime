@@ -2,6 +2,7 @@
 // Copyright 2026 Olivia Ryan
 #pragma once
 #include <afunix.h>
+#include <atomic>
 
 static WCHAR *WineGetDosFileName( const char *path )
 {
@@ -44,15 +45,22 @@ class backend_deadline
 {
     ULONGLONG started = GetTickCount64();
     DWORD budget;
+    const std::atomic<bool> *cancel;
 public:
-    explicit backend_deadline( DWORD milliseconds ) : budget( milliseconds ) {}
+    explicit backend_deadline( DWORD milliseconds, const std::atomic<bool> *cancellation = nullptr )
+        : budget( milliseconds ), cancel( cancellation ) {}
+    BOOL canceled() const { return cancel && cancel->load( std::memory_order_acquire ); }
     BOOL wait( SOCKET socket, bool writing, bool connecting = false ) const
     {
         for ( ;; )
         {
+            if ( canceled() ) { WSASetLastError( WSA_OPERATION_ABORTED ); return FALSE; }
             ULONGLONG elapsed = GetTickCount64() - started;
             if ( elapsed >= budget ) { WSASetLastError( WSAETIMEDOUT ); return FALSE; }
             DWORD remaining = budget - static_cast<DWORD>( elapsed );
+            // A request-local view, retained by its worker, interrupts readiness
+            // without cross-thread socket closure or restarting the total budget.
+            if ( cancel && remaining > 50 ) remaining = 50;
             timeval timeout = { static_cast<long>( remaining / 1000 ), static_cast<long>( remaining % 1000 * 1000 ) };
             fd_set ready, errors;
             FD_ZERO( &ready ); FD_SET( socket, &ready );
@@ -64,7 +72,12 @@ public:
                 if ( WSAGetLastError() == WSAEINTR ) continue;
                 return FALSE;
             }
-            if ( !result ) { WSASetLastError( WSAETIMEDOUT ); return FALSE; }
+            if ( !result )
+            {
+                if ( cancel ) continue;
+                WSASetLastError( WSAETIMEDOUT ); return FALSE;
+            }
+            if ( canceled() ) { WSASetLastError( WSA_OPERATION_ABORTED ); return FALSE; }
             if ( connecting )
             {
                 int error = 0, length = sizeof( error );
@@ -81,6 +94,7 @@ static BOOL xodus_connect( SOCKET socket, const sockaddr *address, int size, con
 {
     u_long nonblocking = 1;
     if ( ioctlsocket( socket, FIONBIO, &nonblocking ) ) return FALSE;
+    if ( deadline.canceled() ) { WSASetLastError( WSA_OPERATION_ABORTED ); return FALSE; }
     if ( !connect( socket, address, size ) ) return TRUE;
     int error = WSAGetLastError();
     if ( error != WSAEWOULDBLOCK && error != WSAEINPROGRESS && error != WSAEALREADY ) return FALSE;
@@ -115,7 +129,8 @@ static BOOL xodus_recv( SOCKET socket, char *data, int size, const backend_deadl
     return TRUE;
 }
 
-static HRESULT xodus_request( UINT16 type, const char *body, UINT16 size, char **response, UINT16 *responseSize, DWORD timeoutMilliseconds = 95000 )
+static HRESULT xodus_request( UINT16 type, const char *body, UINT16 size, char **response, UINT16 *responseSize, DWORD timeoutMilliseconds = 95000,
+                               const std::atomic<bool> *cancellation = nullptr )
 {
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
     UINT32 magic = XODUS_XML_MAGIC;
@@ -133,7 +148,8 @@ static HRESULT xodus_request( UINT16 type, const char *body, UINT16 size, char *
     if ( !response || !responseSize || ( !body && size ) ) return E_INVALIDARG;
     *response = NULL;
     *responseSize = 0;
-    backend_deadline deadline( timeoutMilliseconds );
+    backend_deadline deadline( timeoutMilliseconds, cancellation );
+    if ( deadline.canceled() ) return E_ABORT;
 
     portLen = GetEnvironmentVariableA( "XODUS_BRIDGE_PORT", bridgePort, sizeof( bridgePort ) );
     keyLen = GetEnvironmentVariableA( "XODUS_BRIDGE_KEY", bridgeKey, sizeof( bridgeKey ) );
@@ -198,6 +214,10 @@ error:
     hr = HRESULT_FROM_WIN32( WSAGetLastError() );
     if ( SUCCEEDED( hr ) ) hr = E_FAIL;
 done:
+    if ( deadline.canceled() )
+    {
+        free( *response ); *response = NULL; *responseSize = 0; hr = E_ABORT;
+    }
     if ( s != INVALID_SOCKET ) closesocket( s );
     WSACleanup();
     return hr;

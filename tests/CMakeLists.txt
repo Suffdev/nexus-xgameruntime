@@ -1,4 +1,4 @@
-foreach(probe IN ITEMS auth-rejection-metadata token-endpoint store-public-fetch backend-request)
+foreach(probe IN ITEMS auth-rejection-metadata token-endpoint store-public-fetch backend-request backend-cancellation)
     add_executable(nexus_${probe} Nexus/${probe}.cpp)
     add_dependencies(nexus_${probe} xgameruntime-idl)
     target_include_directories(nexus_${probe} PRIVATE "${IDL_BINARY_DIR}" "${PROJECT_SOURCE_DIR}/include")
@@ -9,6 +9,7 @@ foreach(probe IN ITEMS auth-rejection-metadata token-endpoint store-public-fetch
 endforeach()
 target_link_libraries(nexus_store-public-fetch PRIVATE winhttp)
 target_link_libraries(nexus_backend-request PRIVATE ws2_32)
+target_link_libraries(nexus_backend-cancellation PRIVATE ws2_32)
 
 configure_file(Nexus/MicrosoftGame.config "${CMAKE_BINARY_DIR}/bin/MicrosoftGame.config" COPYONLY)
 

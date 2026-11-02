@@ -39,11 +39,11 @@ static HRESULT get_rps_tickets( XUser *owner, BOOLEAN allowUi, char **userTicket
         return E_INVALIDARG;
     }
 
-    hr = owner->transport.Backend( XODUS_MSA_TOKEN_REQUEST, ( const char * )body, bodySize, &response, &responseSize );
+    hr = owner->transport.BackendCancellable( XODUS_MSA_TOKEN_REQUEST, ( const char * )body, bodySize, &response, &responseSize, owner->cancelled );
     xmlFree( body );
     if ( FAILED( hr ) )
     {
-        ERR( "xodus-service request failed, hr %#lx. Is xodus-service running?\n", hr );
+        if ( hr != E_ABORT ) ERR( "xodus-service request failed, hr %#lx. Is xodus-service running?\n", hr );
         return hr;
     }
 

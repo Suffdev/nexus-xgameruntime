@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 #pragma once
 #include "../../private.h"
+#include <atomic>
+#include <cstdlib>
 
 // An internal protocol dependency, not an exported runtime hook. The default
 // implementation always uses the actual local backend and Microsoft transport.
@@ -17,6 +19,20 @@ public:
                           BYTE **response, SIZE_T *responseSize ) = 0;
     virtual HRESULT HttpRaw( const WCHAR *method, const WCHAR *url, const WCHAR *headers, const void *body,
                              DWORD bodySize, DWORD *status, BYTE **response, SIZE_T *responseSize ) = 0;
+    // Appended private slot preserves existing transport methods. Legacy custom
+    // calls cannot be interrupted: their worker retains ownership until return.
+    // Returned buffers use the same malloc/free contract as Backend.
+    virtual HRESULT BackendCancellable( UINT16 type, const char *body, UINT16 size, char **response,
+                                        UINT16 *responseSize, const std::atomic<bool> &cancel )
+    {
+        if ( !response || !responseSize ) return E_INVALIDARG;
+        *response = nullptr; *responseSize = 0;
+        if ( cancel.load( std::memory_order_acquire ) ) return E_ABORT;
+        HRESULT hr = Backend( type, body, size, response, responseSize );
+        if ( cancel.load( std::memory_order_acquire ) ) hr = E_ABORT;
+        if ( FAILED( hr ) ) { free( *response ); *response = nullptr; *responseSize = 0; }
+        return hr;
+    }
 };
 
 UserTransport &GetUserTransport() noexcept;
