@@ -224,7 +224,7 @@ test('save commit recovery retains dirty revisions and tests cold relaunch confl
     assert.match(fixture,/#include "gamesave-transfer.cpp"/);
     for(const label of ['commit-release-error-visible','commit-relaunch-can-sync','commit-real-conflict-preserved','commit-real-conflict-no-write','newer-local-not-acknowledged','acknowledged-remote-base-durable','newer-local-relaunch-upload'])
         assert.ok(fixture.includes('"'+label+'"'),label);
-    assert.match(read('tests/CMakeLists.txt'),/foreach\(probe sync transfer commit atomic\)/);
+    assert.match(read('tests/CMakeLists.txt'),/foreach\(probe sync transfer commit atomic index\)/);
     assert.match(read('scripts/test-component.mjs'),/\['nexus_gamesave-commit', 183\]/);
     for(const label of ['read-error-sync-reported','read-error-update-reported','read-error-original-revision',
         'delete-failure-reported','delete-failure-index-unchanged','delete-retry-index'])
@@ -478,5 +478,13 @@ test('local save transactions require fault, crash and concurrent reader coverag
         'allocation-error-visible','readonly-original-attribute-retained','no-hardlinks-copy-fallback',
         'missing-index-does-not-reinitialize','missing-index-enumeration-reports-error',
         'missing-index-read-is-not-successful-empty','new-container-abort-leaves-no-visible-state'])
+        assert.ok(fixture.includes('"'+label+'"'),label);
+});
+
+
+test('invalid local indexes have mandatory native data-preservation coverage',()=>{
+    assert.match(read('scripts/test-component.mjs'),/\['nexus_gamesave-index', 1316\]/);
+    const fixture=read('tests/Nexus/gamesave-index.cpp');
+    for(const label of ['invalid-index-load-fails-closed','invalid-index-enumeration-reports-error','invalid-index-read-fails-closed','invalid-index-update-does-not-bless-state','invalid-index-update-preserves-index','invalid-index-sync-fails-closed','invalid-index-no-remote-write','invalid-index-no-download','invalid-index-sync-preserves-progress','legacy-valid-index-readable','legacy-read-does-not-rewrite'])
         assert.ok(fixture.includes('"'+label+'"'),label);
 });

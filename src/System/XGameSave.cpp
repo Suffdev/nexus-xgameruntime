@@ -633,11 +633,11 @@ static UINT64 state_total_size( const struct container_state *state )
 }
 
 #include "GameSave/LocalTransactions.h"
+#include "GameSave/Index.h"
 
 static HRESULT load_state( struct XGameSaveProvider *provider, const char *name, struct container_state *state )
 {
     char dir[2048], path[2048];
-    char *line, *next, *text;
     SIZE_T size;
     BYTE *data;
     HRESULT hr;
@@ -655,38 +655,9 @@ static HRESULT load_state( struct XGameSaveProvider *provider, const char *name,
             hr = missing_local_index( dir, hr );
         return hr;
     }
-    text = ( char * )data;
-    for ( line = text; line && *line; line = next )
-    {
-        char a[1024] = { 0 }, b[128] = { 0 };
-        unsigned int blobSize = 0;
-        if ( ( next = strchr( line, '\n' ) ) ) *next++ = 0;
-        if ( !strncmp( line, "display ", 8 ) )
-        {
-            free( state->display );
-            state->display = hex_decode( line + 8 );
-            if ( !state->display ) { free( data ); return E_OUTOFMEMORY; }
-        }
-        else if ( !strncmp( line, "time ", 5 ) )
-            state->time = _strtoui64( line + 5, NULL, 10 );
-        else if ( !strncmp( line, "remote ", 7 ) )
-            lstrcpynA( state->remote, strcmp( line + 7, "-" ) ? line + 7 : "", sizeof( state->remote ) );
-        else if ( !strncmp( line, "dirty ", 6 ) )
-            state->dirty = atoi( line + 6 );
-        else if ( !strncmp( line, "revision ", 9 ) )
-            state->revision = _strtoui64( line + 9, NULL, 10 );
-        else if ( sscanf( line, "blob %1023s %u %127s", a, &blobSize, b ) == 3 )
-        {
-            char *blobName = hex_decode( a );
-            struct blob_entry *entry = blobName ? add_blob( state, blobName ) : NULL;
-            free( blobName );
-            if ( !entry ) { free( data ); return E_OUTOFMEMORY; }
-            entry->size = blobSize;
-            lstrcpynA( entry->atom, strcmp( b, "-" ) ? b : "", sizeof( entry->atom ) );
-        }
-    }
+    hr = parse_local_index( ( char * )data, size, provider->files, name, state );
     free( data );
-    return S_OK;
+    return hr;
 }
 
 static HRESULT save_state( struct XGameSaveProvider *provider, const struct container_state *state )
@@ -769,21 +740,21 @@ static HRESULT enumerate_local( struct XGameSaveProvider *provider, container_ca
         {
             BYTE *text;
             SIZE_T size;
-            char *line, *end;
-            /* Hash directories are indexes, not container names. Recovery
-             * backups/incomplete downloads must never enter the cloud set. */
+            /* Hash directories are indexes, not container names. Validate
+             * the entire index and its identity before invoking any callback. */
             if ( strlen( data.cFileName ) != 64 || strspn( data.cFileName, "0123456789abcdef" ) != 64 ) continue;
             if ( FAILED( hr = read_file( index, &text, &size ) ) ) break;
-            line = strstr( ( char * )text, "\nname " );
-            if ( !line || !( end = strchr( line + 6, '\n' ) ) )
-            {
-                free( text );
-                continue;
-            }
-            *end = 0;
-            name = hex_decode( line + 6 );
+            container_state state{};
+            hr = parse_local_index( ( char * )text, size, TRUE, NULL, &state );
             free( text );
-            if ( !name ) continue;
+            if ( SUCCEEDED( hr ) )
+            {
+                char expected[2048];
+                if ( !container_dir( provider, state.name, expected, sizeof( expected ) ) ) hr = E_OUTOFMEMORY;
+                else if ( strcmp( strrchr( expected, '\\' ) + 1, data.cFileName ) ) hr = HRESULT_FROM_WIN32( ERROR_INVALID_DATA );
+            }
+            name = state.name; state.name = NULL; free_state( &state );
+            if ( FAILED( hr ) ) { free( name ); break; }
         }
         else
         {
