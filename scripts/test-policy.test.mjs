@@ -523,3 +523,19 @@ test('MSA caller cancellation requires actual production socket and lifetime cov
     }
     assert.match(read('scripts/test-authentication.mjs'),/if\(!cancellationPassed\)proof.passed=false/);
 });
+
+
+test('sign-in HTTP cancellation retains synchronous ownership and stops later work',()=>{
+    assert.match(read('scripts/test-component.mjs'),/\['nexus_http-cancellation', 137\]/);
+    const fixture=read('tests/Nexus/http-cancellation.cpp');
+    for(const label of ['http-worker-retained-until-native-return','http-cancel-does-not-close-inflight-owner-handles',
+        'http-no-retry-after-observed-cancel','http-canceled-output-empty','http-no-body-read-after-canceled-query',
+        'http-no-query-after-canceled-read','http-complete-response-discarded-before-publication',
+        'http-owned-handle-close-once','http-handle-body-tls-invariants','http-precancel-no-handles',
+        'http-independent-still-owned-after-other-cleanup','http-post-cancel-request-valid',
+        'http-legacy-ignores-unpassed-token'])assert.ok(fixture.includes('"'+label+'"'),label);
+    const name='SignInHttpCancellationRetainsHeldCallAndStopsEveryLaterPhase';
+    assert.ok(read('tests/Nexus/test_user.cpp').includes('TEST( NexusAuthentication, '+name+' )'));
+    assert.ok(read('scripts/test-authentication.mjs').includes("'"+name+"'"));
+    assert.equal([...read('src/System/XUser.cpp').matchAll(/user->transport\.HttpCancellable\(/g)].length,4);
+});

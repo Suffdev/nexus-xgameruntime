@@ -33,6 +33,21 @@ public:
         if ( FAILED( hr ) ) { free( *response ); *response = nullptr; *responseSize = 0; }
         return hr;
     }
+    // As with BackendCancellable, the compatibility fallback cannot interrupt
+    // an existing custom transport's synchronous call or release its inputs early.
+    virtual HRESULT HttpCancellable( const WCHAR *method, const WCHAR *url, char *body, const WCHAR *headers,
+                                     const WCHAR **accept, BYTE **response, SIZE_T *responseSize,
+                                     const std::atomic<bool> &cancel )
+    {
+        if ( !response || !responseSize ) return E_INVALIDARG;
+        *response = nullptr; *responseSize = 0;
+        if ( cancel.load( std::memory_order_acquire ) ) return E_ABORT;
+        HRESULT hr = Http( method, url, body, headers, accept, response, responseSize );
+        if ( cancel.load( std::memory_order_acquire ) ) hr = E_ABORT;
+        if ( FAILED( hr ) ) { free( *response ); *response = nullptr; *responseSize = 0; }
+        return hr;
+    }
+
 };
 
 UserTransport &GetUserTransport() noexcept;

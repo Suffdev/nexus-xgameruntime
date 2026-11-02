@@ -245,6 +245,12 @@ public:
     {
         return http_request( method, url, body, headers, accept, response, responseSize );
     }
+    HRESULT HttpCancellable( const WCHAR *method, const WCHAR *url, char *body, const WCHAR *headers,
+                             const WCHAR **accept, BYTE **response, SIZE_T *responseSize,
+                             const std::atomic<bool> &cancel ) override
+    {
+        return http_request_cancellable( method, url, body, headers, accept, response, responseSize, cancel );
+    }
     HRESULT HttpRaw( const WCHAR *method, const WCHAR *url, const WCHAR *headers, const void *body, DWORD bodySize,
                      DWORD *status, BYTE **response, SIZE_T *responseSize ) override
     {
@@ -406,8 +412,8 @@ static HRESULT device_auth( XUserHandle user, const char *deviceTicket, char **d
                                               size - 1, body, signature ) ) )
         goto cleanup;
     if ( !MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, signature, 104, header + 11, 104 ) ) goto error;
-    if ( FAILED( hr = user->transport.Http( L"POST", L"https://device.auth.xboxlive.com/device/authenticate", body,
-                                            header, ACCEPT_JSON, &buffer, &size ) ) )
+    if ( FAILED( hr = user->transport.HttpCancellable( L"POST", L"https://device.auth.xboxlive.com/device/authenticate", body,
+                                                       header, ACCEPT_JSON, &buffer, &size, user->cancelled ) ) )
         goto cleanup;
     if ( FAILED( hr = parse_json( ( char * )buffer, size, &object ) ) ) goto cleanup;
     if ( FAILED( hr = get_json_string( object, L"Token", &token ) ) ) goto cleanup;
@@ -466,8 +472,8 @@ static HRESULT sisu_auth( XUserHandle user, const char *userTicket, const char *
                                               signature ) ) )
         goto cleanup;
     if ( !MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, signature, 104, header + 11, 104 ) ) goto error;
-    if ( FAILED( hr = user->transport.Http( L"POST", L"https://sisu.xboxlive.com/authorize", body, header, ACCEPT_JSON,
-                                            &buffer, &size ) ) )
+    if ( FAILED( hr = user->transport.HttpCancellable( L"POST", L"https://sisu.xboxlive.com/authorize", body, header, ACCEPT_JSON,
+                                                       &buffer, &size, user->cancelled ) ) )
         goto cleanup;
 
     if ( FAILED( hr = parse_json( ( char * )buffer, size, &object ) ) ) goto cleanup;
@@ -799,8 +805,8 @@ HRESULT XUser::InitializeNetwork( XUserAddOptions options )
     /* The launcher already found Microsoft unreachable; fail as the network would. */
     if ( nexus::user::ForcedOffline() ) return HRESULT_FROM_WIN32( ERROR_WINHTTP_CANNOT_CONNECT );
     auth_metadata( "init-default-begin", user, E_PENDING, 0, FALSE, FALSE );
-    hr = user->transport.Http( L"GET", L"https://title.mgt.xboxlive.com/titles/default/endpoints?type=1", NULL, NULL,
-                               ACCEPT_JSON, &defaultBuffer, &defaultSize );
+    hr = user->transport.HttpCancellable( L"GET", L"https://title.mgt.xboxlive.com/titles/default/endpoints?type=1", NULL, NULL,
+                                          ACCEPT_JSON, &defaultBuffer, &defaultSize, user->cancelled );
     auth_metadata( "init-default-end", user, hr, 0, FALSE, FALSE );
     if ( FAILED( hr ) ) return hr;
     if ( cancelled )
@@ -851,8 +857,8 @@ HRESULT XUser::InitializeNetwork( XUserAddOptions options )
         goto cleanup;
     }
     auth_metadata( "init-current-begin", user, E_PENDING, 0, FALSE, FALSE );
-    hr = user->transport.Http( L"GET", L"https://title.mgt.xboxlive.com/titles/current/endpoints", NULL, auth,
-                               ACCEPT_JSON, &currentBuffer, &size );
+    hr = user->transport.HttpCancellable( L"GET", L"https://title.mgt.xboxlive.com/titles/current/endpoints", NULL, auth,
+                                          ACCEPT_JSON, &currentBuffer, &size, user->cancelled );
     auth_metadata( "init-current-end", user, hr, 0, FALSE, FALSE );
     if ( FAILED( hr ) ) goto cleanup;
     if ( cancelled )

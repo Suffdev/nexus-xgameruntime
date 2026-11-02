@@ -57,6 +57,9 @@ public:
     }
     bool currentFails = false, titleToken = true;
     std::string currentEndpoints = Endpoints();
+    unsigned blockedHttpStage = 0;
+    HANDLE httpEntered = CreateEventW( nullptr, TRUE, FALSE, nullptr );
+    HANDLE httpContinue = CreateEventW( nullptr, TRUE, FALSE, nullptr );
     bool blockBackend = false, cooperativeBackend = false;
     bool blockAuthorization = false, refuseAuthorization = false;
     DWORD authorizationThread = 0;
@@ -70,6 +73,7 @@ public:
         CloseHandle( authorizationContinue );
         CloseHandle( backendEntered );
         CloseHandle( backendContinue );
+        CloseHandle( httpEntered ); CloseHandle( httpContinue );
     }
     std::string xml = "<MSATokenResponse><Token>synthetic-rps</Token><DeviceRps>synthetic-device-rps</DeviceRps>"
                       "<XboxMsaAccountId>0123456789ABCDEF</XboxMsaAccountId><StoreMsaAccountId>fedcba9876543210</"
@@ -140,6 +144,11 @@ public:
         ++httpCalls;
         *output = nullptr;
         *length = 0;
+        if ( blockedHttpStage && httpCalls == blockedHttpStage )
+        {
+            SetEvent( httpEntered );
+            if ( WaitForSingleObject( httpContinue, 5000 ) != WAIT_OBJECT_0 ) return E_ABORT;
+        }
         if ( unreachable ) return HRESULT_FROM_WIN32( ERROR_WINHTTP_CANNOT_CONNECT );
         if ( !wcscmp( url, L"https://title.mgt.xboxlive.com/titles/default/endpoints?type=1" ) )
         {
@@ -742,6 +751,42 @@ TEST( NexusAuthentication, LegacyBackendFallbackWaitsForOwnerThenDiscardsCancele
     response = nullptr; length = 0; auto before = independent.backendCalls;
     EXPECT_EQ( independent.BackendCancellable( 3, "<MSATokenRequest>", 17, &response, &length, cancel ), E_ABORT );
     EXPECT_EQ( independent.backendCalls, before ); EXPECT_EQ( response, nullptr ); EXPECT_EQ( length, 0u );
+}
+
+TEST( NexusAuthentication, SignInHttpCancellationRetainsHeldCallAndStopsEveryLaterPhase )
+{
+    Apartment apartment;
+    for ( unsigned stage = 1; stage <= 4; ++stage )
+    {
+        SCOPED_TRACE( stage ); SyntheticTransport transport; transport.blockedHttpStage = stage;
+        XUserImpl users( transport ); IXThreadingImpl *threads = nullptr;
+        ASSERT_EQ( QueryApiImpl( CLSID_XThreadingImpl, __uuidof( IXThreadingImpl ), reinterpret_cast<void **>( &threads ) ), S_OK );
+        XTaskQueueHandle queue = nullptr;
+        ASSERT_EQ( threads->XTaskQueueCreate( XTaskQueueDispatchMode::ThreadPool, XTaskQueueDispatchMode::Manual, &queue ), S_OK );
+        struct State { IXThreadingImpl *threads; XTaskQueueHandle queue; unsigned callbacks = 0; } state{ threads, queue };
+        auto block = new XAsyncBlock{}; block->queue = queue; block->context = &state;
+        block->callback = []( XAsyncBlock *done ) WINAPI
+        {
+            auto state = static_cast<State *>( done->context ); ++state->callbacks;
+            EXPECT_EQ( state->threads->XAsyncGetStatus( done, FALSE ), E_ABORT );
+            *done = {}; done->queue = state->queue; done->context = state;
+            done->callback = []( XAsyncBlock *reused ) WINAPI { ++static_cast<State *>( reused->context )->callbacks; delete reused; };
+            EXPECT_EQ( state->threads->XAsyncRun( done, []( XAsyncBlock * ) WINAPI -> HRESULT { return S_OK; } ), S_OK );
+        };
+        ASSERT_EQ( users.XUserAddAsync( XUserAddOptions::AddDefaultUserSilently, block ), S_OK );
+        EXPECT_EQ( WaitForSingleObject( transport.httpEntered, 3000 ), WAIT_OBJECT_0 );
+        threads->XAsyncCancel( block ); EXPECT_EQ( threads->XAsyncGetStatus( block, FALSE ), E_ABORT );
+        EXPECT_EQ( WaitForUserSignInWorkers( 0 ), HRESULT_FROM_WIN32( ERROR_TIMEOUT ) );
+        EXPECT_EQ( state.callbacks, 0u );
+        EXPECT_TRUE( threads->XTaskQueueDispatch( queue, XTaskQueuePort::Completion, 3000 ) );
+        EXPECT_TRUE( threads->XTaskQueueDispatch( queue, XTaskQueuePort::Completion, 3000 ) );
+        EXPECT_EQ( state.callbacks, 2u ); // one abort, one new operation on the reused block
+        EXPECT_EQ( WaitForUserSignInWorkers( 0 ), HRESULT_FROM_WIN32( ERROR_TIMEOUT ) );
+        SetEvent( transport.httpContinue ); EXPECT_EQ( WaitForUserSignInWorkers( 3000 ), S_OK );
+        EXPECT_EQ( transport.httpCalls, stage ); EXPECT_EQ( transport.backendCalls, stage == 1 ? 0u : 1u );
+        EXPECT_EQ( transport.rawCalls, 0u ); EXPECT_EQ( transport.unexpected, 0u );
+        threads->XTaskQueueCloseHandle( queue ); threads->Release();
+    }
 }
 
 TEST( NexusAuthentication, AsyncResultTransfersRealIdentityAndChecksOperationIdentity )

@@ -1,4 +1,4 @@
-foreach(probe IN ITEMS auth-rejection-metadata token-endpoint store-public-fetch backend-request backend-cancellation)
+foreach(probe IN ITEMS auth-rejection-metadata token-endpoint store-public-fetch backend-request backend-cancellation http-cancellation)
     add_executable(nexus_${probe} Nexus/${probe}.cpp)
     add_dependencies(nexus_${probe} xgameruntime-idl)
     target_include_directories(nexus_${probe} PRIVATE "${IDL_BINARY_DIR}" "${PROJECT_SOURCE_DIR}/include")
