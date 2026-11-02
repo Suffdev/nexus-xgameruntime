@@ -1,20 +1,5 @@
-# Compile the exact XML parser already carried by the pinned Wine source.
-# No system parser, network fetch, or dependency-version fallback is permitted.
-if(NOT NEXUS_WINE_SOURCE)
-    message(FATAL_ERROR "Set NEXUS_WINE_SOURCE to the matching pinned Wine source tree")
-endif()
-set(XML2_SOURCE "${NEXUS_WINE_SOURCE}/libs/xml2")
-file(READ "${CMAKE_CURRENT_LIST_DIR}/xml2.lock.json" XML2_LOCK)
-string(JSON XML2_COUNT LENGTH "${XML2_LOCK}" files)
-math(EXPR XML2_LAST "${XML2_COUNT} - 1")
-foreach(INDEX RANGE ${XML2_LAST})
-    string(JSON NAME MEMBER "${XML2_LOCK}" files ${INDEX})
-    string(JSON EXPECTED GET "${XML2_LOCK}" files "${NAME}")
-    file(SHA256 "${XML2_SOURCE}/${NAME}" ACTUAL)
-    if(NOT ACTUAL STREQUAL EXPECTED)
-        message(FATAL_ERROR "Pinned XML source mismatch: ${NAME}")
-    endif()
-endforeach()
+# Compile only the exact parser verified by the unchanged 99-file source lock.
+include("${CMAKE_CURRENT_LIST_DIR}/Xml2Source.cmake")
 
 add_library(nexus-xml2 STATIC
     "${XML2_SOURCE}/HTMLparser.c"
