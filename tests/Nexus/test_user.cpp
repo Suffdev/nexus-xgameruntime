@@ -1315,3 +1315,25 @@ TEST( NexusOfflineIdentity, AStaleIdentityIsNotUsed )
     EXPECT_EQ( user->SignInOffline( Unreachable ), Unreachable );
     EXPECT_EQ( user->xuid, 0u );
 }
+
+TEST( NexusAuthentication, EndpointPathsAcceptRelativeAndAbsoluteServiceMetadata )
+{
+    Apartment apartment;
+    for ( const auto path : { "login", "/login", "login/platform", "/login/platform" } )
+    {
+        SyntheticTransport transport;
+        transport.currentEndpoints = std::string( R"({"EndPoints":[{"Protocol":"https","Host":"*.service.example.invalid","HostType":"wildcard","Path":")" ) + path +
+            R"(","RelyingParty":"rp://synthetic-service/","TokenType":"JWT"}]})";
+        auto user = CreateUser( transport );
+        ASSERT_EQ( user->InitializeNetwork( XUserAddOptions::AddDefaultUserSilently ), S_OK );
+        user->initDone = 1; user->initResult = S_OK;
+        endpoint info{};
+        ASSERT_EQ( user->GetEndpointInfo( "https://auth.service.example.invalid/login/platform/xbox", &info ), S_OK ) << path;
+        EXPECT_STREQ( WindowsGetStringRawBuffer( info.relyingParty, nullptr ), L"rp://synthetic-service/" );
+        EXPECT_STREQ( WindowsGetStringRawBuffer( info.tokenType, nullptr ), L"JWT" );
+        EXPECT_EQ( info.policy, nullptr );
+        EXPECT_TRUE( FAILED( user->GetEndpointInfo( "https://auth.service.example.invalid/other/login/platform", &info ) ) );
+        EXPECT_TRUE( FAILED( user->GetEndpointInfo( "http://auth.service.example.invalid/login/platform", &info ) ) );
+        EXPECT_TRUE( FAILED( user->GetEndpointInfo( "https://auth.foreign.invalid/login/platform", &info ) ) );
+    }
+}

@@ -1345,8 +1345,21 @@ HRESULT WINAPI XUser::GetEndpointInfo( const char *url, struct endpoint *info )
         const WCHAR *host = WindowsGetStringRawBuffer( impl->endpoints[i].host, &hostLen );
         const WCHAR *path = WindowsGetStringRawBuffer( impl->endpoints[i].path, &pathLen );
         if ( uc.dwSchemeLength != protocolLen || wcsnicmp( uc.lpszScheme, protocol, protocolLen ) ) continue;
-        if ( impl->endpoints[i].path && ( uc.dwUrlPathLength < pathLen || wcsncmp( uc.lpszUrlPath, path, pathLen ) ) )
-            continue;
+        if ( impl->endpoints[i].path )
+        {
+            const WCHAR *urlPath = uc.lpszUrlPath;
+            UINT32 urlPathLen = uc.dwUrlPathLength;
+            /* Service metadata accepts paths relative to the URL root ("login")
+             * as well as absolute paths ("/login"). WinHTTP includes the root
+             * slash in its parsed path. Keep all remaining bytes and the
+             * existing case-sensitive prefix semantics unchanged. */
+            if ( pathLen && path[0] != '/' && urlPathLen && urlPath[0] == '/' )
+            {
+                ++urlPath;
+                --urlPathLen;
+            }
+            if ( urlPathLen < pathLen || wcsncmp( urlPath, path, pathLen ) ) continue;
+        }
         if ( impl->endpoints[i].wildcard )
         {
             if ( !match && match_wildcard( host, hostLen, uc.lpszHostName, uc.dwHostNameLength ) )
