@@ -129,8 +129,9 @@ test('XML parser inputs are pinned and checked without fallback or external enti
     const lock=JSON.parse(read('cmake/xml2.lock.json'));
     assert.equal(lock.commit,'7fc704ef49c50e9702c9983a5250d5738697bb04');
     assert.ok(Object.keys(lock.files).length>70);
-    assert.match(read('cmake/Xml2.cmake'),/file\(SHA256/);
-    assert.match(read('cmake/Xml2.cmake'),/FATAL_ERROR "Pinned XML source mismatch/);
+    assert.match(read('cmake/Xml2.cmake'),/include.*Xml2Source\.cmake/);
+    assert.match(read('cmake/Xml2Source.cmake'),/file\(SHA256/);
+    assert.match(read('cmake/Xml2Source.cmake'),/FATAL_ERROR "Pinned XML source mismatch/);
     assert.match(read('src/Runtime/Xml.cpp'),/XML_PARSE_NONET/);
     assert.match(read('src/Runtime/Xml.cpp'),/XML_PARSER_LOADDTD, 0/);
     assert.match(read('src/Runtime/Xml.cpp'),/XML_PARSER_SUBST_ENTITIES, 0/);
