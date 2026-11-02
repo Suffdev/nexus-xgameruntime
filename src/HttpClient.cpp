@@ -200,7 +200,9 @@ cleanup:
         const BYTE *inp = data;                                                                                        \
         type *out = base64;                                                                                            \
                                                                                                                        \
-        if ( ( dataSize * 8 + 5 ) / 6 + ( pad ? ( 4 - ( dataSize % 4 ) ) % 4 : 0 ) > base64Size )                      \
+        const UINT64 required = pad ? ( ( UINT64( dataSize ) + 2 ) / 3 ) * 4                                  \
+                                    : ( UINT64( dataSize ) * 8 + 5 ) / 6;                                     \
+        if ( required > base64Size )                                                                                  \
             return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );                                                    \
                                                                                                                        \
         for ( UINT32 i = 0; i < dataSize / 3; i++ )                                                                    \
