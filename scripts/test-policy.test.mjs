@@ -210,7 +210,7 @@ test('save commit recovery retains dirty revisions and tests cold relaunch confl
     assert.match(fixture,/#include "gamesave-transfer.cpp"/);
     for(const label of ['commit-release-error-visible','commit-relaunch-can-sync','commit-real-conflict-preserved','commit-real-conflict-no-write','newer-local-not-acknowledged','acknowledged-remote-base-durable','newer-local-relaunch-upload'])
         assert.ok(fixture.includes('"'+label+'"'),label);
-    assert.match(read('tests/CMakeLists.txt'),/foreach\(probe sync transfer commit\)/);
+    assert.match(read('tests/CMakeLists.txt'),/foreach\(probe sync transfer commit atomic\)/);
     assert.match(read('scripts/test-component.mjs'),/\['nexus_gamesave-commit', 183\]/);
     for(const label of ['read-error-sync-reported','read-error-update-reported','read-error-original-revision',
         'delete-failure-reported','delete-failure-index-unchanged','delete-retry-index'])
@@ -451,4 +451,18 @@ test('save conflicts retain explicit choices, backups and native regression cove
     assert.match(read('scripts/test-component.mjs'),new RegExp("\\['nexus_gamesave-sync', "+entry.conflictNativeChecks+"\\]"));
     assert.match(source,/run_conflicts\( FALSE \)/);assert.match(source,/run_conflicts\( TRUE \)/);
     assert.doesNotMatch(read('src/xgameruntime.def'),/SaveConflict|ResolveConflict/);
+});
+
+
+test('local save transactions require fault, crash and concurrent reader coverage',()=>{
+    const fixture=read('tests/Nexus/gamesave-atomic.cpp');
+    assert.match(read('scripts/test-component.mjs'),/\['nexus_gamesave-atomic', 586\]/);
+    assert.match(fixture,/#include "gamesave-transfer.cpp"/);
+    for(const label of ['failed-write-rolls-back-delete','locked-second-fails-whole-update',
+        'failed-rollback-not-empty-save','cleanup-retains-discoverable-identity','killed-at-injected-boundary',
+        'restart-sync-recovers-first','concurrent-readers-never-see-mixed-revisions','concurrent-no-lost-updates',
+        'allocation-error-visible','readonly-original-attribute-retained','no-hardlinks-copy-fallback',
+        'missing-index-does-not-reinitialize','missing-index-enumeration-reports-error',
+        'missing-index-read-is-not-successful-empty','new-container-abort-leaves-no-visible-state'])
+        assert.ok(fixture.includes('"'+label+'"'),label);
 });

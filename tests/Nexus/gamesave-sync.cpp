@@ -234,6 +234,7 @@ static void run_provider( BOOL files )
     WCHAR temp[MAX_PATH];
     char path[1024];
     struct XGameSaveProvider provider = { 0 };
+    InitializeCriticalSection( &provider.cs );
     HRESULT hr;
     printf( "CASE provider %s\n", files ? "files" : "blobs" );
     provider.transport = &closedTransport;
@@ -408,6 +409,7 @@ static void run_provider( BOOL files )
     }
     free( provider.auth );
     CHECK( "no-network-writes", writes == 0 );
+    DeleteCriticalSection( &provider.cs );
 }
 static void check_bytes( XGameSaveProvider *provider, const char *name, const char *expected )
 {

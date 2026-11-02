@@ -480,15 +480,20 @@ static HRESULT read_file( const char *path, BYTE **data, SIZE_T *size )
 
 static HRESULT write_file( const char *path, const void *data, SIZE_T size )
 {
-    char tmp[2048 + 8];
-    WCHAR wide[4096], temporary[4096];
+    char tmp[2048 + 64], suffix[64];
+    WCHAR wide[4096], temporary[4096], guid_text[40];
     HANDLE file;
     DWORD error = ERROR_SUCCESS;
 
-    snprintf( tmp, sizeof( tmp ), "%s.tmp", path );
+    GUID guid;
+    HRESULT hr = CoCreateGuid( &guid );
+    if ( FAILED( hr ) ) return hr;
+    if ( !StringFromGUID2( guid, guid_text, ARRAY_SIZE( guid_text ) ) ||
+         !WideCharToMultiByte( CP_UTF8, 0, guid_text, -1, suffix, sizeof( suffix ), NULL, NULL ) ||
+         snprintf( tmp, sizeof( tmp ), "%s.tmp-%s", path, suffix ) >= sizeof( tmp ) ) return E_INVALIDARG;
     if ( !save_wide_path( path, wide ) || !save_wide_path( tmp, temporary ) )
         return HRESULT_FROM_WIN32( GetLastError() );
-    file = CreateFileW( temporary, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL );
+    file = CreateFileW( temporary, GENERIC_WRITE, 0, NULL, CREATE_NEW, 0, NULL );
     if ( file == INVALID_HANDLE_VALUE ) return HRESULT_FROM_WIN32( GetLastError() );
     SIZE_T offset = 0;
     while ( offset < size )
@@ -627,6 +632,8 @@ static UINT64 state_total_size( const struct container_state *state )
     return total;
 }
 
+#include "GameSave/LocalTransactions.h"
+
 static HRESULT load_state( struct XGameSaveProvider *provider, const char *name, struct container_state *state )
 {
     char dir[2048], path[2048];
@@ -636,10 +643,18 @@ static HRESULT load_state( struct XGameSaveProvider *provider, const char *name,
     HRESULT hr;
 
     memset( state, 0, sizeof( *state ) );
+    save_root_lock lock( provider );
+    if ( FAILED( lock.status ) ) return lock.status;
+    if ( FAILED( hr = recover_local_update( provider, name ) ) ) return hr;
     if ( !( state->name = strdup( name ) ) ) return E_OUTOFMEMORY;
     if ( !container_dir( provider, name, dir, sizeof( dir ) ) ) return E_OUTOFMEMORY;
     snprintf( path, sizeof( path ), "%s\\index", dir );
-    if ( FAILED( hr = read_file( path, &data, &size ) ) ) return hr;
+    if ( FAILED( hr = read_file( path, &data, &size ) ) )
+    {
+        if ( hr == HRESULT_FROM_WIN32( ERROR_FILE_NOT_FOUND ) || hr == HRESULT_FROM_WIN32( ERROR_PATH_NOT_FOUND ) )
+            hr = missing_local_index( dir, hr );
+        return hr;
+    }
     text = ( char * )data;
     for ( line = text; line && *line; line = next )
     {
@@ -647,7 +662,11 @@ static HRESULT load_state( struct XGameSaveProvider *provider, const char *name,
         unsigned int blobSize = 0;
         if ( ( next = strchr( line, '\n' ) ) ) *next++ = 0;
         if ( !strncmp( line, "display ", 8 ) )
+        {
+            free( state->display );
             state->display = hex_decode( line + 8 );
+            if ( !state->display ) { free( data ); return E_OUTOFMEMORY; }
+        }
         else if ( !strncmp( line, "time ", 5 ) )
             state->time = _strtoui64( line + 5, NULL, 10 );
         else if ( !strncmp( line, "remote ", 7 ) )
@@ -661,7 +680,7 @@ static HRESULT load_state( struct XGameSaveProvider *provider, const char *name,
             char *blobName = hex_decode( a );
             struct blob_entry *entry = blobName ? add_blob( state, blobName ) : NULL;
             free( blobName );
-            if ( !entry ) continue;
+            if ( !entry ) { free( data ); return E_OUTOFMEMORY; }
             entry->size = blobSize;
             lstrcpynA( entry->atom, strcmp( b, "-" ) ? b : "", sizeof( entry->atom ) );
         }
@@ -672,6 +691,10 @@ static HRESULT load_state( struct XGameSaveProvider *provider, const char *name,
 
 static HRESULT save_state( struct XGameSaveProvider *provider, const struct container_state *state )
 {
+    save_root_lock lock( provider );
+    if ( FAILED( lock.status ) ) return lock.status;
+    HRESULT recovery = recover_local_update( provider, state->name );
+    if ( FAILED( recovery ) ) return recovery;
     char dir[2048], path[2048], *hex, *text;
     SIZE_T size = 256 + ( provider->files ? strlen( state->name ) * 2 + 8 : 0 ) +
                   ( state->display ? strlen( state->display ) * 2 : 0 ),
@@ -684,6 +707,7 @@ static HRESULT save_state( struct XGameSaveProvider *provider, const struct cont
     create_directories( dir );
     if ( !( text = static_cast<std::remove_reference_t<decltype( text )>>( calloc( 1, size ) ) ) ) return E_OUTOFMEMORY;
     hex = hex_encode( state->display ? state->display : "" );
+    if ( !hex ) { free( text ); return E_OUTOFMEMORY; }
     len += snprintf( text + len, size - len, "display %s\ntime %I64u\nremote %s\ndirty %d\n", hex ? hex : "",
                      state->time, state->remote[0] ? state->remote : "-", state->dirty );
     free( hex );
@@ -703,6 +727,7 @@ static HRESULT save_state( struct XGameSaveProvider *provider, const struct cont
     for ( UINT32 i = 0; i < state->count; i++ )
     {
         hex = hex_encode( state->blobs[i].name );
+        if ( !hex ) { free( text ); return E_OUTOFMEMORY; }
         len += snprintf( text + len, size - len, "blob %s %u %s\n", hex ? hex : "", state->blobs[i].size,
                          state->blobs[i].atom[0] ? state->blobs[i].atom : "-" );
         free( hex );
@@ -717,6 +742,11 @@ typedef BOOL ( *container_callback )( struct XGameSaveProvider *provider, const 
 
 static HRESULT enumerate_local( struct XGameSaveProvider *provider, container_callback callback, void *context )
 {
+    save_cs_lock local( &provider->cs );
+    save_root_lock lock( provider );
+    if ( FAILED( lock.status ) ) return lock.status;
+    HRESULT recovery = recover_local_updates( provider );
+    if ( FAILED( recovery ) ) return recovery;
     char pattern[2048], index[2048];
     WIN32_FIND_DATAA data;
     HANDLE find;
@@ -757,8 +787,11 @@ static HRESULT enumerate_local( struct XGameSaveProvider *provider, container_ca
         }
         else
         {
-            if ( GetFileAttributesA( index ) == INVALID_FILE_ATTRIBUTES ) continue;
+            SIZE_T length = strlen( data.cFileName );
+            if ( !length || length % 2 || length > 512 ||
+                 strspn( data.cFileName, "0123456789abcdefABCDEF" ) != length ) continue;
             if ( !( name = hex_decode( data.cFileName ) ) ) continue;
+            if ( strlen( name ) * 2 != length ) { free( name ); continue; }
         }
         more = callback( provider, name, context );
         free( name );
@@ -1032,10 +1065,12 @@ static HRESULT upload_large_atom( struct XGameSaveProvider *provider, const char
  * older in-flight snapshot must never acknowledge a newer local write. */
 static HRESULT record_cloud_commit( struct XGameSaveProvider *provider, const struct container_state *uploaded )
 {
+    save_cs_lock local( &provider->cs );
+    save_root_lock lock( provider );
+    if ( FAILED( lock.status ) ) return lock.status;
     struct container_state current;
     HRESULT hr;
 
-    EnterCriticalSection( &provider->cs );
     hr = load_state( provider, uploaded->name, &current );
     if ( SUCCEEDED( hr ) )
     {
@@ -1043,7 +1078,6 @@ static HRESULT record_cloud_commit( struct XGameSaveProvider *provider, const st
         hr = save_state( provider, &current );
     }
     free_state( &current );
-    LeaveCriticalSection( &provider->cs );
     return hr;
 }
 
@@ -1168,6 +1202,8 @@ static void free_upload( struct save_upload *upload )
  * game is free to overwrite or delete the live files while HTTP is in flight. */
 static struct save_upload *snapshot_upload( struct XGameSaveProvider *provider, const char *name )
 {
+    save_root_lock lock( provider );
+    if ( FAILED( lock.status ) ) return NULL;
     struct save_upload *upload =
         static_cast<std::remove_reference_t<decltype( upload )>>( calloc( 1, sizeof( *upload ) ) );
     char path[2048];
@@ -1255,22 +1291,26 @@ static DWORD WINAPI upload_worker( void *context )
             }
             hr = cloud_upload_data( provider, &upload->state, upload->data, upload->sizes );
             EnterCriticalSection( &provider->cs );
-            if ( SUCCEEDED( hr ) && SUCCEEDED( load_state( provider, upload->state.name, &current ) ) )
             {
-                /* Same-second writes are distinct revisions. Never acknowledge
-                 * newer data using the successful upload of an older snapshot. */
-                if ( current.revision == upload->state.revision )
-                    hr = save_state( provider, &upload->state );
-                else
+                save_root_lock lock( provider );
+                if ( SUCCEEDED( hr ) ) hr = lock.status;
+                if ( SUCCEEDED( hr ) && SUCCEEDED( load_state( provider, upload->state.name, &current ) ) )
                 {
-                    lstrcpynA( current.remote, upload->state.remote, sizeof( current.remote ) );
-                    hr = save_state( provider, &current );
+                    /* Same-second writes are distinct revisions. Never acknowledge
+                     * newer data using the successful upload of an older snapshot. */
+                    if ( current.revision == upload->state.revision )
+                        hr = save_state( provider, &upload->state );
+                    else
+                    {
+                        lstrcpynA( current.remote, upload->state.remote, sizeof( current.remote ) );
+                        hr = save_state( provider, &current );
+                    }
+                    free_state( &current );
                 }
-                free_state( &current );
+                else if ( SUCCEEDED( hr ) )
+                    free_state( &current );
+                if ( FAILED( hr ) ) WARN( "background upload failed, hr %#lx; dirty save retained for retry.\n", hr );
             }
-            else if ( SUCCEEDED( hr ) )
-                free_state( &current );
-            if ( FAILED( hr ) ) WARN( "background upload failed, hr %#lx; dirty save retained for retry.\n", hr );
             LeaveCriticalSection( &provider->cs );
             LeaveCriticalSection( &provider->cloud_cs );
             free_upload( upload );
@@ -1395,6 +1435,12 @@ static HRESULT files_validate_download( const container_state *state );
 
 static HRESULT cloud_sync( struct XGameSaveProvider *provider )
 {
+    save_cs_lock cloud( provider->upload_thread ? &provider->cloud_cs : NULL );
+    save_cs_lock local( &provider->cs );
+    save_root_lock lock( provider );
+    if ( FAILED( lock.status ) ) return lock.status;
+    HRESULT recovery = recover_local_updates( provider );
+    if ( FAILED( recovery ) ) return recovery;
     struct remote_container *remote = NULL;
     enum sync_mode mode;
     const char *blobs, *item;
@@ -1718,6 +1764,15 @@ static HRESULT delete_container( struct XGameSaveProvider *provider, const char 
      * snapshots so they can never recreate the deleted remote container. */
     if ( provider->upload_thread ) EnterCriticalSection( &provider->cloud_cs );
     EnterCriticalSection( &provider->cs );
+    save_root_lock lock( provider );
+    hr = lock.status;
+    if ( SUCCEEDED( hr ) ) hr = recover_local_update( provider, name );
+    if ( FAILED( hr ) )
+    {
+        LeaveCriticalSection( &provider->cs );
+        if ( provider->upload_thread ) LeaveCriticalSection( &provider->cloud_cs );
+        return hr;
+    }
     if ( !container_dir( provider, name, dir, sizeof( dir ) ) )
         hr = E_OUTOFMEMORY;
     else
@@ -1743,6 +1798,7 @@ struct info_context
     void *context;
     XGameSaveContainerInfoCallback *callback;
     BOOL found;
+    HRESULT hr = S_OK;
 };
 
 static BOOL info_callback( struct XGameSaveProvider *provider, const char *name, void *context )
@@ -1754,10 +1810,10 @@ static BOOL info_callback( struct XGameSaveProvider *provider, const char *name,
 
     if ( ctx->exact && strcmp( ctx->exact, name ) ) return TRUE;
     if ( ctx->prefix && strncmp( ctx->prefix, name, strlen( ctx->prefix ) ) ) return TRUE;
-    if ( FAILED( load_state( provider, name, &state ) ) )
+    if ( FAILED( ctx->hr = load_state( provider, name, &state ) ) )
     {
         free_state( &state );
-        return TRUE;
+        return FALSE;
     }
     info.name = state.name;
     info.displayName = state.display ? state.display : state.name;
@@ -1779,9 +1835,9 @@ static HRESULT enumerate_containers( struct XGameSaveProvider *provider, const c
     struct info_context ctx = { prefix, exact, context, callback, FALSE };
     if ( !provider || !callback ) return E_INVALIDARG;
     EnterCriticalSection( &provider->cs );
-    enumerate_local( provider, info_callback, &ctx );
+    HRESULT hr = enumerate_local( provider, info_callback, &ctx );
     LeaveCriticalSection( &provider->cs );
-    return S_OK;
+    return FAILED( hr ) ? hr : ctx.hr;
 }
 
 static HRESULT enumerate_blobs( struct XGameSaveContainer *container, const char *prefix, void *context,
@@ -1819,6 +1875,9 @@ struct read_request
 
 static HRESULT prepare_read( struct read_request *req )
 {
+    save_cs_lock local( &req->container->provider->cs );
+    save_root_lock lock( req->container->provider );
+    if ( FAILED( lock.status ) ) return lock.status;
     struct container_state state;
     char path[2048];
     SIZE_T size = 0, offset;
@@ -1830,7 +1889,8 @@ static HRESULT prepare_read( struct read_request *req )
     {
         free_state( &state );
         LeaveCriticalSection( &req->container->provider->cs );
-        hr = req->names ? E_GS_BLOB_NOT_FOUND : ( req->preparedCount = 0, req->preparedSize = 0, S_OK );
+        if ( hr == HRESULT_FROM_WIN32( ERROR_FILE_NOT_FOUND ) || hr == HRESULT_FROM_WIN32( ERROR_PATH_NOT_FOUND ) )
+            hr = req->names ? E_GS_BLOB_NOT_FOUND : ( req->preparedCount = 0, req->preparedSize = 0, S_OK );
         return hr;
     }
     count = req->names ? req->count : state.count;
@@ -1921,40 +1981,65 @@ static struct read_request *create_read_request( struct XGameSaveContainer *cont
 static HRESULT submit_update( struct XGameSaveUpdate *update )
 {
     struct XGameSaveProvider *provider = update->container->provider;
+    save_cs_lock local( &provider->cs );
+    save_root_lock lock( provider );
+    if ( FAILED( lock.status ) ) return lock.status;
+    local_save_transaction transaction( provider, update->container->name );
     struct container_state state;
     char path[2048];
     UINT64 total = 0;
     HRESULT hr = S_OK;
 
     for ( UINT32 i = 0; i < update->count; i++ )
+    {
+        if ( update->ops[i].size > 16 * 1024 * 1024 - total ) return E_GS_UPDATE_TOO_BIG;
         total += update->ops[i].size;
-    if ( total > 16 * 1024 * 1024 ) return E_GS_UPDATE_TOO_BIG;
+    }
 
-    EnterCriticalSection( &provider->cs );
     hr = load_state( provider, update->container->name, &state );
     if ( hr == HRESULT_FROM_WIN32( ERROR_FILE_NOT_FOUND ) || hr == HRESULT_FROM_WIN32( ERROR_PATH_NOT_FOUND ) )
     {
         free_state( &state );
         hr = ( state.name = strdup( update->container->name ) ) ? S_OK : E_OUTOFMEMORY;
     }
-    if ( update->display )
+    if ( SUCCEEDED( hr ) && update->display )
     {
         free( state.display );
         state.display = strdup( update->display );
+        if ( !state.display ) hr = E_OUTOFMEMORY;
     }
-    else if ( !state.display )
-        state.display = strdup( update->container->name );
-    if ( SUCCEEDED( hr ) )
+    else if ( SUCCEEDED( hr ) && !state.display && !( state.display = strdup( update->container->name ) ) )
+        hr = E_OUTOFMEMORY;
+    // Check sharing/readonly restrictions on every destination before staging.
+    // Replacing the whole directory must not bypass a locked blob or index.
+    for ( UINT32 i = 0; SUCCEEDED( hr ) && i <= update->count; i++ )
     {
-        char dir[2048];
-        container_dir( provider, state.name, dir, sizeof( dir ) );
-        create_directories( dir );
+        WCHAR wide[4096];
+        if ( i == update->count )
+        {
+            char dir[2048];
+            if ( !container_dir( provider, state.name, dir, sizeof( dir ) ) ||
+                 snprintf( path, sizeof( path ), "%s\\index", dir ) >= sizeof( path ) ) { hr = E_INVALIDARG; break; }
+        }
+        else if ( !blob_path( provider, state.name, update->ops[i].name, path, sizeof( path ) ) )
+        { hr = E_INVALIDARG; break; }
+        if ( !save_wide_path( path, wide ) ) { hr = E_INVALIDARG; break; }
+        DWORD attributes;
+        hr = save_path_attributes( path, &attributes );
+        if ( hr == S_FALSE ) { hr = S_OK; continue; }
+        if ( FAILED( hr ) ) break;
+        if ( attributes & ( FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_READONLY ) ) { hr = E_ACCESSDENIED; break; }
+        HANDLE probe = CreateFileW( wide, DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                    NULL, OPEN_EXISTING, 0, NULL );
+        if ( probe == INVALID_HANDLE_VALUE ) hr = HRESULT_FROM_WIN32( GetLastError() );
+        else CloseHandle( probe );
     }
+    if ( SUCCEEDED( hr ) ) hr = transaction.prepare();
 
     for ( UINT32 i = 0; SUCCEEDED( hr ) && i < update->count; i++ )
     {
         struct update_op *op = &update->ops[i];
-        if ( !blob_path( provider, state.name, op->name, path, sizeof( path ) ) )
+        if ( !blob_path( &transaction.staged, state.name, op->name, path, sizeof( path ) ) )
         {
             hr = E_OUTOFMEMORY;
             break;
@@ -1989,15 +2074,14 @@ static HRESULT submit_update( struct XGameSaveUpdate *update )
         state.time = unix_now();
         state.dirty = TRUE;
         state.revision++;
-        hr = save_state( provider, &state );
+        hr = save_state( &transaction.staged, &state );
     }
+    if ( SUCCEEDED( hr ) ) hr = transaction.commit();
     if ( SUCCEEDED( hr ) && provider->cloud )
     {
         queue_upload( provider, state.name );
     }
     free_state( &state );
-    LeaveCriticalSection( &provider->cs );
-
     return hr;
 }
 
