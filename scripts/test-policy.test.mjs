@@ -202,7 +202,10 @@ test('save commit recovery retains dirty revisions and tests cold relaunch confl
     for(const label of ['commit-release-error-visible','commit-relaunch-can-sync','commit-real-conflict-preserved','commit-real-conflict-no-write','newer-local-not-acknowledged','acknowledged-remote-base-durable','newer-local-relaunch-upload'])
         assert.ok(fixture.includes('"'+label+'"'),label);
     assert.match(read('tests/CMakeLists.txt'),/foreach\(probe sync transfer commit\)/);
-    assert.match(read('scripts/test-component.mjs'),/\['nexus_gamesave-commit', 107\]/);
+    assert.match(read('scripts/test-component.mjs'),/\['nexus_gamesave-commit', 183\]/);
+    for(const label of ['read-error-sync-reported','read-error-update-reported','read-error-original-revision',
+        'delete-failure-reported','delete-failure-index-unchanged','delete-retry-index'])
+        assert.ok(fixture.includes('"'+label+'"'));
 });
 
 test('save result APIs never inspect opaque async storage or share operation identities',()=>{

@@ -149,6 +149,38 @@ static void first_local_update_still_works( void )
     close_provider( p );
 }
 
+static void failed_delete_retains_index( void )
+{
+    auto p = device( FALSE, "delete-locked-blob" );
+    p->cloud = FALSE;
+    seed( p, "retained", FALSE );
+    char path[2048];
+    WCHAR wide[4096];
+    CHECK( "delete-path", blob_path( p, "Save", "progress", path, sizeof( path ) ) && save_wide_path( path, wide ) );
+    HANDLE lock = CreateFileW( wide, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL );
+    CHECK( "delete-lock", lock != INVALID_HANDLE_VALUE );
+    struct XGameSaveContainer container = { p, const_cast<char *>( "Save" ) };
+    struct update_op op = { const_cast<char *>( "progress" ), nullptr, 0, TRUE };
+    struct XGameSaveUpdate update = {};
+    update.container = &container;
+    update.count = 1;
+    update.ops = &op;
+    CHECK( "delete-failure-reported", FAILED( submit_update( &update ) ) );
+    CloseHandle( lock );
+    read_progress( p, "retained", FALSE );
+    struct container_state state;
+    CHECK( "delete-failure-load", load_state( p, "Save", &state ) == S_OK );
+    CHECK( "delete-failure-index-unchanged", state.count == 1 && state.revision == 1 );
+    free_state( &state );
+    CHECK( "delete-retry", submit_update( &update ) == S_OK );
+    CHECK( "delete-retry-file-absent", GetFileAttributesW( wide ) == INVALID_FILE_ATTRIBUTES );
+    CHECK( "delete-retry-load", load_state( p, "Save", &state ) == S_OK );
+    CHECK( "delete-retry-index", !state.count && state.dirty && state.revision == 2 );
+    free_state( &state );
+    CHECK( "delete-already-missing", submit_update( &update ) == S_OK );
+    close_provider( p );
+}
+
 int main( void )
 {
     InitializeLogging();
@@ -172,6 +204,7 @@ int main( void )
         unreadable_index_preserves_local_progress( files, TRUE );
     }
     first_local_update_still_works();
+    failed_delete_retains_index();
     printf( "CHECKS %u FAILURES %u\n", checks, failures );
     return failures ? 1 : 0;
 }

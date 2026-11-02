@@ -1961,7 +1961,14 @@ static HRESULT submit_update( struct XGameSaveUpdate *update )
         }
         if ( op->remove )
         {
-            DeleteFileA( path );
+            WCHAR wide[4096];
+            if ( !save_wide_path( path, wide ) ) hr = HRESULT_FROM_WIN32( GetLastError() );
+            else if ( !DeleteFileW( wide ) )
+            {
+                DWORD error = GetLastError();
+                if ( error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND ) hr = HRESULT_FROM_WIN32( error );
+            }
+            if ( FAILED( hr ) ) break;
             remove_blob( &state, op->name );
         }
         else
