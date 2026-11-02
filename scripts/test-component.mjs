@@ -11,6 +11,7 @@ const probes = [
     ['nexus_legacy-service-client', 70],
     ['nexus_auth-rejection-metadata', 28],
     ['nexus_token-endpoint', 36],
+    ['nexus_backend-request', 356],
     ['nexus_store-context', 61],
     ['nexus_store-license-map', 90],
     ['nexus_store-public-fetch', 98],

@@ -205,6 +205,20 @@ test('base64 capacity contracts run in the native authentication gate',()=>{
     assert.match(read('scripts/test-authentication.mjs'),/if\(!base64Passed\)proof.passed=false/);
 });
 
+test('backend framing has a shared total deadline and mandatory stalled transport coverage',()=>{
+    const source=read('src/System/User/BackendRequest.h');
+    assert.match(read('src/System/XUser.cpp'),/#include "User\/BackendRequest.h"/);
+    assert.match(source,/DWORD timeoutMilliseconds = 95000/);
+    assert.match(source,/backend_deadline deadline\( timeoutMilliseconds \)/);
+    assert.doesNotMatch(source,/type == 5|SO_RCVTIMEO|SO_SNDTIMEO/);
+    assert.match(read('scripts/test-component.mjs'),/\['nexus_backend-request', 356\]/);
+    const fixture=read('tests/Nexus/backend-request.cpp');
+    for(const label of ['whole-request-deadline','partial-response-not-published','complete-fragmented-response',
+        'protocol-error-not-success','connection-error-preserved','send-backpressure-honors-deadline',
+        'wire-request-preserved','unix-protocol-branch-covered'])
+        assert.ok(fixture.includes('"'+label+'"'),label);
+});
+
 test('save commit recovery retains dirty revisions and tests cold relaunch conflicts',()=>{
     const fixture=read('tests/Nexus/gamesave-commit.cpp');
     assert.match(fixture,/#include "gamesave-transfer.cpp"/);
