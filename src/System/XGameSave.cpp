@@ -442,28 +442,39 @@ static HRESULT read_file( const char *path, BYTE **data, SIZE_T *size )
     WCHAR wide[4096];
     HANDLE file;
     LARGE_INTEGER li;
-    DWORD read;
+    DWORD error = ERROR_SUCCESS;
 
     *data = NULL;
     *size = 0;
     if ( !save_wide_path( path, wide ) ) return HRESULT_FROM_WIN32( GetLastError() );
     file = CreateFileW( wide, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL );
     if ( file == INVALID_HANDLE_VALUE ) return HRESULT_FROM_WIN32( GetLastError() );
-    if ( !GetFileSizeEx( file, &li ) ||
-         !( *data = static_cast<std::remove_reference_t<decltype( *data )>>( calloc( 1, li.QuadPart + 1 ) ) ) )
+    if ( !GetFileSizeEx( file, &li ) ) error = GetLastError();
+    else if ( li.QuadPart < 0 || static_cast<UINT64>( li.QuadPart ) >= SIZE_MAX ) error = ERROR_FILE_TOO_LARGE;
+    else if ( !( *data = static_cast<BYTE *>( calloc( 1, static_cast<SIZE_T>( li.QuadPart ) + 1 ) ) ) )
+        error = ERROR_NOT_ENOUGH_MEMORY;
+    if ( error )
     {
         CloseHandle( file );
-        return E_OUTOFMEMORY;
+        return HRESULT_FROM_WIN32( error );
     }
-    if ( li.QuadPart && ( !ReadFile( file, *data, li.QuadPart, &read, NULL ) || read != li.QuadPart ) )
+    SIZE_T offset = 0, length = static_cast<SIZE_T>( li.QuadPart );
+    while ( offset < length )
     {
-        CloseHandle( file );
-        free( *data );
-        *data = NULL;
-        return HRESULT_FROM_WIN32( GetLastError() );
+        DWORD read = 0, chunk = static_cast<DWORD>( std::min<SIZE_T>( length - offset, MAXDWORD ) );
+        if ( !ReadFile( file, *data + offset, chunk, &read, NULL ) ) error = GetLastError();
+        else if ( !read ) error = ERROR_HANDLE_EOF;
+        if ( error ) break;
+        offset += read;
     }
     CloseHandle( file );
-    *size = li.QuadPart;
+    if ( error )
+    {
+        free( *data );
+        *data = NULL;
+        return HRESULT_FROM_WIN32( error );
+    }
+    *size = length;
     return S_OK;
 }
 
@@ -472,20 +483,30 @@ static HRESULT write_file( const char *path, const void *data, SIZE_T size )
     char tmp[2048 + 8];
     WCHAR wide[4096], temporary[4096];
     HANDLE file;
-    DWORD written;
-    BOOL ok;
+    DWORD error = ERROR_SUCCESS;
 
     snprintf( tmp, sizeof( tmp ), "%s.tmp", path );
     if ( !save_wide_path( path, wide ) || !save_wide_path( tmp, temporary ) )
         return HRESULT_FROM_WIN32( GetLastError() );
     file = CreateFileW( temporary, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL );
     if ( file == INVALID_HANDLE_VALUE ) return HRESULT_FROM_WIN32( GetLastError() );
-    ok = ( !size || ( WriteFile( file, data, size, &written, NULL ) && written == size ) ) && FlushFileBuffers( file );
+    SIZE_T offset = 0;
+    while ( offset < size )
+    {
+        DWORD written = 0, chunk = static_cast<DWORD>( std::min<SIZE_T>( size - offset, MAXDWORD ) );
+        if ( !WriteFile( file, static_cast<const BYTE *>( data ) + offset, chunk, &written, NULL ) ) error = GetLastError();
+        else if ( !written ) error = ERROR_WRITE_FAULT;
+        if ( error ) break;
+        offset += written;
+    }
+    if ( !error && !FlushFileBuffers( file ) ) error = GetLastError();
     CloseHandle( file );
-    if ( !ok || !MoveFileExW( temporary, wide, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH ) )
+    if ( !error && !MoveFileExW( temporary, wide, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH ) )
+        error = GetLastError();
+    if ( error )
     {
         DeleteFileW( temporary );
-        return HRESULT_FROM_WIN32( GetLastError() );
+        return HRESULT_FROM_WIN32( error );
     }
     return S_OK;
 }
@@ -694,14 +715,20 @@ static HRESULT save_state( struct XGameSaveProvider *provider, const struct cont
 
 typedef BOOL ( *container_callback )( struct XGameSaveProvider *provider, const char *name, void *context );
 
-static void enumerate_local( struct XGameSaveProvider *provider, container_callback callback, void *context )
+static HRESULT enumerate_local( struct XGameSaveProvider *provider, container_callback callback, void *context )
 {
     char pattern[2048], index[2048];
     WIN32_FIND_DATAA data;
     HANDLE find;
+    HRESULT hr = S_OK;
+    BOOL stopped = FALSE;
 
     snprintf( pattern, sizeof( pattern ), "%s\\*", provider->root );
-    if ( ( find = save_find_first( pattern, &data ) ) == INVALID_HANDLE_VALUE ) return;
+    if ( ( find = save_find_first( pattern, &data ) ) == INVALID_HANDLE_VALUE )
+    {
+        DWORD error = GetLastError();
+        return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND ? S_OK : HRESULT_FROM_WIN32( error );
+    }
     do
     {
         char *name;
@@ -716,7 +743,7 @@ static void enumerate_local( struct XGameSaveProvider *provider, container_callb
             /* Hash directories are indexes, not container names. Recovery
              * backups/incomplete downloads must never enter the cloud set. */
             if ( strlen( data.cFileName ) != 64 || strspn( data.cFileName, "0123456789abcdef" ) != 64 ) continue;
-            if ( FAILED( read_file( index, &text, &size ) ) ) continue;
+            if ( FAILED( hr = read_file( index, &text, &size ) ) ) break;
             line = strstr( ( char * )text, "\nname " );
             if ( !line || !( end = strchr( line + 6, '\n' ) ) )
             {
@@ -735,9 +762,19 @@ static void enumerate_local( struct XGameSaveProvider *provider, container_callb
         }
         more = callback( provider, name, context );
         free( name );
-        if ( !more ) break;
+        if ( !more )
+        {
+            stopped = TRUE;
+            break;
+        }
     } while ( FindNextFileA( find, &data ) );
+    if ( !stopped && SUCCEEDED( hr ) )
+    {
+        DWORD error = GetLastError();
+        if ( error != ERROR_NO_MORE_FILES ) hr = HRESULT_FROM_WIN32( error );
+    }
     FindClose( find );
+    return hr;
 }
 
 static HRESULT cloud_request( struct XGameSaveProvider *provider, const char *method, const char *path,
@@ -1312,10 +1349,10 @@ static BOOL sync_local_callback( struct XGameSaveProvider *provider, const char 
 
     for ( ; remote->name; remote++ )
         if ( !strcmp( remote->name, name ) ) return TRUE;
-    if ( FAILED( load_state( provider, name, &state ) ) )
+    if ( FAILED( sync->hr = load_state( provider, name, &state ) ) )
     {
         free_state( &state );
-        return TRUE;
+        return FALSE;
     }
     if ( sync_mode() == SYNC_UPLOAD )
         sync->hr = force_upload( provider, &state );
@@ -1466,7 +1503,15 @@ list_again:
     for ( UINT32 i = 0; i < count; i++ )
     {
         struct container_state state;
-        BOOL exists = SUCCEEDED( load_state( provider, remote[i].name, &state ) );
+        HRESULT local = load_state( provider, remote[i].name, &state );
+        BOOL exists = SUCCEEDED( local );
+        if ( FAILED( local ) && local != HRESULT_FROM_WIN32( ERROR_FILE_NOT_FOUND ) &&
+             local != HRESULT_FROM_WIN32( ERROR_PATH_NOT_FOUND ) )
+        {
+            free_state( &state );
+            hr = local;
+            goto done;
+        }
         BOOL remoteChanged = !exists || strcmp( state.remote, remote[i].time ? remote[i].time : "" );
         if ( exists && state.dirty && remoteChanged && mode == SYNC_AUTO )
         {
@@ -1503,8 +1548,8 @@ done:
         if ( SUCCEEDED( hr ) && !refresh )
         {
             struct local_sync_context sync = { remote, S_OK };
-            enumerate_local( provider, sync_local_callback, &sync );
-            hr = sync.hr;
+            hr = enumerate_local( provider, sync_local_callback, &sync );
+            if ( SUCCEEDED( hr ) ) hr = sync.hr;
         }
         for ( UINT32 i = 0; i < count; i++ )
         {
@@ -1518,8 +1563,8 @@ done:
     {
         struct remote_container empty = { 0 };
         struct local_sync_context sync = { &empty, S_OK };
-        enumerate_local( provider, sync_local_callback, &sync );
-        hr = sync.hr;
+        hr = enumerate_local( provider, sync_local_callback, &sync );
+        if ( SUCCEEDED( hr ) ) hr = sync.hr;
     }
     if ( refresh )
     {
@@ -1886,10 +1931,11 @@ static HRESULT submit_update( struct XGameSaveUpdate *update )
     if ( total > 16 * 1024 * 1024 ) return E_GS_UPDATE_TOO_BIG;
 
     EnterCriticalSection( &provider->cs );
-    if ( FAILED( load_state( provider, update->container->name, &state ) ) )
+    hr = load_state( provider, update->container->name, &state );
+    if ( hr == HRESULT_FROM_WIN32( ERROR_FILE_NOT_FOUND ) || hr == HRESULT_FROM_WIN32( ERROR_PATH_NOT_FOUND ) )
     {
         free_state( &state );
-        if ( !( state.name = strdup( update->container->name ) ) ) hr = E_OUTOFMEMORY;
+        hr = ( state.name = strdup( update->container->name ) ) ? S_OK : E_OUTOFMEMORY;
     }
     if ( update->display )
     {
