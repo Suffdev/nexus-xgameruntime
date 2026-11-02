@@ -233,12 +233,14 @@ static HRESULT files_import_one( const char *root, const char *container, const 
                                  const WIN32_FIND_DATAW *info, void *arg )
 {
     struct files_import_context *ctx = static_cast<files_import_context *>( arg );
+    save_cs_lock local( &ctx->provider->cs ); save_root_lock root_lock( ctx->provider );
+    if ( FAILED( root_lock.status ) ) return root_lock.status;
     struct container_state state;
     struct blob_entry *entry;
     char path[FILES_PATH], cached[FILES_PATH], directory[FILES_PATH];
     BYTE *data = NULL, *old = NULL;
     SIZE_T size, oldSize = 0;
-    BOOL replaced = FALSE;
+    BOOL replaced = FALSE, added = FALSE;
     HRESULT hr;
     if ( ( ( UINT64 )info->nFileSizeHigh << 32 | info->nFileSizeLow ) > FILES_MAX_BLOB ) return E_GS_UPDATE_TOO_BIG;
     if ( snprintf( path, sizeof( path ), "%s\\%s\\%s", root, container, name ) >= sizeof( path ) )
@@ -260,18 +262,22 @@ static HRESULT files_import_one( const char *root, const char *container, const 
         goto done;
     }
     if ( FAILED( hr = files_mkdir( directory ) ) ) goto done;
+    added = find_blob( &state, name ) == NULL;
     if ( !( entry = add_blob( &state, name ) ) )
     {
         hr = E_OUTOFMEMORY;
         goto done;
     }
-    if ( FAILED( files_read( cached, &old, &oldSize ) ) || oldSize != size || entry->size != size ||
+    if ( FAILED( files_read( cached, &old, &oldSize ) ) || added || oldSize != size || entry->size != size ||
          memcmp( data, old, size ) )
     {
+        if ( state.revision == ~(UINT64)0 ) { hr = HRESULT_FROM_WIN32( ERROR_ARITHMETIC_OVERFLOW ); goto done; }
+        if ( FAILED( hr = ensure_incarnation( &state ) ) ) goto done;
         if ( FAILED( hr = files_write( cached, data, size ) ) ) goto done;
         replaced = TRUE;
         entry->size = size;
         entry->atom[0] = 0;
+        state.revision++;
         state.dirty = TRUE;
         state.time = unix_now();
     }
@@ -292,6 +298,8 @@ struct files_cache_context
 static BOOL files_cache_visit( struct XGameSaveProvider *provider, const char *container, void *arg )
 {
     struct files_cache_context *ctx = static_cast<files_cache_context *>( arg );
+    save_cs_lock local( &provider->cs ); save_root_lock root_lock( provider );
+    if ( FAILED( root_lock.status ) ) { ctx->hr = root_lock.status; return FALSE; }
     struct container_state state;
     char dir[FILES_PATH], path[FILES_PATH], cached[FILES_PATH];
     WCHAR wide[FILES_PATH];
@@ -335,7 +343,9 @@ static BOOL files_cache_visit( struct XGameSaveProvider *provider, const char *c
             if ( attrs == INVALID_FILE_ATTRIBUTES &&
                  ( GetLastError() == ERROR_FILE_NOT_FOUND || GetLastError() == ERROR_PATH_NOT_FOUND ) )
             {
-                remove_blob( &state, entry->name );
+                if ( state.revision == ~(UINT64)0 ) { hr = HRESULT_FROM_WIN32( ERROR_ARITHMETIC_OVERFLOW ); break; }
+                if ( FAILED( hr = ensure_incarnation( &state ) ) ) break;
+                remove_blob( &state, entry->name ); state.revision++;
                 state.dirty = TRUE;
                 state.time = unix_now();
                 continue;
@@ -373,8 +383,8 @@ static HRESULT files_import( struct XGameSaveProvider *provider, const char *fol
     struct files_cache_context cache = { folder, S_OK, TRUE };
     HRESULT hr = files_walk( folder, "", files_import_one, &scan );
     if ( FAILED( hr ) ) return hr;
-    enumerate_local( provider, files_cache_visit, &cache );
-    return cache.hr;
+    hr = enumerate_local( provider, files_cache_visit, &cache );
+    return FAILED( hr ) ? hr : cache.hr;
 }
 static HRESULT files_export( struct XGameSaveProvider *provider, const char *folder )
 {
@@ -385,7 +395,7 @@ static HRESULT files_export( struct XGameSaveProvider *provider, const char *fol
     snprintf( incoming, sizeof( incoming ), "%s.incoming-%lu", folder, GetCurrentProcessId() );
     snprintf( backup, sizeof( backup ), "%s.backup-%I64u-%lu", folder, GetTickCount64(), GetCurrentProcessId() );
     if ( FAILED( hr = files_mkdir( incoming ) ) ) return hr;
-    enumerate_local( provider, files_cache_visit, &ctx );
+    if ( FAILED( hr = enumerate_local( provider, files_cache_visit, &ctx ) ) ) return hr;
     if ( FAILED( ctx.hr ) ) return ctx.hr;
     if ( FAILED( hr = files_wide( incoming, source ) ) || FAILED( hr = files_wide( folder, target ) ) ||
          FAILED( hr = files_wide( backup, old ) ) )
@@ -416,8 +426,19 @@ static HRESULT files_validate_download( const container_state *state )
 }
 
 static HRESULT files_cloud_download( struct XGameSaveProvider *provider, const char *name, const char *display,
-                                     const char *remoteTime )
+                                     const char *remoteTime, const container_state *expected, BOOL expected_exists )
 {
+    save_version_guard version( provider, name, expected, expected_exists );
+    if ( FAILED( version.status() ) ) return version.status();
+    XGameSaveProvider staging{};
+    struct staging_cs_scope
+    {
+        CRITICAL_SECTION *value;
+        explicit staging_cs_scope( CRITICAL_SECTION *cs ) : value( cs ) { InitializeCriticalSection( value ); }
+        ~staging_cs_scope() { DeleteCriticalSection( value ); }
+    } staging_cs( &staging.cs );
+    staging.files = TRUE; staging.transport = provider->transport; staging.user = provider->user; staging.auth = provider->auth;
+    strcpy( staging.base, provider->base );
     char saved[FILES_PATH], incoming[FILES_PATH], target[FILES_PATH], backup[FILES_PATH];
     WCHAR fromW[FILES_PATH], targetW[FILES_PATH], backupW[FILES_PATH];
     struct container_state state;
@@ -425,21 +446,19 @@ static HRESULT files_cloud_download( struct XGameSaveProvider *provider, const c
     BOOL exists;
     if ( !files_component( name, TRUE ) ) return E_GS_INVALID_CONTAINER_NAME;
     strcpy( saved, provider->root );
-    if ( snprintf( provider->root, sizeof( provider->root ), "%s.incoming-%lu", saved, GetCurrentProcessId() ) >=
-         sizeof( provider->root ) )
+    if ( snprintf( staging.root, sizeof( staging.root ), "%s.incoming-%lu", saved, GetCurrentProcessId() ) >=
+         sizeof( staging.root ) )
     {
-        strcpy( provider->root, saved );
         return E_GS_INVALID_CONTAINER_NAME;
     }
-    hr = cloud_download( provider, name, display, remoteTime );
+    hr = cloud_download( &staging, name, display, remoteTime );
     if ( SUCCEEDED( hr ) )
     {
-        hr = load_state( provider, name, &state );
+        hr = load_state( &staging, name, &state );
         if ( SUCCEEDED( hr ) ) hr = files_validate_download( &state );
         free_state( &state );
     }
-    if ( !container_dir( provider, name, incoming, sizeof( incoming ) ) ) hr = E_OUTOFMEMORY;
-    strcpy( provider->root, saved );
+    if ( !container_dir( &staging, name, incoming, sizeof( incoming ) ) ) hr = E_OUTOFMEMORY;
     if ( FAILED( hr ) ) return hr;
     if ( !container_dir( provider, name, target, sizeof( target ) ) ) return E_OUTOFMEMORY;
     if ( snprintf( backup, sizeof( backup ), "%s.backup-%I64u", target, GetTickCount64() ) >= sizeof( backup ) )
@@ -447,6 +466,8 @@ static HRESULT files_cloud_download( struct XGameSaveProvider *provider, const c
     if ( FAILED( hr = files_wide( incoming, fromW ) ) || FAILED( hr = files_wide( target, targetW ) ) ||
          FAILED( hr = files_wide( backup, backupW ) ) )
         return hr;
+    save_cs_lock local( &provider->cs ); save_root_lock root( provider );
+    if ( FAILED( hr = root.status ) || FAILED( hr = version.check() ) ) return hr;
     exists = GetFileAttributesW( targetW ) != INVALID_FILE_ATTRIBUTES;
     if ( exists && !MoveFileExW( targetW, backupW, MOVEFILE_WRITE_THROUGH ) )
         return HRESULT_FROM_WIN32( GetLastError() );
@@ -469,7 +490,6 @@ static BOOL files_upload_visit( struct XGameSaveProvider *provider, const char *
         if ( SUCCEEDED( hr ) )
         {
             provider->uploaded++;
-            hr = save_state( provider, &state );
         }
     }
     free_state( &state );
@@ -572,19 +592,20 @@ extern "C" void WINAPI XodusSaveFilesMonitor( HWND window, HINSTANCE instance, c
         if ( FAILED( hr = GetSaveTransport( provider )
                               .Authorization( provider->user, "http://xboxlive.com", &provider->auth ) ) )
             goto ready;
-        if ( !cloud_lock( provider ) )
         {
-            hr = E_GS_CONTAINER_NOT_IN_SYNC;
-            goto ready;
+            save_remote_lock gate( provider );
+            if ( FAILED( gate.status ) || !cloud_lock( provider ) )
+            { hr = FAILED( gate.status ) ? gate.status : E_GS_CONTAINER_NOT_IN_SYNC; goto ready; }
+            provider->session_lock = TRUE;
         }
-        provider->session_lock = TRUE;
     }
     if ( view_existed && FAILED( hr = files_import( provider, ipc->folder ) ) ) goto ready;
     if ( provider->cloud && FAILED( hr = cloud_sync( provider ) ) ) goto ready;
     if ( provider->cloud ) SaveStatus( "nexus-files: phase=download downloaded=%u\n", provider->downloaded );
     if ( provider->cloud )
     {
-        enumerate_local( provider, files_upload_visit, &hr );
+        HRESULT enumerated = enumerate_local( provider, files_upload_visit, &hr );
+        if ( FAILED( enumerated ) ) hr = enumerated;
         if ( FAILED( hr ) ) goto ready;
     }
     if ( FAILED( hr = files_export( provider, ipc->folder ) ) ) goto ready;
@@ -599,8 +620,9 @@ ready:
         {
             if ( provider->cloud )
             {
+                save_remote_lock gate( provider );
                 provider->locked = FALSE;
-                if ( !cloud_lock( provider ) )
+                if ( FAILED( gate.status ) || !cloud_lock( provider ) )
                 {
                     ipc->hr = E_GS_CONTAINER_NOT_IN_SYNC;
                     hr = ipc->hr;
@@ -610,7 +632,11 @@ ready:
         }
         /* The parent has exited: all save file handles are closed. */
         if ( SUCCEEDED( hr ) ) hr = files_import( provider, ipc->folder );
-        if ( SUCCEEDED( hr ) && provider->cloud ) enumerate_local( provider, files_upload_visit, &hr );
+        if ( SUCCEEDED( hr ) && provider->cloud )
+        {
+            HRESULT enumerated = enumerate_local( provider, files_upload_visit, &hr );
+            if ( FAILED( enumerated ) ) hr = enumerated;
+        }
         SaveStatus( "nexus-files: final-sync hr=%#lx uploaded=%u\n", hr, provider->uploaded );
     }
     if ( FAILED( hr ) ) ERR( "file save provider failed hr=%#lx; local data is retained\n", hr );

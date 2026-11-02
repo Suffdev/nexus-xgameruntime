@@ -145,7 +145,7 @@ if(NEXUS_MIGRATION_PROBES)
     endforeach()
 endif()
 
-foreach(probe sync transfer commit atomic index)
+foreach(probe sync transfer commit atomic index fencing)
     add_executable(nexus_gamesave-${probe} Nexus/gamesave-${probe}.cpp)
     target_link_libraries(nexus_gamesave-${probe} PRIVATE xgameruntime-impl)
     target_compile_features(nexus_gamesave-${probe} PRIVATE cxx_std_23)

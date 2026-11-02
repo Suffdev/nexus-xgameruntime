@@ -224,7 +224,7 @@ test('save commit recovery retains dirty revisions and tests cold relaunch confl
     assert.match(fixture,/#include "gamesave-transfer.cpp"/);
     for(const label of ['commit-release-error-visible','commit-relaunch-can-sync','commit-real-conflict-preserved','commit-real-conflict-no-write','newer-local-not-acknowledged','acknowledged-remote-base-durable','newer-local-relaunch-upload'])
         assert.ok(fixture.includes('"'+label+'"'),label);
-    assert.match(read('tests/CMakeLists.txt'),/foreach\(probe sync transfer commit atomic index\)/);
+    assert.match(read('tests/CMakeLists.txt'),/foreach\(probe sync transfer commit atomic index fencing\)/);
     assert.match(read('scripts/test-component.mjs'),/\['nexus_gamesave-commit', 183\]/);
     for(const label of ['read-error-sync-reported','read-error-update-reported','read-error-original-revision',
         'delete-failure-reported','delete-failure-index-unchanged','delete-retry-index'])
@@ -470,12 +470,13 @@ test('save conflicts retain explicit choices, backups and native regression cove
 
 test('local save transactions require fault, crash and concurrent reader coverage',()=>{
     const fixture=read('tests/Nexus/gamesave-atomic.cpp');
-    assert.match(read('scripts/test-component.mjs'),/\['nexus_gamesave-atomic', 586\]/);
+    assert.match(read('scripts/test-component.mjs'),/\['nexus_gamesave-atomic', 598\]/);
     assert.match(fixture,/#include "gamesave-transfer.cpp"/);
     for(const label of ['failed-write-rolls-back-delete','locked-second-fails-whole-update',
         'failed-rollback-not-empty-save','cleanup-retains-discoverable-identity','killed-at-injected-boundary',
         'restart-sync-recovers-first','concurrent-readers-never-see-mixed-revisions','concurrent-no-lost-updates',
-        'allocation-error-visible','readonly-original-attribute-retained','no-hardlinks-copy-fallback',
+        'allocation-error-visible','root-lock-allocation-failure-is-not-success',
+        'remote-lock-allocation-failure-is-not-success','readonly-original-attribute-retained','no-hardlinks-copy-fallback',
         'missing-index-does-not-reinitialize','missing-index-enumeration-reports-error',
         'missing-index-read-is-not-successful-empty','new-container-abort-leaves-no-visible-state'])
         assert.ok(fixture.includes('"'+label+'"'),label);
@@ -486,5 +487,20 @@ test('invalid local indexes have mandatory native data-preservation coverage',()
     assert.match(read('scripts/test-component.mjs'),/\['nexus_gamesave-index', 1316\]/);
     const fixture=read('tests/Nexus/gamesave-index.cpp');
     for(const label of ['invalid-index-load-fails-closed','invalid-index-enumeration-reports-error','invalid-index-read-fails-closed','invalid-index-update-does-not-bless-state','invalid-index-update-preserves-index','invalid-index-sync-fails-closed','invalid-index-no-remote-write','invalid-index-no-download','invalid-index-sync-preserves-progress','legacy-valid-index-readable','legacy-read-does-not-rewrite'])
+        assert.ok(fixture.includes('"'+label+'"'),label);
+});
+
+
+test('remote save fencing requires synthetic ABA, crash and concurrent local-write coverage',()=>{
+    assert.match(read('scripts/test-component.mjs'),/\['nexus_gamesave-fencing', 251\]/);
+    const fixture=read('tests/Nexus/gamesave-fencing.cpp');
+    for(const label of ['fence-dirty-ABA-same-revision-time-size','fence-stale-snapshot-never-starts-metadata-put',
+        'fence-delete-not-resurrected-remotely','fence-local-submit-does-not-wait-on-network',
+        'fence-sync-snapshot-survives-baseline-only-advance','fence-stale-receive-rejected',
+        'fence-cross-process-gate-timeout','fence-cross-process-abandonment-recovers',
+        'fence-created-root-same-canonical-identity','fence-create-does-not-bypass-existing-lock',
+        'fence-rejected-reacquire-clears-stale-flag','fence-dialog-does-not-hold-data-or-remote-gate',
+        'fence-stale-conflict-choice-rejected','fence-generation-durable-not-per-read',
+        'fence-files-zero-readd-dirty-new-revision','fence-files-overflow-keeps-old-bytes'])
         assert.ok(fixture.includes('"'+label+'"'),label);
 });

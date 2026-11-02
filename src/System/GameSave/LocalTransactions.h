@@ -1,36 +1,126 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later
  * Local blob transactions retain the existing index/blob format. Publish a
  * complete directory and recover an interrupted swap before reading a save.
- * Lock order: cloud_cs, provider cs, then the shared root mutex. */
-class save_root_lock
+ * Remote lock order: cloud_cs, shared remote gate, provider cs, then root.
+ * Local-only reads/updates need only provider cs and root; HTTP/dialog never
+ * retains either local lock. */
+/* Named objects coordinate cooperating processes in the same Windows object
+ * namespace (the same Wineserver on Wine), not independent Wine prefixes. */
+/* Resolve the nearest existing directory, then append the missing tail. The
+ * identity cannot change merely because a caller creates its root after
+ * taking the lock, including roots below a directory alias/junction. */
+static HRESULT save_canonical_root( const char *root, WCHAR result[4096] )
+{
+    WCHAR path[4096], absolute[4096], ancestor[4096], resolved[4096];
+    if ( !MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, root, -1, path, ARRAY_SIZE( path ) ) ) return E_INVALIDARG;
+    if ( !wcsncmp( path, L"\\\\?\\UNC\\", 8 ) )
+    {
+        memmove( path + 2, path + 8, ( wcslen( path ) - 7 ) * sizeof( WCHAR ) ); path[0] = path[1] = L'\\';
+    }
+    else if ( !wcsncmp( path, L"\\\\?\\", 4 ) )
+        memmove( path, path + 4, ( wcslen( path ) - 3 ) * sizeof( WCHAR ) );
+    DWORD length = GetFullPathNameW( path, ARRAY_SIZE( absolute ), absolute, NULL );
+    if ( !length || length >= ARRAY_SIZE( absolute ) ) return E_INVALIDARG;
+    while ( length > 3 && ( absolute[length - 1] == L'\\' || absolute[length - 1] == L'/' ) ) absolute[--length] = 0;
+    wcscpy( ancestor, absolute );
+    DWORD prefix = length;
+    for ( ;; )
+    {
+        const WCHAR *open_path = ancestor;
+        if ( ancestor[1] == L':' )
+        {
+            if ( wcslen( ancestor ) + 4 >= ARRAY_SIZE( path ) ) return E_INVALIDARG;
+            wcscpy( path, L"\\\\?\\" ); wcscat( path, ancestor ); open_path = path;
+        }
+        else if ( ancestor[0] == L'\\' && ancestor[1] == L'\\' )
+        {
+            if ( wcslen( ancestor ) + 6 >= ARRAY_SIZE( path ) ) return E_INVALIDARG;
+            wcscpy( path, L"\\\\?\\UNC\\" ); wcscat( path, ancestor + 2 ); open_path = path;
+        }
+        HANDLE directory = CreateFileW( open_path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                      NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL );
+        if ( directory != INVALID_HANDLE_VALUE )
+        {
+            BY_HANDLE_FILE_INFORMATION information;
+            if ( !GetFileInformationByHandle( directory, &information ) )
+            { DWORD error = GetLastError(); CloseHandle( directory ); return HRESULT_FROM_WIN32( error ); }
+            if ( !( information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY ) )
+            { CloseHandle( directory ); return HRESULT_FROM_WIN32( ERROR_DIRECTORY ); }
+            DWORD count = GetFinalPathNameByHandleW( directory, resolved, ARRAY_SIZE( resolved ), FILE_NAME_NORMALIZED );
+            CloseHandle( directory );
+            if ( !count || count >= ARRAY_SIZE( resolved ) ) return E_INVALIDARG;
+            break;
+        }
+        DWORD error = GetLastError();
+        if ( error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND ) return HRESULT_FROM_WIN32( error );
+        if ( prefix <= 3 ) return HRESULT_FROM_WIN32( error );
+        WCHAR *slash = wcsrchr( ancestor, L'\\' );
+        if ( !slash || slash - ancestor < 2 ) return HRESULT_FROM_WIN32( error );
+        prefix = slash - ancestor;
+        if ( prefix == 2 && ancestor[1] == L':' ) prefix = 3;
+        ancestor[prefix] = 0;
+    }
+    if ( !wcsncmp( resolved, L"\\\\?\\UNC\\", 8 ) )
+    {
+        memmove( resolved + 2, resolved + 8, ( wcslen( resolved ) - 7 ) * sizeof( WCHAR ) );
+        resolved[0] = resolved[1] = L'\\';
+    }
+    else if ( !wcsncmp( resolved, L"\\\\?\\", 4 ) )
+        memmove( resolved, resolved + 4, ( wcslen( resolved ) - 3 ) * sizeof( WCHAR ) );
+    SIZE_T count = wcslen( resolved );
+    const WCHAR *tail = absolute + prefix;
+    if ( count && resolved[count - 1] == L'\\' && *tail == L'\\' ) tail++;
+    BOOL separator = count && resolved[count - 1] != L'\\' && *tail && *tail != L'\\';
+    if ( count + separator + wcslen( tail ) >= 4096 ) return E_INVALIDARG;
+    wcscpy( result, resolved ); if ( separator ) wcscat( result, L"\\" ); wcscat( result, tail );
+    count = wcslen( result );
+    while ( count > 3 && result[count - 1] == L'\\' ) result[--count] = 0;
+    CharUpperBuffW( result, count ); return S_OK;
+}
+class save_shared_lock
 {
     HANDLE mutex = NULL;
     bool owned = false;
+    DWORD timeout;
 public:
     HRESULT status = E_OUTOFMEMORY;
-    explicit save_root_lock( const XGameSaveProvider *provider )
+    save_shared_lock( const XGameSaveProvider *provider, const WCHAR *prefix, DWORD wait ) : timeout( wait )
     {
-        WCHAR path[4096], absolute[4096], name[96];
+        WCHAR absolute[4096], name[128];
         char utf8[16384];
-        if ( !save_wide_path( provider->root, path ) ) { status = E_INVALIDARG; return; }
-        DWORD length = GetFullPathNameW( path, ARRAY_SIZE( absolute ), absolute, NULL );
-        if ( !length || length >= ARRAY_SIZE( absolute ) ) { status = E_INVALIDARG; return; }
-        CharUpperBuffW( absolute, length );
+        HRESULT canonical = save_canonical_root( provider->root, absolute );
+        if ( FAILED( canonical ) ) { status = canonical; return; }
         if ( !WideCharToMultiByte( CP_UTF8, 0, absolute, -1, utf8, sizeof( utf8 ), NULL, NULL ) ) return;
         char *key = files_cache_key( utf8 );
         if ( !key ) return;
-        wcscpy( name, L"Local\\NexusGameSave-" );
-        for ( unsigned i = 0; i <= 64; i++ ) name[20 + i] = key[i];
-        free( key );
+        swprintf( name, ARRAY_SIZE( name ), L"%ls%hs", prefix, key ); free( key );
         mutex = CreateMutexW( NULL, FALSE, name );
         if ( !mutex ) { status = HRESULT_FROM_WIN32( GetLastError() ); return; }
-        DWORD wait = WaitForSingleObject( mutex, INFINITE );
-        owned = wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED;
-        status = owned ? S_OK : HRESULT_FROM_WIN32( GetLastError() );
+        acquire();
     }
-    ~save_root_lock() { if ( owned ) ReleaseMutex( mutex ); if ( mutex ) CloseHandle( mutex ); }
-    save_root_lock( const save_root_lock & ) = delete;
-    save_root_lock &operator=( const save_root_lock & ) = delete;
+    HRESULT acquire()
+    {
+        if ( owned ) return status;
+        if ( !mutex ) return status;
+        DWORD result = WaitForSingleObject( mutex, timeout );
+        owned = result == WAIT_OBJECT_0 || result == WAIT_ABANDONED;
+        return status = owned ? S_OK : HRESULT_FROM_WIN32( result == WAIT_TIMEOUT ? ERROR_TIMEOUT : GetLastError() );
+    }
+    void release() { if ( owned ) { ReleaseMutex( mutex ); owned = false; } }
+    ~save_shared_lock() { release(); if ( mutex ) CloseHandle( mutex ); }
+    save_shared_lock( const save_shared_lock & ) = delete;
+    save_shared_lock &operator=( const save_shared_lock & ) = delete;
+};
+class save_root_lock : public save_shared_lock
+{
+public:
+    explicit save_root_lock( const XGameSaveProvider *p ) : save_shared_lock( p, L"Local\\NexusGameSave-", INFINITE ) {}
+};
+class save_remote_lock : public save_shared_lock
+{
+public:
+    explicit save_remote_lock( const XGameSaveProvider *p, DWORD timeout = 15000 )
+        : save_shared_lock( p, L"Local\\NexusGameSaveRemote-", timeout ) {}
 };
 
 class save_cs_lock

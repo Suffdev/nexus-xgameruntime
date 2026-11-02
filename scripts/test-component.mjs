@@ -22,7 +22,7 @@ const probes = [
     ['nexus_package-identity', 15], ['nexus_package-legacy', 175], ['nexus_package-chunks', 312],
     ['nexus_package-content',423], ['nexus_package-installed',110], ['nexus_package-monitors', 362], ['nexus_package-progress-bytes', 115],
     ['nexus_package-selection', 750],
-    ['nexus_gamesave-sync', 4073], ['nexus_gamesave-conflict-ui', 51], ['nexus_gamesave-transfer', 263], ['nexus_gamesave-commit', 183], ['nexus_gamesave-atomic', 586], ['nexus_gamesave-index', 1316], ['nexus_gamesave-files', 25],
+    ['nexus_gamesave-sync', 4073], ['nexus_gamesave-conflict-ui', 51], ['nexus_gamesave-transfer', 263], ['nexus_gamesave-commit', 183], ['nexus_gamesave-atomic', 598], ['nexus_gamesave-index', 1316], ['nexus_gamesave-fencing', 251], ['nexus_gamesave-files', 25],
     ['nexus_gamesave-file-paths', 55],
     ['nexus_game-invitations', 56, ['--component']],
     ['nexus_connectivity-events', 359],

@@ -34,7 +34,7 @@ static HRESULT parse_local_index( char *data, SIZE_T size, BOOL files, const cha
                                   container_state *state )
 {
     const HRESULT invalid = HRESULT_FROM_WIN32( ERROR_INVALID_DATA );
-    enum { DISPLAY = 1, TIME = 2, REMOTE = 4, DIRTY = 8, REVISION = 16, NAME = 32 };
+    enum { DISPLAY = 1, TIME = 2, REMOTE = 4, DIRTY = 8, REVISION = 16, NAME = 32, INCARNATION = 64 };
     unsigned seen = 0;
     if ( !size || data[size - 1] != '\n' || memchr( data, 0, size ) ) return invalid;
     for ( char *line = data, *next; *line; line = next )
@@ -72,6 +72,16 @@ static HRESULT parse_local_index( char *data, SIZE_T size, BOOL files, const cha
             field = REVISION;
             if ( !save_index_number( line + 9, ~(UINT64)0, &number ) ) return invalid;
             state->revision = number;
+        }
+        else if ( !strncmp( line, "incarnation ", 12 ) )
+        {
+            field = INCARNATION;
+            const char *id = line + 12;
+            if ( strlen( id ) != 38 || id[0] != '{' || id[37] != '}' ) return invalid;
+            for ( unsigned i = 1; i < 37; i++ )
+                if ( i == 9 || i == 14 || i == 19 || i == 24 ? id[i] != '-' :
+                     !strchr( "0123456789abcdefABCDEF", id[i] ) ) return invalid;
+            strcpy( state->incarnation, line + 12 );
         }
         else if ( !strncmp( line, "name ", 5 ) )
         {

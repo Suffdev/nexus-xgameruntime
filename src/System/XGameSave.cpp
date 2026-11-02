@@ -84,6 +84,7 @@ struct container_state
     char remote[48];
     BOOL dirty;
     UINT64 revision;
+    char incarnation[40];
     UINT32 count;
     struct blob_entry *blobs;
 };
@@ -683,6 +684,7 @@ static HRESULT save_state( struct XGameSaveProvider *provider, const struct cont
                      state->time, state->remote[0] ? state->remote : "-", state->dirty );
     free( hex );
     len += snprintf( text + len, size - len, "revision %I64u\n", state->revision );
+    if ( state->incarnation[0] ) len += snprintf( text + len, size - len, "incarnation %s\n", state->incarnation );
     if ( provider->files )
     {
         hex = hex_encode( state->name );
@@ -709,9 +711,74 @@ static HRESULT save_state( struct XGameSaveProvider *provider, const struct cont
     return hr;
 }
 
+/* A generation is minted durably before a legacy container can enter a
+ * remote queue. Reads never invent identity; deleting/recreating changes it. */
+static HRESULT ensure_incarnation( container_state *state )
+{
+    if ( state->incarnation[0] ) return S_OK;
+    GUID guid; WCHAR text[40];
+    HRESULT hr = CoCreateGuid( &guid );
+    if ( FAILED( hr ) ) return hr;
+    if ( !StringFromGUID2( guid, text, ARRAY_SIZE( text ) ) ||
+         !WideCharToMultiByte( CP_UTF8, 0, text, -1, state->incarnation, sizeof( state->incarnation ), NULL, NULL ) )
+        return E_FAIL;
+    return S_OK;
+}
+static BOOL same_save_version( const container_state *a, const container_state *b )
+{
+    return a->revision == b->revision && !strcmp( a->incarnation, b->incarnation ) && a->dirty == b->dirty &&
+           !strcmp( a->remote, b->remote );
+}
+static HRESULT current_save_version( XGameSaveProvider *provider, const container_state *expected )
+{
+    container_state current{};
+    HRESULT hr = load_state( provider, expected->name, &current );
+    if ( SUCCEEDED( hr ) && !same_save_version( expected, &current ) ) hr = E_GS_CONTAINER_NOT_IN_SYNC;
+    free_state( &current ); return hr;
+}
+
+/* A missing target is a version too. Capture before receiving bytes and
+ * compare under the promotion lock; no download may overwrite an intervening
+ * creation, deletion, or local transaction. */
+class save_version_guard
+{
+    XGameSaveProvider *provider;
+    container_state captured{};
+    HRESULT initial;
+    BOOL observed = FALSE;
+public:
+    save_version_guard( XGameSaveProvider *p, const char *name, const container_state *expected = NULL,
+                        BOOL expected_exists = FALSE ) : provider( p )
+    {
+        save_cs_lock local( &p->cs ); save_root_lock root( p );
+        initial = root.status;
+        if ( SUCCEEDED( initial ) ) { observed = TRUE; initial = load_state( p, name, &captured ); }
+        if ( expected && ( expected_exists != SUCCEEDED( initial ) ||
+             ( expected_exists && !same_save_version( expected, &captured ) ) ) ) initial = E_GS_CONTAINER_NOT_IN_SYNC;
+    }
+    HRESULT status() const
+    {
+        if ( !observed || !captured.name ) return FAILED( initial ) ? initial : E_FAIL;
+        return initial == HRESULT_FROM_WIN32( ERROR_FILE_NOT_FOUND ) ||
+               initial == HRESULT_FROM_WIN32( ERROR_PATH_NOT_FOUND ) ? S_OK : initial;
+    }
+    HRESULT check() const
+    {
+        if ( FAILED( status() ) ) return status();
+        container_state current{};
+        HRESULT now = load_state( provider, captured.name, &current );
+        BOOL absent = now == HRESULT_FROM_WIN32( ERROR_FILE_NOT_FOUND ) || now == HRESULT_FROM_WIN32( ERROR_PATH_NOT_FOUND );
+        HRESULT hr = SUCCEEDED( initial ) ?
+            ( SUCCEEDED( now ) && same_save_version( &captured, &current ) ? S_OK : E_GS_CONTAINER_NOT_IN_SYNC ) :
+            ( absent ? S_OK : E_GS_CONTAINER_NOT_IN_SYNC );
+        free_state( &current ); return hr;
+    }
+    ~save_version_guard() { free_state( &captured ); }
+};
+
 typedef BOOL ( *container_callback )( struct XGameSaveProvider *provider, const char *name, void *context );
 
-static HRESULT enumerate_local( struct XGameSaveProvider *provider, container_callback callback, void *context )
+static HRESULT enumerate_local_locked( struct XGameSaveProvider *provider, container_callback callback, void *context )
 {
     save_cs_lock local( &provider->cs );
     save_root_lock lock( provider );
@@ -781,6 +848,33 @@ static HRESULT enumerate_local( struct XGameSaveProvider *provider, container_ca
     return hr;
 }
 
+struct save_name { save_name *next; char *name; };
+struct save_names { save_name *first = NULL, **tail = &first; HRESULT status = S_OK; };
+static BOOL collect_save_name( XGameSaveProvider *, const char *name, void *context )
+{
+    save_names *names = static_cast<save_names *>( context );
+    save_name *item = static_cast<save_name *>( calloc( 1, sizeof( *item ) ) );
+    if ( !item ) { names->status = E_OUTOFMEMORY; return FALSE; }
+    if ( !( item->name = strdup( name ) ) ) { free( item ); names->status = E_OUTOFMEMORY; return FALSE; }
+    *names->tail = item; names->tail = &item->next; return TRUE;
+}
+/* Collect a validated name list under the data mutex. Callbacks may do HTTP,
+ * so none is invoked while enumeration owns the data lock or provider cs. */
+static HRESULT enumerate_local( XGameSaveProvider *provider, container_callback callback, void *context )
+{
+    save_names names;
+    HRESULT hr = enumerate_local_locked( provider, collect_save_name, &names );
+    if ( SUCCEEDED( hr ) ) hr = names.status;
+    BOOL more = TRUE;
+    while ( names.first )
+    {
+        save_name *item = names.first; names.first = item->next;
+        if ( SUCCEEDED( hr ) && more ) more = callback( provider, item->name, context );
+        free( item->name ); free( item );
+    }
+    return hr;
+}
+
 static HRESULT cloud_request( struct XGameSaveProvider *provider, const char *method, const char *path,
                               const char *extraHeaders, const void *body, DWORD bodySize, DWORD *status, BYTE **buffer,
                               SIZE_T *bufferSize )
@@ -801,6 +895,8 @@ static HRESULT cloud_request( struct XGameSaveProvider *provider, const char *me
 
 static BOOL cloud_lock( struct XGameSaveProvider *provider )
 {
+    save_remote_lock gate( provider );
+    if ( FAILED( gate.status ) ) return FALSE;
     const char *quota;
     SIZE_T size;
     BYTE *buffer;
@@ -808,6 +904,7 @@ static BOOL cloud_lock( struct XGameSaveProvider *provider )
     HRESULT hr;
 
     if ( provider->session_lock && provider->locked ) return TRUE;
+    provider->locked = FALSE;
     hr = cloud_request( provider, "PUT", "/lock?friendlyName=Xodus",
                         "x-xbl-lock-ver: 1\r\nContent-Type: application/json\r\n", NULL, 0, &status, &buffer, &size );
     if ( FAILED( hr ) ) return FALSE;
@@ -824,6 +921,8 @@ static BOOL cloud_lock( struct XGameSaveProvider *provider )
 
 static HRESULT cloud_unlock( struct XGameSaveProvider *provider, BOOL uploaded )
 {
+    save_remote_lock gate( provider );
+    if ( FAILED( gate.status ) ) return gate.status;
     SIZE_T size = 0;
     BYTE *buffer = NULL;
     DWORD status = 0;
@@ -1034,22 +1133,32 @@ static HRESULT upload_large_atom( struct XGameSaveProvider *provider, const char
  * session-release notification. Persist only that baseline, keeping dirty
  * data and the current local revision until the entire upload succeeds. An
  * older in-flight snapshot must never acknowledge a newer local write. */
-static HRESULT record_cloud_commit( struct XGameSaveProvider *provider, const struct container_state *uploaded )
+static HRESULT record_cloud_commit( struct XGameSaveProvider *provider, const struct container_state *uploaded,
+                                    BOOL completed )
 {
-    save_cs_lock local( &provider->cs );
-    save_root_lock lock( provider );
+    save_cs_lock local( &provider->cs ); save_root_lock lock( provider );
     if ( FAILED( lock.status ) ) return lock.status;
-    struct container_state current;
-    HRESULT hr;
-
-    hr = load_state( provider, uploaded->name, &current );
+    container_state current{};
+    HRESULT hr = load_state( provider, uploaded->name, &current );
+    if ( SUCCEEDED( hr ) && strcmp( current.incarnation, uploaded->incarnation ) ) hr = E_GS_CONTAINER_NOT_IN_SYNC;
     if ( SUCCEEDED( hr ) )
     {
-        lstrcpynA( current.remote, uploaded->remote, sizeof( current.remote ) );
-        hr = save_state( provider, &current );
+        if ( current.revision == uploaded->revision && current.dirty )
+        {
+            container_state acknowledged = *uploaded;
+            acknowledged.dirty = !completed;
+            hr = save_state( provider, &acknowledged );
+        }
+        else if ( current.dirty && current.revision > uploaded->revision )
+        {
+            /* A newer local write may proceed during HTTP. Acknowledge only
+             * the remote baseline, retaining its new payload and dirty state. */
+            lstrcpynA( current.remote, uploaded->remote, sizeof( current.remote ) );
+            hr = save_state( provider, &current );
+        }
+        else hr = E_GS_CONTAINER_NOT_IN_SYNC;
     }
-    free_state( &current );
-    return hr;
+    free_state( &current ); return hr;
 }
 
 static HRESULT cloud_upload_data( struct XGameSaveProvider *provider, struct container_state *state, BYTE **snapshot,
@@ -1062,6 +1171,20 @@ static HRESULT cloud_upload_data( struct XGameSaveProvider *provider, struct con
     HRESULT hr = S_OK;
 
     if ( !provider->cloud ) return S_FALSE;
+    save_remote_lock remote( provider );
+    if ( FAILED( remote.status ) ) return remote.status;
+    {
+        save_cs_lock local( &provider->cs ); save_root_lock lock( provider );
+        if ( FAILED( lock.status ) ) return lock.status;
+        container_state current{};
+        hr = load_state( provider, state->name, &current );
+        if ( SUCCEEDED( hr ) && ( !current.dirty || !state->dirty || current.revision != state->revision ||
+             strcmp( current.incarnation, state->incarnation ) ) ) hr = E_GS_CONTAINER_NOT_IN_SYNC;
+        /* A completed older upload may only advance this queued write's
+         * remote baseline; that does not invalidate its immutable payload. */
+        if ( SUCCEEDED( hr ) ) lstrcpynA( state->remote, current.remote, sizeof( state->remote ) );
+        free_state( &current ); if ( FAILED( hr ) ) return hr;
+    }
     if ( !cloud_lock( provider ) ) return E_FAIL;
 
     for ( UINT32 i = 0; i < state->count && SUCCEEDED( hr ); i++ )
@@ -1138,9 +1261,10 @@ static HRESULT cloud_upload_data( struct XGameSaveProvider *provider, struct con
     if ( SUCCEEDED( hr ) )
     {
         lstrcpynA( state->remote, timestamp, sizeof( state->remote ) );
-        HRESULT persisted = record_cloud_commit( provider, state );
+        HRESULT persisted = record_cloud_commit( provider, state, FALSE );
         HRESULT released = cloud_unlock( provider, TRUE );
         hr = FAILED( persisted ) ? persisted : released;
+        if ( SUCCEEDED( hr ) ) hr = record_cloud_commit( provider, state, TRUE );
     }
     else
         cloud_unlock( provider, FALSE );
@@ -1153,9 +1277,36 @@ static HRESULT cloud_upload_data( struct XGameSaveProvider *provider, struct con
     return hr;
 }
 
+static struct save_upload *snapshot_upload( XGameSaveProvider *, const char * );
+static void free_upload( save_upload * );
 static HRESULT cloud_upload( struct XGameSaveProvider *provider, struct container_state *state )
 {
-    return cloud_upload_data( provider, state, NULL, NULL );
+    save_cs_lock cloud( provider->upload_thread ? &provider->cloud_cs : NULL );
+    save_remote_lock gate( provider );
+    if ( FAILED( gate.status ) ) return gate.status;
+    save_upload *upload;
+    {
+        save_cs_lock local( &provider->cs ); save_root_lock root( provider );
+        if ( FAILED( root.status ) ) return root.status;
+        container_state current{};
+        HRESULT hr = load_state( provider, state->name, &current );
+        if ( SUCCEEDED( hr ) && ( current.revision != state->revision || current.dirty != state->dirty ||
+             strcmp( current.incarnation, state->incarnation ) ||
+             ( !state->dirty && strcmp( current.remote, state->remote ) ) ) ) hr = E_GS_CONTAINER_NOT_IN_SYNC;
+        free_state( &current );
+        if ( FAILED( hr ) ) return hr;
+        upload = snapshot_upload( provider, state->name );
+    }
+    if ( !upload ) return E_OUTOFMEMORY;
+    HRESULT hr = cloud_upload_data( provider, &upload->state, upload->data, upload->sizes );
+    if ( SUCCEEDED( hr ) )
+    {
+        free_state( state ); *state = upload->state;
+        for ( UINT32 i = 0; i < upload->state.count; i++ ) free( upload->data[i] );
+        free( upload->data ); upload->data = NULL;
+        memset( &upload->state, 0, sizeof( upload->state ) );
+    }
+    free_upload( upload ); return hr;
 }
 
 static void free_upload( struct save_upload *upload )
@@ -1180,6 +1331,14 @@ static struct save_upload *snapshot_upload( struct XGameSaveProvider *provider, 
     char path[2048];
     if ( !upload ) return NULL;
     if ( FAILED( load_state( provider, name, &upload->state ) ) ) goto failed;
+    {
+        BOOL changed = !upload->state.incarnation[0] || ( !upload->state.dirty && !upload->state.remote[0] );
+        if ( FAILED( ensure_incarnation( &upload->state ) ) ) goto failed;
+        /* A valid never-uploaded legacy container may be locally clean. Make
+         * its first publication durable dirty intent before starting HTTP. */
+        if ( !upload->state.remote[0] ) upload->state.dirty = TRUE;
+        if ( changed && FAILED( save_state( provider, &upload->state ) ) ) goto failed;
+    }
     if ( upload->state.count )
     {
         upload->data = static_cast<std::remove_reference_t<decltype( upload->data )>>(
@@ -1248,42 +1407,22 @@ static DWORD WINAPI upload_worker( void *context )
         WaitForSingleObject( provider->upload_event, INFINITE );
         for ( ;; )
         {
-            EnterCriticalSection( &provider->cloud_cs );
-            EnterCriticalSection( &provider->cs );
-            upload = provider->uploads;
-            if ( upload ) provider->uploads = upload->next;
-            stopping = provider->upload_stopping;
-            LeaveCriticalSection( &provider->cs );
+            save_cs_lock cloud( &provider->cloud_cs );
+            save_remote_lock gate( provider );
+            {
+                save_cs_lock local( &provider->cs );
+                upload = provider->uploads;
+                if ( upload ) provider->uploads = upload->next;
+                stopping = provider->upload_stopping;
+            }
             if ( !upload )
             {
-                LeaveCriticalSection( &provider->cloud_cs );
                 if ( stopping ) goto done;
                 break;
             }
-            hr = cloud_upload_data( provider, &upload->state, upload->data, upload->sizes );
-            EnterCriticalSection( &provider->cs );
-            {
-                save_root_lock lock( provider );
-                if ( SUCCEEDED( hr ) ) hr = lock.status;
-                if ( SUCCEEDED( hr ) && SUCCEEDED( load_state( provider, upload->state.name, &current ) ) )
-                {
-                    /* Same-second writes are distinct revisions. Never acknowledge
-                     * newer data using the successful upload of an older snapshot. */
-                    if ( current.revision == upload->state.revision )
-                        hr = save_state( provider, &upload->state );
-                    else
-                    {
-                        lstrcpynA( current.remote, upload->state.remote, sizeof( current.remote ) );
-                        hr = save_state( provider, &current );
-                    }
-                    free_state( &current );
-                }
-                else if ( SUCCEEDED( hr ) )
-                    free_state( &current );
-                if ( FAILED( hr ) ) WARN( "background upload failed, hr %#lx; dirty save retained for retry.\n", hr );
-            }
-            LeaveCriticalSection( &provider->cs );
-            LeaveCriticalSection( &provider->cloud_cs );
+            hr = FAILED( gate.status ) ? gate.status :
+                 cloud_upload_data( provider, &upload->state, upload->data, upload->sizes );
+            if ( FAILED( hr ) ) WARN( "background upload failed, hr %#lx; dirty save retained for retry.\n", hr );
             free_upload( upload );
         }
     }
@@ -1294,6 +1433,8 @@ done:
 
 static HRESULT cloud_delete( struct XGameSaveProvider *provider, const char *name )
 {
+    save_remote_lock gate( provider );
+    if ( FAILED( gate.status ) ) return gate.status;
     char path[1024], *enc = url_encode( name );
     SIZE_T size;
     BYTE *buffer;
@@ -1315,9 +1456,9 @@ static HRESULT cloud_delete( struct XGameSaveProvider *provider, const char *nam
     free( enc );
     hr = cloud_request( provider, "DELETE", path, NULL, NULL, 0, &status, &buffer, &size );
     free( buffer );
-    cloud_unlock( provider, SUCCEEDED( hr ) );
     if ( SUCCEEDED( hr ) && status != 200 && status != 204 && status != 404 ) hr = E_FAIL;
-    return hr;
+    HRESULT released = cloud_unlock( provider, SUCCEEDED( hr ) );
+    return FAILED( hr ) ? hr : released;
 }
 
 struct remote_container
@@ -1372,14 +1513,16 @@ static BOOL sync_local_callback( struct XGameSaveProvider *provider, const char 
         sync->hr = cloud_upload( provider, &state );
         if ( SUCCEEDED( sync->hr ) )
         {
-            sync->hr = save_state( provider, &state );
-            if ( SUCCEEDED( sync->hr ) ) provider->uploaded++;
+            provider->uploaded++;
         }
     }
     else if ( container_dir( provider, name, dir, sizeof( dir ) ) )
     {
 
-        delete_directory( dir );
+        save_cs_lock local( &provider->cs ); save_root_lock root( provider );
+        sync->hr = root.status;
+        if ( SUCCEEDED( sync->hr ) ) sync->hr = current_save_version( provider, &state );
+        if ( SUCCEEDED( sync->hr ) ) delete_directory( dir );
     }
     free_state( &state );
     return SUCCEEDED( sync->hr );
@@ -1387,18 +1530,24 @@ static BOOL sync_local_callback( struct XGameSaveProvider *provider, const char 
 
 static HRESULT force_upload( struct XGameSaveProvider *provider, struct container_state *state )
 {
-    HRESULT hr, persisted;
-    for ( UINT32 i = 0; i < state->count; i++ )
-        state->blobs[i].atom[0] = 0;
-    state->dirty = TRUE;
-    if ( FAILED( hr = save_state( provider, state ) ) ) return hr;
-    hr = cloud_upload( provider, state );
-    persisted = save_state( provider, state );
-    if ( SUCCEEDED( hr ) && SUCCEEDED( persisted ) ) provider->uploaded++;
-    return FAILED( hr ) ? hr : persisted;
+    {
+        save_cs_lock local( &provider->cs ); save_root_lock root( provider );
+        if ( FAILED( root.status ) ) return root.status;
+        HRESULT hr = current_save_version( provider, state );
+        if ( FAILED( hr ) ) return hr;
+        if ( state->revision == ~(UINT64)0 ) return HRESULT_FROM_WIN32( ERROR_ARITHMETIC_OVERFLOW );
+        if ( FAILED( hr = ensure_incarnation( state ) ) ) return hr;
+        for ( UINT32 i = 0; i < state->count; i++ ) state->blobs[i].atom[0] = 0;
+        state->dirty = TRUE; state->revision++;
+        if ( FAILED( hr = save_state( provider, state ) ) ) return hr;
+    }
+    HRESULT hr = cloud_upload( provider, state );
+    if ( SUCCEEDED( hr ) ) provider->uploaded++;
+    return hr;
 }
 
-static HRESULT files_cloud_download( struct XGameSaveProvider *, const char *, const char *, const char * );
+static HRESULT files_cloud_download( struct XGameSaveProvider *, const char *, const char *, const char *,
+                                     const container_state * = NULL, BOOL = FALSE );
 
 static HRESULT files_validate_download( const container_state *state );
 
@@ -1407,11 +1556,14 @@ static HRESULT files_validate_download( const container_state *state );
 static HRESULT cloud_sync( struct XGameSaveProvider *provider )
 {
     save_cs_lock cloud( provider->upload_thread ? &provider->cloud_cs : NULL );
-    save_cs_lock local( &provider->cs );
-    save_root_lock lock( provider );
-    if ( FAILED( lock.status ) ) return lock.status;
-    HRESULT recovery = recover_local_updates( provider );
-    if ( FAILED( recovery ) ) return recovery;
+    save_remote_lock gate( provider );
+    if ( FAILED( gate.status ) ) return gate.status;
+    {
+        save_cs_lock local( &provider->cs ); save_root_lock root( provider );
+        if ( FAILED( root.status ) ) return root.status;
+        HRESULT recovery = recover_local_updates( provider );
+        if ( FAILED( recovery ) ) return recovery;
+    }
     struct remote_container *remote = NULL;
     enum sync_mode mode;
     const char *blobs, *item;
@@ -1534,7 +1686,7 @@ list_again:
         {
             /* Only an explicit choice with recovery copies can replace either
              * side. A cancelled/stale/failed resolution retains local data. */
-            hr = resolve_cloud_conflict( provider, &state, remote[i].display, remote[i].time );
+            hr = resolve_cloud_conflict( provider, &state, remote[i].display, remote[i].time, gate );
             free_state( &state );
             refresh = SUCCEEDED( hr );
             goto done;
@@ -1546,14 +1698,13 @@ list_again:
         else if ( mode == SYNC_DOWNLOAD || !exists || ( remoteChanged && !state.dirty ) ||
                   ( remoteChanged && state.dirty && parse_iso_time( remote[i].time ) > state.time ) )
         {
-            hr = provider->files ? files_cloud_download( provider, remote[i].name, remote[i].display, remote[i].time )
-                                 : cloud_download( provider, remote[i].name, remote[i].display, remote[i].time );
+            hr = provider->files ? files_cloud_download( provider, remote[i].name, remote[i].display, remote[i].time, &state, exists )
+                                 : cloud_download( provider, remote[i].name, remote[i].display, remote[i].time, &state, exists );
             if ( SUCCEEDED( hr ) ) provider->downloaded++;
         }
         else if ( state.dirty )
         {
             hr = cloud_upload( provider, &state );
-            if ( SUCCEEDED( hr ) ) hr = save_state( provider, &state );
             if ( SUCCEEDED( hr ) ) provider->uploaded++;
         }
         free_state( &state );
@@ -1670,7 +1821,6 @@ static BOOL flush_dirty_upload( struct XGameSaveProvider *provider, const char *
     if ( SUCCEEDED( hr ) && state.dirty )
     {
         hr = cloud_upload( provider, &state );
-        if ( SUCCEEDED( hr ) ) hr = save_state( provider, &state );
         if ( FAILED( hr ) ) WARN( "final cloud upload failed, hr %#lx; dirty save retained.\n", hr );
     }
     free_state( &state );
@@ -1727,38 +1877,25 @@ static INT64 remaining_quota( struct XGameSaveProvider *provider )
 
 static HRESULT delete_container( struct XGameSaveProvider *provider, const char *name )
 {
-    char dir[2048];
-    HRESULT hr;
-
     if ( !provider || !name || !*name ) return E_INVALIDARG;
-    /* Finish the active remote upload before deleting; cancel older pending
-     * snapshots so they can never recreate the deleted remote container. */
-    if ( provider->upload_thread ) EnterCriticalSection( &provider->cloud_cs );
-    EnterCriticalSection( &provider->cs );
-    save_root_lock lock( provider );
-    hr = lock.status;
-    if ( SUCCEEDED( hr ) ) hr = recover_local_update( provider, name );
-    if ( FAILED( hr ) )
+    save_cs_lock cloud( provider->upload_thread ? &provider->cloud_cs : NULL );
+    save_remote_lock gate( provider );
+    if ( FAILED( gate.status ) ) return gate.status;
+    HRESULT hr;
     {
-        LeaveCriticalSection( &provider->cs );
-        if ( provider->upload_thread ) LeaveCriticalSection( &provider->cloud_cs );
-        return hr;
+        save_cs_lock local( &provider->cs ); save_root_lock root( provider );
+        if ( FAILED( root.status ) ) return root.status;
+        if ( FAILED( hr = recover_local_update( provider, name ) ) ) return hr;
+        container_state state{};
+        hr = load_state( provider, name, &state ); free_state( &state );
+        if ( FAILED( hr ) && hr != HRESULT_FROM_WIN32( ERROR_FILE_NOT_FOUND ) &&
+             hr != HRESULT_FROM_WIN32( ERROR_PATH_NOT_FOUND ) ) return hr;
+        char dir[2048];
+        if ( !container_dir( provider, name, dir, sizeof( dir ) ) ) return E_OUTOFMEMORY;
+        delete_directory( dir ); cancel_pending_upload( provider, name );
     }
-    if ( !container_dir( provider, name, dir, sizeof( dir ) ) )
-        hr = E_OUTOFMEMORY;
-    else
-    {
-        delete_directory( dir );
-        cancel_pending_upload( provider, name );
-        LeaveCriticalSection( &provider->cs );
-        hr = cloud_delete( provider, name );
-        if ( FAILED( hr ) ) WARN( "cloud delete failed, hr %#lx.\n", hr );
-        hr = S_OK;
-        if ( provider->upload_thread ) LeaveCriticalSection( &provider->cloud_cs );
-        return hr;
-    }
-    LeaveCriticalSection( &provider->cs );
-    if ( provider->upload_thread ) LeaveCriticalSection( &provider->cloud_cs );
+    hr = provider->cloud ? cloud_delete( provider, name ) : S_OK;
+    if ( FAILED( hr ) ) WARN( "cloud delete failed, hr %#lx.\n", hr );
     return hr;
 }
 
@@ -2044,8 +2181,9 @@ static HRESULT submit_update( struct XGameSaveUpdate *update )
     {
         state.time = unix_now();
         state.dirty = TRUE;
-        state.revision++;
-        hr = save_state( &transaction.staged, &state );
+        if ( state.revision == ~(UINT64)0 ) hr = HRESULT_FROM_WIN32( ERROR_ARITHMETIC_OVERFLOW );
+        else { state.revision++; hr = ensure_incarnation( &state ); }
+        if ( SUCCEEDED( hr ) ) hr = save_state( &transaction.staged, &state );
     }
     if ( SUCCEEDED( hr ) ) hr = transaction.commit();
     if ( SUCCEEDED( hr ) && provider->cloud )

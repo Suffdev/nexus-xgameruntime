@@ -245,6 +245,14 @@ static void concurrent_providers()
 
 static void allocation_failures()
 {
+    {
+        auto p = device( FALSE, "lock-allocation-fault" ); p->cloud = FALSE; seed_pair( p );
+        allocation_calls = 0; allocation_fail_at = 1;
+        { save_root_lock lock( p ); CHECK( "root-lock-allocation-failure-is-not-success", FAILED( lock.status ) ); }
+        allocation_calls = 0; allocation_fail_at = 1;
+        { save_remote_lock lock( p, 40 ); CHECK( "remote-lock-allocation-failure-is-not-success", FAILED( lock.status ) ); }
+        allocation_fail_at = 0; expect_pair( p, "old-A", "old-B", 1, FALSE ); close_provider( p );
+    }
     unsigned covered = 0;
     for ( unsigned point = 1; point <= 100; point++ )
     {
