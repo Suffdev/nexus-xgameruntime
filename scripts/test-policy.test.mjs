@@ -196,6 +196,15 @@ test('file saves retain all ABI assertions and load their actual C++ helper DLL'
         assert.match(read(file),/XUSER_\|NEXUS_\|XGAMERUNTIME_/);
 });
 
+test('base64 capacity contracts run in the native authentication gate',()=>{
+    assert.match(read('tests/CMakeLists.txt'),/target_sources\(test_nexus_user PRIVATE Nexus\/test_base64.cpp\)/);
+    for(const name of ['StandardEncodingRespectsCapacity','UrlEncodingRespectsCapacity','WideEncodingRespectsCapacity']) {
+        assert.ok(read('tests/Nexus/test_base64.cpp').includes(name));
+        assert.ok(read('scripts/test-authentication.mjs').includes(name));
+    }
+    assert.match(read('scripts/test-authentication.mjs'),/if\(!base64Passed\)proof.passed=false/);
+});
+
 test('save commit recovery retains dirty revisions and tests cold relaunch conflicts',()=>{
     const fixture=read('tests/Nexus/gamesave-commit.cpp');
     assert.match(fixture,/#include "gamesave-transfer.cpp"/);
