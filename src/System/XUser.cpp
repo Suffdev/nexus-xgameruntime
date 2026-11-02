@@ -431,7 +431,7 @@ cleanup:
 
 static HRESULT xsts_authorize( XUserHandle user, const char *relyingParty, BOOL title, char **auth );
 static HRESULT xsts_authorize_privilege( XUserHandle user, const char *relyingParty, BOOL title, char **auth,
-                                         XUserPrivilege privilege, BOOLEAN *granted, bool presence = false );
+                                         XUserPrivilege privilege, BOOLEAN *granted, bool presence = false, UINT64 *expires = nullptr );
 static char *hstring_to_utf8( HSTRING string );
 static WCHAR *utf8_to_wide( const char *string );
 
@@ -877,6 +877,7 @@ cleanup:
 
 void XUser::ResetNetworkState() noexcept
 {
+    authorizationCache.Clear();
     free( userToken );
     userToken = nullptr;
     free( deviceToken );
@@ -1229,25 +1230,38 @@ error:
     return HRESULT_FROM_WIN32( GetLastError() );
 }
 
-HRESULT WINAPI XUser::GetAuthorization( const WCHAR *relyingParty, WCHAR **auth )
+HRESULT WINAPI XUser::GetAuthorization( const WCHAR *relyingParty, WCHAR **auth, bool forceRefresh )
 {
-    auto *impl = this;
-    char *relyingPartyA, *authA = NULL;
-    SIZE_T size;
-    HRESULT hr;
-
-    if ( FAILED( hr = user_wait_init( impl ) ) ) return hr;
-
-    if ( !( size = WideCharToMultiByte( CP_UTF8, WC_ERR_INVALID_CHARS, relyingParty, -1, NULL, 0, NULL, NULL ) ) )
-        return HRESULT_FROM_WIN32( GetLastError() );
-    if ( !( relyingPartyA = static_cast<std::remove_reference_t<decltype( relyingPartyA )>>( calloc( 1, size ) ) ) )
-        return E_OUTOFMEMORY;
-    WideCharToMultiByte( CP_UTF8, WC_ERR_INVALID_CHARS, relyingParty, -1, relyingPartyA, size, NULL, NULL );
-    if ( SUCCEEDED( hr = xsts_authorize( impl, relyingPartyA, TRUE, &authA ) ) && !( *auth = utf8_to_wide( authA ) ) )
-        hr = E_OUTOFMEMORY;
-    free( relyingPartyA );
-    free( authA );
-    return hr;
+    if ( !auth ) return E_POINTER;
+    *auth = nullptr;
+    if ( !relyingParty ) return E_INVALIDARG;
+    HRESULT hr = user_wait_init( this );
+    if ( FAILED( hr ) ) return hr;
+    if ( cancelled ) return E_ABORT;
+    if ( offline ) return HRESULT_FROM_WIN32( ERROR_WINHTTP_CANNOT_CONNECT );
+    try
+    {
+        const int size = WideCharToMultiByte( CP_UTF8, WC_ERR_INVALID_CHARS, relyingParty, -1, nullptr, 0, nullptr, nullptr );
+        if ( !size ) return HRESULT_FROM_WIN32( GetLastError() );
+        if ( size > 65536 ) return E_INVALIDARG;
+        std::string audience( size, '\0' ), token;
+        if ( !WideCharToMultiByte( CP_UTF8, WC_ERR_INVALID_CHARS, relyingParty, -1, audience.data(), size, nullptr, nullptr ) )
+            return HRESULT_FROM_WIN32( GetLastError() );
+        audience.resize( size - 1 );
+        hr = authorizationCache.Get( audience.c_str(), forceRefresh, cancelled,
+            [&]( std::string &value, UINT64 &expires ) {
+                char *response = nullptr;
+                HRESULT result = xsts_authorize_privilege( this, audience.c_str(), TRUE, &response,
+                    static_cast<XUserPrivilege>( 0 ), nullptr, false, &expires );
+                std::unique_ptr<char, decltype( &free )> owned( response, free );
+                if ( SUCCEEDED( result ) ) value = response;
+                return result;
+            }, token );
+        if ( SUCCEEDED( hr ) && !( *auth = utf8_to_wide( token.c_str() ) ) ) return E_OUTOFMEMORY;
+        return hr;
+    }
+    catch ( const std::bad_alloc & ) { return E_OUTOFMEMORY; }
+    catch ( ... ) { return E_FAIL; }
 }
 
 HRESULT WINAPI XUser::GetSignature( UINT32 version, const char *method, const char *url, const char *auth,
@@ -2081,7 +2095,9 @@ static HRESULT WINAPI token_signature_phase( XAsyncOp op, const XAsyncProviderDa
         }
         if ( info.tokenType &&
              FAILED( hr = ( context->user )
-                              ->GetAuthorization( WindowsGetStringRawBuffer( info.relyingParty, NULL ), &auth ) ) )
+                              ->GetAuthorization( WindowsGetStringRawBuffer( info.relyingParty, NULL ), &auth,
+                                  ( static_cast<UINT32>( context->options ) &
+                                    static_cast<UINT32>( XUserGetTokenAndSignatureOptions::ForceRefresh ) ) != 0 ) ) )
             goto complete;
 
         if ( context->isUtf16 )
@@ -2881,11 +2897,11 @@ static HRESULT xsts_authorize( XUserHandle user, const char *relyingParty, BOOL 
 }
 
 static HRESULT xsts_authorize_privilege( XUserHandle user, const char *relyingParty, BOOL title, char **auth,
-                                         XUserPrivilege privilege, BOOLEAN *granted, bool presence )
+                                         XUserPrivilege privilege, BOOLEAN *granted, bool presence, UINT64 *expires )
 {
     static const char url[] = "https://xsts.auth.xboxlive.com/xsts/authorize";
     IJsonObject *object = NULL, *claims = NULL, *identity = NULL;
-    HSTRING token = NULL, uhs = NULL, xid = NULL, prv = NULL;
+    HSTRING token = NULL, uhs = NULL, xid = NULL, prv = NULL, notAfter = NULL;
     char *body = NULL, *tokenA = NULL, *uhsA = NULL;
     IJsonArray *xui = NULL;
     BYTE *buffer = NULL;
@@ -2893,6 +2909,7 @@ static HRESULT xsts_authorize_privilege( XUserHandle user, const char *relyingPa
     HRESULT hr, comInit = E_FAIL;
     DWORD status = 0;
     BOOL requested_title = title;
+    if ( expires ) *expires = 0;
 
     auth_metadata( "xsts-begin", user, E_PENDING, 0, requested_title, FALSE );
     if ( granted ) *granted = FALSE;
@@ -2984,6 +3001,13 @@ static HRESULT xsts_authorize_privilege( XUserHandle user, const char *relyingPa
         goto cleanup;
     }
     snprintf( *auth, size, "XBL3.0 x=%s;%s", uhsA, tokenA );
+    if ( expires && SUCCEEDED( get_json_string( object, L"NotAfter", &notAfter ) ) )
+    {
+        UINT32 length = 0;
+        const WCHAR *text = WindowsGetStringRawBuffer( notAfter, &length );
+        *expires = nexus::user::AuthorizationExpiry( std::wstring_view( text, length ) );
+    }
+
 
 cleanup:
     if ( identity ) ( identity )->Release();
@@ -2994,6 +3018,7 @@ cleanup:
     if ( uhs ) WindowsDeleteString( uhs );
     if ( xid ) WindowsDeleteString( xid );
     if ( prv ) WindowsDeleteString( prv );
+    if ( notAfter ) WindowsDeleteString( notAfter );
     free( tokenA );
     free( uhsA );
     free( buffer );

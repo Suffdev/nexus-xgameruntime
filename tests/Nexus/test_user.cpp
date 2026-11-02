@@ -8,6 +8,8 @@
 #include <vector>
 #include <memory>
 #include <cstring>
+#include <thread>
+#include <future>
 
 namespace
 {
@@ -42,7 +44,10 @@ public:
 class SyntheticTransport final : public UserTransport
 {
 public:
-    unsigned backendCalls = 0, httpCalls = 0, rawCalls = 0, unexpected = 0;
+    unsigned backendCalls = 0, httpCalls = 0, unexpected = 0;
+    std::atomic<unsigned> rawCalls{0};
+    std::mutex rawMutex;
+    std::string notAfter;
     unsigned defaultFailures = 0, retryMilliseconds = 0, retryCalls = 0;
     bool unreachable = false;
     void WaitForSignInRetry( DWORD milliseconds ) noexcept override
@@ -157,10 +162,12 @@ public:
             if ( WaitForSingleObject( authorizationContinue, 5000 ) != WAIT_OBJECT_0 ) return E_ABORT;
         }
         if ( refuseAuthorization ) return E_FAIL;
-        signedBodies.emplace_back( static_cast<const char *>( body ), size );
+        { std::lock_guard<std::mutex> lock( rawMutex );
+          signedBodies.emplace_back( static_cast<const char *>( body ), size ); }
         *status = xstsStatus;
         std::string response = R"({"Token":"synthetic-xsts","DisplayClaims":{"xui":[{"xid":")" + claimXid +
                                R"(","uhs":"synthetic-user-hash","prv":")" + privilegeText + R"("}]}})";
+        if ( !notAfter.empty() ) response.insert( 1, "\"NotAfter\":\"" + notAfter + "\"," );
         return Reply( response, output, length );
     }
 };
@@ -1336,4 +1343,268 @@ TEST( NexusAuthentication, EndpointPathsAcceptRelativeAndAbsoluteServiceMetadata
         EXPECT_TRUE( FAILED( user->GetEndpointInfo( "http://auth.service.example.invalid/login/platform", &info ) ) );
         EXPECT_TRUE( FAILED( user->GetEndpointInfo( "https://auth.foreign.invalid/login/platform", &info ) ) );
     }
+}
+
+
+namespace
+{
+std::string FutureAuthorizationExpiry()
+{
+    UINT64 raw = nexus::user::AuthorizationClock{}().wall + 3600ull * 10000000;
+    FILETIME file{ DWORD( raw ), DWORD( raw >> 32 ) };
+    SYSTEMTIME time{};
+    FileTimeToSystemTime( &file, &time );
+    char text[32];
+    snprintf( text, sizeof( text ), "%04u-%02u-%02uT%02u:%02u:%02u.0000000Z", time.wYear, time.wMonth,
+              time.wDay, time.wHour, time.wMinute, time.wSecond );
+    return text;
+}
+}
+TEST( NexusAuthorizationCache, ReusesOnlyTheSameUserAndAudienceAndResetsWithCredentials )
+{
+    Apartment apartment;
+    SyntheticTransport transport;
+    transport.notAfter = FutureAuthorizationExpiry();
+    auto first = CreateUser( transport ), second = CreateUser( transport );
+    for ( auto user : { first.get(), second.get() } )
+    {
+        ASSERT_EQ( user->InitializeNetwork( XUserAddOptions::AddDefaultUserSilently ), S_OK );
+        user->initDone = 1; user->initResult = S_OK;
+    }
+    auto request = [&]( XUser *user, const WCHAR *audience, bool force = false ) {
+        WCHAR *auth = nullptr;
+        auto hr = user->GetAuthorization( audience, &auth, force );
+        if ( SUCCEEDED( hr ) ) EXPECT_STREQ( auth, L"XBL3.0 x=synthetic-user-hash;synthetic-xsts" );
+        free( auth ); return hr;
+    };
+    for ( unsigned i = 0; i < 20; ++i ) EXPECT_EQ( request( first.get(), L"https://one.invalid/" ), S_OK );
+    EXPECT_EQ( transport.rawCalls.load(), 1u );
+    EXPECT_EQ( request( first.get(), L"https://two.invalid/" ), S_OK );
+    EXPECT_EQ( request( second.get(), L"https://one.invalid/" ), S_OK );
+    EXPECT_EQ( transport.rawCalls.load(), 3u );
+    EXPECT_EQ( request( first.get(), L"https://one.invalid/", true ), S_OK );
+    EXPECT_EQ( transport.rawCalls.load(), 4u );
+    transport.xstsStatus = 401;
+    EXPECT_EQ( request( first.get(), L"https://one.invalid/", true ), E_FAIL );
+    EXPECT_EQ( request( first.get(), L"https://one.invalid/" ), E_FAIL );
+    transport.xstsStatus = 200;
+    ASSERT_EQ( first->InitializeNetwork( XUserAddOptions::AddDefaultUserSilently ), S_OK );
+    EXPECT_EQ( request( first.get(), L"https://one.invalid/" ), S_OK );
+    EXPECT_EQ( transport.rawCalls.load(), 7u );
+    first->cancelled = true;
+    EXPECT_EQ( request( first.get(), L"https://one.invalid/" ), E_ABORT );
+    EXPECT_EQ( transport.rawCalls.load(), 7u );
+}
+TEST( NexusAuthorizationCache, ConcurrentRequestsShareOneRealTransportExchange )
+{
+    Apartment apartment;
+    SyntheticTransport transport;
+    transport.notAfter = FutureAuthorizationExpiry();
+    auto user = CreateUser( transport );
+    ASSERT_EQ( user->InitializeNetwork( XUserAddOptions::AddDefaultUserSilently ), S_OK );
+    user->initDone = 1; user->initResult = S_OK;
+    transport.blockAuthorization = true;
+    std::vector<std::future<HRESULT>> work;
+    for ( unsigned i = 0; i < 20; ++i ) work.push_back( std::async( std::launch::async, [&] {
+        WCHAR *auth = nullptr;
+        auto hr = user->GetAuthorization( L"https://one.invalid/", &auth );
+        if ( SUCCEEDED( hr ) && ( !auth || wcscmp( auth, L"XBL3.0 x=synthetic-user-hash;synthetic-xsts" ) ) ) hr = E_FAIL;
+        free( auth ); return hr;
+    } ) );
+    EXPECT_EQ( WaitForSingleObject( transport.authorizationEntered, 2000 ), WAIT_OBJECT_0 );
+    SetEvent( transport.authorizationContinue );
+    for ( auto &item : work ) EXPECT_EQ( item.get(), S_OK );
+    EXPECT_EQ( transport.rawCalls.load(), 1u );
+}
+TEST( NexusAuthorizationCache, MissingInvalidOrExpiredServerLifetimeDoesNotBecomePersistent )
+{
+    Apartment apartment;
+    SyntheticTransport transport;
+    auto user = CreateUser( transport );
+    ASSERT_EQ( user->InitializeNetwork( XUserAddOptions::AddDefaultUserSilently ), S_OK );
+    user->initDone = 1; user->initResult = S_OK;
+    for ( auto value : { "", "invalid", "2000-01-01T00:00:00Z", "2099-02-30T00:00:00Z", "2099-01-01T00:00:00+00:00" } )
+    {
+        transport.notAfter = value;
+        auto count = transport.rawCalls.load();
+        for ( int i = 0; i < 2; ++i )
+        {
+            WCHAR *auth = nullptr;
+            EXPECT_EQ( user->GetAuthorization( L"https://one.invalid/", &auth ), S_OK );
+            free( auth );
+        }
+        EXPECT_EQ( transport.rawCalls.load(), count + 2 );
+    }
+}
+TEST( NexusAuthorizationCache, ServerExpirySkewClockRollbackAndMonotonicCapAreEnforced )
+{
+    using namespace nexus::user;
+    EXPECT_EQ( AuthorizationExpiry( L"2024-02-29T12:34:56.1234567Z" ), AuthorizationExpiry( L"2024-02-29T12:34:56Z" ) );
+    for ( auto bad : { L"2023-02-29T12:34:56Z", L"2024-01-01T24:00:00Z", L"2024-01-01T00:00:00.Z", L"2024-01-01T00:00:00.0xZ", L"2024-01-01T00:00:00Zjunk" } )
+        EXPECT_EQ( AuthorizationExpiry( bad ), 0u );
+    AuthorizationCache cache;
+    AuthorizationClock::Time now{ AuthorizationExpiry( L"2024-01-01T00:00:00Z" ), 10000 };
+    UINT64 expiry = now.wall + 120ull * 10000000;
+    std::atomic<bool> cancelled{false};
+    unsigned calls = 0;
+    std::string token;
+    auto fetch = [&]( std::string &out, UINT64 &end ) { ++calls; out = "token"; end = expiry; return S_OK; };
+    auto get = [&] { return cache.Get( "audience", false, cancelled, fetch, token, [&] { return now; } ); };
+    EXPECT_EQ( get(), S_OK ); EXPECT_EQ( get(), S_OK ); EXPECT_EQ( calls, 1u );
+    now.wall += 60ull * 10000000;
+    EXPECT_EQ( get(), S_OK ); EXPECT_EQ( calls, 2u );
+    expiry = now.wall + 3600ull * 10000000;
+    EXPECT_EQ( get(), S_OK ); EXPECT_EQ( calls, 3u );
+    --now.wall;
+    EXPECT_EQ( get(), S_OK ); EXPECT_EQ( calls, 4u );
+    now.tick += 600000;
+    EXPECT_EQ( get(), S_OK ); EXPECT_EQ( calls, 5u );
+    --now.tick;
+    EXPECT_EQ( get(), S_OK ); EXPECT_EQ( calls, 6u );
+}
+TEST( NexusAuthorizationCache, RefreshDoesNotAcceptOlderInflightResponseOrBlockOtherAudiences )
+{
+    nexus::user::AuthorizationCache cache;
+    std::atomic<bool> cancelled{false};
+    std::promise<void> entered, release;
+    auto released = release.get_future().share();
+    auto old = std::async( std::launch::async, [&] {
+        std::string value;
+        return cache.Get( "one", false, cancelled, [&]( std::string &out, UINT64 &expires ) {
+            entered.set_value(); released.wait(); out = "old";
+            expires = nexus::user::AuthorizationClock{}().wall + 3600ull * 10000000; return S_OK;
+        }, value );
+    } );
+    entered.get_future().wait();
+    std::string value;
+    auto fresh = []( std::string &out, UINT64 &expires ) { out = "new"; expires = nexus::user::AuthorizationClock{}().wall + 3600ull * 10000000; return S_OK; };
+    // Independent calls complete while the first network request is blocked.
+    EXPECT_EQ( cache.Get( "two", false, cancelled, fresh, value ), S_OK );
+    EXPECT_EQ( cache.Get( "one", true, cancelled, fresh, value ), S_OK );
+    EXPECT_EQ( value, "new" );
+    release.set_value();
+    EXPECT_EQ( old.get(), E_ABORT );
+    EXPECT_EQ( cache.Get( "one", false, cancelled, []( std::string &, UINT64 & ) { return E_FAIL; }, value ), S_OK );
+    EXPECT_EQ( value, "new" );
+}
+TEST( NexusAuthorizationCache, BoundedEntriesEvictAndClearInvalidatesInflightWork )
+{
+    nexus::user::AuthorizationCache cache;
+    std::atomic<bool> cancelled{false};
+    std::string token;
+    unsigned calls = 0;
+    auto fetch = [&]( std::string &out, UINT64 &expires ) { ++calls; out = "token"; expires = nexus::user::AuthorizationClock{}().wall + 3600ull * 10000000; return S_OK; };
+    for ( unsigned i = 0; i < 40; ++i ) EXPECT_EQ( cache.Get( std::to_string( i ).c_str(), false, cancelled, fetch, token ), S_OK );
+    EXPECT_EQ( cache.Get( "39", false, cancelled, fetch, token ), S_OK ); EXPECT_EQ( calls, 40u );
+    EXPECT_EQ( cache.Get( "0", false, cancelled, fetch, token ), S_OK ); EXPECT_EQ( calls, 41u );
+    cache.Clear();
+    EXPECT_EQ( cache.Get( "0", false, cancelled, fetch, token ), S_OK ); EXPECT_EQ( calls, 42u );
+    EXPECT_EQ( cache.Get( "pending", false, cancelled, [&]( std::string &out, UINT64 &expires ) {
+        cache.Clear(); return fetch( out, expires );
+    }, token ), E_ABORT );
+    EXPECT_TRUE( token.empty() );
+    EXPECT_EQ( cache.Get( "exception", false, cancelled, []( std::string &, UINT64 & ) -> HRESULT { throw std::bad_alloc(); }, token ), E_OUTOFMEMORY );
+    EXPECT_EQ( cache.Get( "exception", false, cancelled, fetch, token ), S_OK );
+}
+
+TEST( NexusAuthorizationCache, PublicForceRefreshWorksInBothEncodingsAndSignsEachRequest )
+{
+    Apartment apartment;
+    for ( bool wide : { false, true } )
+    {
+        SyntheticTransport transport;
+        transport.notAfter = FutureAuthorizationExpiry();
+        auto user = CreateUser( transport );
+        XUserImpl api( transport );
+        ASSERT_EQ( user->InitializeNetwork( XUserAddOptions::AddDefaultUserSilently ), S_OK );
+        user->initDone = 1; user->initResult = S_OK;
+        IXThreadingImpl *threads = nullptr;
+        ASSERT_EQ( QueryApiImpl( CLSID_XThreadingImpl, __uuidof( IXThreadingImpl ), reinterpret_cast<void **>( &threads ) ), S_OK );
+        XTaskQueueHandle queue = nullptr;
+        ASSERT_EQ( threads->XTaskQueueCreate( XTaskQueueDispatchMode::Manual, XTaskQueueDispatchMode::Manual, &queue ), S_OK );
+        std::string previous;
+        for ( unsigned i = 0; i < 4; ++i )
+        {
+            XAsyncBlock block{}; block.queue = queue;
+            const auto options = i == 2 ? XUserGetTokenAndSignatureOptions::ForceRefresh : XUserGetTokenAndSignatureOptions::None;
+            const char body = 'a' + i;
+            ASSERT_EQ( wide ? api.XUserGetTokenAndSignatureUtf16Async( user.get(), options, L"POST", L"https://service.example.invalid/api", 0, nullptr, 1, &body, &block )
+                            : api.XUserGetTokenAndSignatureAsync( user.get(), options, "POST", "https://service.example.invalid/api", 0, nullptr, 1, &body, &block ), S_OK );
+            ASSERT_TRUE( threads->XTaskQueueDispatch( queue, XTaskQueuePort::Work, 0 ) );
+            ASSERT_EQ( threads->XAsyncGetStatus( &block, TRUE ), S_OK );
+            SIZE_T size = 0;
+            ASSERT_EQ( threads->XAsyncGetResultSize( &block, &size ), S_OK );
+            std::vector<BYTE> bytes( size );
+            std::string signature;
+            if ( wide )
+            {
+                XUserGetTokenAndSignatureUtf16Data *result = nullptr;
+                ASSERT_EQ( api.XUserGetTokenAndSignatureUtf16Result( &block, size, bytes.data(), &result, nullptr ), S_OK );
+                signature.assign( result->signature, result->signature + wcslen( result->signature ) );
+            }
+            else
+            {
+                XUserGetTokenAndSignatureData *result = nullptr;
+                ASSERT_EQ( api.XUserGetTokenAndSignatureResult( &block, size, bytes.data(), &result, nullptr ), S_OK );
+                signature = result->signature;
+            }
+            EXPECT_EQ( signature.size(), 104u );
+            EXPECT_NE( previous, signature ); previous = signature;
+            EXPECT_EQ( transport.rawCalls.load(), i < 2 ? 1u : 2u );
+            while ( threads->XTaskQueueDispatch( queue, XTaskQueuePort::Completion, 0 ) ) {}
+            EXPECT_EQ( WaitForUserSignInWorkers( 2000 ), S_OK );
+        }
+        threads->XTaskQueueCloseHandle( queue ); threads->Release();
+    }
+}
+TEST( NexusAuthorizationCache, WaitingCallCancelsWithoutCancellingAnotherCaller )
+{
+    nexus::user::AuthorizationCache cache;
+    std::atomic<bool> ownerCancelled{false}, waiterCancelled{false};
+    std::promise<void> entered, release;
+    auto released = release.get_future().share();
+    auto owner = std::async( std::launch::async, [&] {
+        std::string value;
+        return cache.Get( "one", false, ownerCancelled, [&]( std::string &out, UINT64 &expires ) {
+            entered.set_value(); released.wait(); out = "token";
+            expires = nexus::user::AuthorizationClock{}().wall + 3600ull * 10000000; return S_OK;
+        }, value );
+    } );
+    entered.get_future().wait();
+    auto waiter = std::async( std::launch::async, [&] {
+        std::string value;
+        return cache.Get( "one", false, waiterCancelled, []( std::string &, UINT64 & ) { return E_FAIL; }, value );
+    } );
+    EXPECT_EQ( waiter.wait_for( std::chrono::milliseconds( 50 ) ), std::future_status::timeout );
+    waiterCancelled = true;
+    EXPECT_EQ( waiter.wait_for( std::chrono::seconds( 1 ) ), std::future_status::ready );
+    release.set_value();
+    EXPECT_EQ( waiter.get(), E_ABORT );
+    EXPECT_EQ( owner.get(), S_OK );
+}
+TEST( NexusAuthorizationCache, DelayedWaiterDoesNotReceiveAnExpiredToken )
+{
+    nexus::user::AuthorizationCache cache;
+    std::atomic<bool> cancelled{false};
+    const auto now = nexus::user::AuthorizationClock{}();
+    std::promise<void> entered, release;
+    auto released = release.get_future().share();
+    auto owner = std::async( std::launch::async, [&] {
+        std::string token;
+        return cache.Get( "one", false, cancelled, [&]( std::string &out, UINT64 &expires ) {
+            entered.set_value(); released.wait(); out = "token"; expires = now.wall + 120ull * 10000000; return S_OK;
+        }, token, [&] { return now; } );
+    } );
+    entered.get_future().wait();
+    auto waiter = std::async( std::launch::async, [&] {
+        std::string token;
+        auto delayed = now; delayed.wall += 120ull * 10000000;
+        auto hr = cache.Get( "one", false, cancelled, []( std::string &, UINT64 & ) { return E_FAIL; }, token, [&] { return delayed; } );
+        EXPECT_TRUE( token.empty() );
+        return hr;
+    } );
+    EXPECT_EQ( waiter.wait_for( std::chrono::milliseconds( 50 ) ), std::future_status::timeout );
+    release.set_value();
+    EXPECT_EQ( owner.get(), S_OK );
+    EXPECT_EQ( waiter.get(), HRESULT_FROM_WIN32( ERROR_RETRY ) );
 }

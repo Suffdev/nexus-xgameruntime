@@ -27,7 +27,11 @@ const offlineCases=['KeptOnlyWhenTheBackendReportsAFreshOfflineLease','SignsInOn
 const offlinePassed=offlineCases.every(name=>new RegExp('\\[\\s*OK\\s*\\]\\s+NexusOfflineIdentity\\.'+name+'(?:\\s|$)').test(output));
 const base64Cases=['StandardEncodingRespectsCapacity','UrlEncodingRespectsCapacity','WideEncodingRespectsCapacity'];
 const base64Passed=base64Cases.every(name=>new RegExp('\\[\\s*OK\\s*\\]\\s+Base64\\.'+name+'(?:\\s|$)').test(output));
+const authorizationCacheCases=["ReusesOnlyTheSameUserAndAudienceAndResetsWithCredentials", "ConcurrentRequestsShareOneRealTransportExchange", "MissingInvalidOrExpiredServerLifetimeDoesNotBecomePersistent", "ServerExpirySkewClockRollbackAndMonotonicCapAreEnforced", "RefreshDoesNotAcceptOlderInflightResponseOrBlockOtherAudiences", "BoundedEntriesEvictAndClearInvalidatesInflightWork", "PublicForceRefreshWorksInBothEncodingsAndSignsEachRequest", "WaitingCallCancelsWithoutCancellingAnotherCaller", "DelayedWaiterDoesNotReceiveAnExpiredToken"];
+const authorizationCachePassed=authorizationCacheCases.every(name=>new RegExp('\\[\\s*OK\\s*\\]\\s+NexusAuthorizationCache\\.'+name+'(?:\\s|$)').test(output));
 const proof={scope:'C++ authentication implementation, synthetic transport only',engine,engineHash:engine==='wine'?null:hash(engine),exeHash:before,unchanged:hash(exe)===before,status:result.status,signal:result.signal,error:result.error?.message,checks:match?Number(match[1]):0,realAccounts:false,realCloud:false,fullRuntime:false,passed:result.status===0&&!result.error&&!!match&&Number(match[1])>=27&&!/\[\s*(FAILED|SKIPPED)\s*\]/.test(output)};
+proof.authorizationCacheCases=authorizationCacheCases.length;proof.authorizationCachePassed=authorizationCachePassed;
+if(!authorizationCachePassed)proof.passed=false;
 proof.presenceCases=presenceCases.length;proof.presencePassed=presencePassed;
 if(!presencePassed)proof.passed=false;
 proof.offlineCases=offlineCases.length;proof.offlinePassed=offlinePassed;
