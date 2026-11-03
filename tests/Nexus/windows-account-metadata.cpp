@@ -155,6 +155,9 @@ public:
         return E_ACCESSDENIED;
     }
 };
+// This standalone ticket/registry fixture does not exercise the optional
+// diagnostic file sink owned by XUser.cpp. Supply its typed local boundary.
+static void auth_metadata( const char *, XUserHandle, HRESULT, DWORD, BOOL, BOOL ) {}
 #include "../../src/System/User/Tickets.h"
 static HRESULT get_rps_tickets( BOOL ui, char **user, char **device, char xbox[17], char store[17] )
 {
