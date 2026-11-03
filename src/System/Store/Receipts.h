@@ -255,7 +255,17 @@ done:
     return hr;
 }
 
-static HRESULT receipt_load( const char *jwt, const char *nonce, IJsonObject **claim, UINT64 *expiry )
+/* One worker-owned slot per entitlement operation, never a claim/permission cache.
+ * Only a completely verified receipt may admit DER. Every hit verifies again. */
+struct receipt_certificate_cache
+{
+    char id[41];
+    BYTE *der;
+    DWORD size;
+};
+
+static HRESULT receipt_load( const char *jwt, const char *nonce, IJsonObject **claim, UINT64 *expiry,
+                             receipt_certificate_cache *cache = nullptr )
 {
     const char *dot = strchr( jwt, '.' ), *second;
     BYTE *payload = NULL, *decoded = NULL, *document = NULL, *der = NULL;
@@ -277,6 +287,11 @@ static HRESULT receipt_load( const char *jwt, const char *nonce, IJsonObject **c
     if ( i > 64 || i == decoded_size || FAILED( receipt_json( decoded + i, decoded_size - i, &data ) ) ) goto done;
     id = receipt_string( data, L"certificateId", 40 );
     if ( !receipt_cert_id( id ) ) goto done;
+    if ( cache && cache->der && !strcmp( cache->id, id ) )
+    {
+        hr = receipt_verify( jwt, nonce, id, cache->der, cache->size, claim, expiry );
+        goto done;
+    }
     /* Explicit narrow arguments, independent of the CRT's wide %S convention. */
     if ( swprintf( path, ARRAY_SIZE( path ), L"/v8.0/licenseToken/fullCertificate/%hs", id ) < 0 )
     {
@@ -291,6 +306,13 @@ static HRESULT receipt_load( const char *jwt, const char *nonce, IJsonObject **c
          FAILED( receipt_decode( certificate, strlen( certificate ), FALSE, &der, &der_size ) ) )
         goto done;
     hr = receipt_verify( jwt, nonce, id, der, der_size, claim, expiry );
+    if ( SUCCEEDED( hr ) && cache )
+    {
+        free( cache->der );
+        cache->der = der; cache->size = der_size;
+        memcpy( cache->id, id, sizeof( cache->id ) );
+        der = nullptr;
+    }
 done:
     if ( body ) ( body )->Release();
     if ( data ) ( data )->Release();
@@ -589,6 +611,7 @@ static HRESULT entitled_fetch( const char *request, LONG *canceled, struct entit
     xmlNodePtr root, node, response_root;
     char *ids[ENTITLED_MAX_PRODUCTS] = { 0 }, *market = NULL, *language = NULL;
     struct receipt_license licenses[ENTITLED_MAX_PRODUCTS];
+    receipt_certificate_cache certificate_cache = {};
     UINT32 count = 0, license_count = 0, i, j, batch;
     UINT64 kinds, expiry = UINT64_MAX, proof_until = 0;
     ULONGLONG deadline = GetTickCount64() + 120000;
@@ -646,7 +669,7 @@ static HRESULT entitled_fetch( const char *request, LONG *canceled, struct entit
         if ( SUCCEEDED( hr ) ) hr = xodus_store_license_xml( body, strlen( body ), &jwt, canceled, deadline );
         free( body );
         if ( SUCCEEDED( hr ) && InterlockedCompareExchange( canceled, 0, 0 ) ) hr = E_ABORT;
-        if ( SUCCEEDED( hr ) ) hr = receipt_load( jwt, nonce, &claim, &token_expiry );
+        if ( SUCCEEDED( hr ) ) hr = receipt_load( jwt, nonce, &claim, &token_expiry, &certificate_cache );
         xodus_store_license_note( "store-entitled-receipt", hr );
         if ( jwt )
         {
@@ -697,6 +720,7 @@ static HRESULT entitled_fetch( const char *request, LONG *canceled, struct entit
 done:
     for ( i = 0; i < count; i++ )
         free( ids[i] );
+    free( certificate_cache.der );
     free( market );
     free( language );
     if ( doc ) xmlFreeDoc( doc );

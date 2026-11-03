@@ -1,11 +1,12 @@
 /* Account-free tests of the exact runtime helpers and actual XAsync provider.
  * Synthetic RSA keys stay in this process. No production trust override exists.
- * The license bridge below always fails and cannot contact an account service. */
+ * The license bridge below always fails except for locally signed fixture receipts; no mode contacts an account service. */
 #define INITGUID
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <string>
+#include <vector>
 #include <type_traits>
 #include <limits>
 #include <stddef.h>
@@ -13,6 +14,8 @@
 #include <libxml/tree.h>
 #include "../../src/private.h"
 #include <xstore.h>
+#include <wincrypt.h>
+#include <bcrypt.h>
 #include <xpackage.h>
 
 const char *storeId = "B00000000001";
@@ -28,6 +31,15 @@ UINT64 xuser_get_xuid( XUserHandle user )
 {
     return 1;
 }
+static bool certificate_mode, certificate_stage_only;
+static HCRYPTPROV certificate_provider;
+static char certificate_id[41];
+static std::string certificate_document, certificate_nonce;
+static std::vector<std::string> certificate_nonces;
+static unsigned certificate_requests, certificate_verifications, certificate_signatures, certificate_batches;
+static bool certificate_expired, certificate_stop_after_reply, certificate_advance_clock;
+static LONG *certificate_cancel_target;
+static char *token( HCRYPTPROV provider, const char *cert_id, int variant, const char *nonce = "synthetic-nonce" );
 static bool metadata_mode, metadata_oversize, metadata_match_product = true, metadata_advance_clock;
 static ULONGLONG metadata_ticks;
 static LONG *metadata_cancel_after_row;
@@ -36,6 +48,7 @@ static SIZE_T public_cursor;
 static DWORD metadata_status = 200;
 void xodus_store_license_note( const char *phase, HRESULT hr )
 {
+    if ( certificate_mode && certificate_advance_clock && !strcmp( phase, "store-entitled-receipt" ) ) metadata_ticks = 200000;
     if ( metadata_mode && !strcmp( phase, "store-entitled-metadata" ) )
     {
         if ( metadata_cancel_after_row ) InterlockedExchange( metadata_cancel_after_row, 1 );
@@ -48,12 +61,20 @@ static ULONGLONG FixturePublicTick()
 }
 HRESULT xodus_store_license_body( const char **ids, SIZE_T count, const char *nonce, char **out )
 {
+    if ( certificate_mode ) { certificate_nonce = nonce; certificate_nonces.emplace_back( nonce ); }
     *out = strdup( "synthetic" );
     return *out ? S_OK : E_OUTOFMEMORY;
 }
 HRESULT xodus_store_license_xml( const char *request, SIZE_T size, char **out )
 {
     *out = NULL;
+    if ( certificate_mode )
+    {
+        ++certificate_batches;
+        *out = token( certificate_provider, certificate_id, 0, certificate_nonce.c_str() );
+        if ( certificate_stop_after_reply && certificate_batches == 2 && certificate_cancel_target ) InterlockedExchange( certificate_cancel_target, 1 );
+        return *out ? S_OK : E_OUTOFMEMORY;
+    }
     InterlockedIncrement( &bridge_active );
     SetEvent( bridge_started );
     WaitForSingleObject( bridge_gate, bridge_timeout );
@@ -80,6 +101,10 @@ static HINTERNET WINAPI FixturePublicOpenRequest( HINTERNET connection, LPCWSTR 
     public_path[0] = 0;
     if ( path && wcslen( path ) < ARRAY_SIZE( public_path ) ) wcscpy( public_path, path );
     public_cursor = 0; public_body = metadata_body;
+    if ( certificate_mode && path && wcsstr( path, L"/v8.0/licenseToken/fullCertificate/" ) )
+    {
+        ++certificate_requests; public_body = certificate_document;
+    }
     if ( metadata_mode && metadata_match_product && path && wcsstr( path, L"bigIds=B00000000002&" ) )
     {
         const auto pos = public_body.find( "B00000000001" );
@@ -111,6 +136,19 @@ static BOOL WINAPI FixturePublicRead( HINTERNET, void *buffer, DWORD size, DWORD
     *read = std::min<SIZE_T>( size, public_body.size() - public_cursor );
     memcpy( buffer, public_body.data() + public_cursor, *read ); public_cursor += *read; return metadata_mode;
 }
+static LONG WINAPI FixtureCertificateTime( LPFILETIME when, PCERT_INFO info )
+{
+    if ( certificate_mode ) { ++certificate_verifications; if ( certificate_expired ) return 1; }
+    return CertVerifyTimeValidity( when, info );
+}
+static NTSTATUS WINAPI FixtureCertificateSignature( BCRYPT_KEY_HANDLE key, void *padding, PUCHAR hash, ULONG hash_size,
+                                                     PUCHAR signature, ULONG signature_size, ULONG flags )
+{
+    if ( certificate_mode ) ++certificate_signatures;
+    return BCryptVerifySignature( key, padding, hash, hash_size, signature, signature_size, flags );
+}
+#define BCryptVerifySignature FixtureCertificateSignature
+#define CertVerifyTimeValidity FixtureCertificateTime
 #define GetTickCount64 FixturePublicTick
 #define WinHttpReceiveResponse FixturePublicReceive
 #define WinHttpQueryHeaders FixturePublicHeaders
@@ -127,6 +165,8 @@ static BOOL WINAPI FixturePublicRead( HINTERNET, void *buffer, DWORD size, DWORD
 #undef WinHttpQueryDataAvailable
 #undef WinHttpReadData
 #undef GetTickCount64
+#undef CertVerifyTimeValidity
+#undef BCryptVerifySignature
 /* Only this account-free executable has a synthetic installed-package index. */
 HRESULT xpackage_query_content_store( const char *identifier, SIZE_T size, char *store )
 {
@@ -257,7 +297,7 @@ static char *encode( const BYTE *bytes, DWORD size, BOOL url )
     return text;
 }
 
-static char *token( HCRYPTPROV provider, const char *cert_id, int variant )
+static char *token( HCRYPTPROV provider, const char *cert_id, int variant, const char *nonce )
 {
     const char *header = variant == 1 ? "{\"alg\":\"HS256\"}" : "{\"alg\":\"RS256\"}";
     char claim[2048], payload[4096], *h = NULL, *p = NULL, *c = NULL, *s = NULL, *input = NULL, *jwt = NULL;
@@ -266,10 +306,10 @@ static char *token( HCRYPTPROV provider, const char *cert_id, int variant )
     HCRYPTHASH hash = 0;
     UINT64 now = time( NULL );
     snprintf( claim, sizeof( claim ),
-              "{\"tokenVersion\":1,\"certificateId\":\"%s\",\"customDeveloperString\":\"synthetic-nonce\","
+              "{\"tokenVersion\":1,\"certificateId\":\"%s\",\"customDeveloperString\":\"%s\","
               "\"licensableProducts\":[{\"productId\":\"B00000000001\",\"skuId\":\"0010\",\"endDate\":\"9999-12-31T23:"
               "59:59Z\"}]}",
-              cert_id );
+              cert_id, nonce );
     std::string rows = claim;
     if ( variant == 5 )
         rows.insert( rows.size() - 2,
@@ -310,6 +350,114 @@ done:
     free( s );
     free( input );
     return jwt;
+}
+
+static std::string certificate_request( unsigned count )
+{
+    std::string request = "<Request><ParentProductId>B00000000001</ParentProductId><Market>US</Market><Language>en-US</Language><ProductKinds>31</ProductKinds>";
+    for ( unsigned i = 2; i <= count; ++i ) { char row[64]; snprintf( row, sizeof( row ), "<ProductId>B%011u</ProductId>", i ); request += row; }
+    return request + "</Request>";
+}
+static std::string certificate_json( PCCERT_CONTEXT cert )
+{
+    char *base64 = encode( cert->pbCertEncoded, cert->cbCertEncoded, FALSE );
+    CHECK( "certificate-operation-encoded", base64 != nullptr );
+    if ( !base64 ) return {};
+    std::string result = std::string( "{\"certificate\":\"" ) + base64 + "\"}"; free( base64 ); return result;
+}
+static HRESULT certificate_operation( unsigned count, LONG *canceled = nullptr )
+{
+    certificate_requests = certificate_verifications = certificate_signatures = certificate_batches = 0; certificate_nonces.clear(); metadata_ticks = 0;
+    LONG local = 0; entitled_snapshot *snapshot = nullptr;
+    const auto hr = entitled_fetch( certificate_request( count ).c_str(), canceled ? canceled : &local, &snapshot );
+    if ( SUCCEEDED( hr ) ) CHECK( "certificate-operation-success", snapshot && snapshot->count == 1 );
+    else CHECK( "certificate-operation-no-failed-output", snapshot == nullptr );
+    if ( snapshot ) entitled_snapshot_release( snapshot ); return hr;
+}
+static HRESULT certificate_cached_load( receipt_certificate_cache *cache, const char *issued = "fresh-nonce",
+                                         const char *expected = "fresh-nonce", int variant = 0, bool tamper = false )
+{
+    char *jwt = token( certificate_provider, certificate_id, variant, issued );
+    CHECK( "certificate-cache-signed-input", jwt != nullptr );
+    if ( !jwt ) return E_OUTOFMEMORY;
+    if ( tamper ) { char *signature = strchr( strchr( jwt, '.' ) + 1, '.' ) + 1; signature[0] = signature[0] == 'A' ? 'B' : 'A'; }
+    IJsonObject *claim = nullptr; UINT64 expiry = 0;
+    const auto hr = receipt_load( jwt, expected, &claim, &expiry, cache );
+    CHECK( "certificate-cache-claim-follows-verification", SUCCEEDED( hr ) ? claim != nullptr : claim == nullptr );
+    if ( claim ) claim->Release(); free( jwt ); return hr;
+}
+static void test_certificate_operation( HCRYPTPROV provider, const char *id, PCCERT_CONTEXT cert )
+{
+    certificate_provider = provider; strcpy( certificate_id, id );
+    const auto document = certificate_json( cert ); if ( document.empty() ) return;
+    certificate_document = document;
+    metadata_body = R"({"Products":[{"ProductId":"B00000000001","ProductType":"Durable","LocalizedProperties":[{"ProductTitle":"Synthetic","Language":"en-US"}],"DisplaySkuAvailabilities":[{"Sku":{"SkuId":"0010","Properties":{"IsTrial":false}}}]}]})";
+    metadata_mode = certificate_mode = true;
+    CHECK( "certificate-operation-two-batch-result", certificate_operation( 65 ) == S_OK );
+    CHECK( "certificate-operation-two-fresh-receipts", certificate_batches == 2 && certificate_nonces.size() == 2 && certificate_nonces[0] != certificate_nonces[1] );
+    CHECK( "certificate-operation-two-validations", certificate_verifications == 2 && certificate_signatures == 2 );
+    CHECK( "certificate-operation-one-public-get", certificate_requests == 1 );
+    printf( "CERTIFICATE_MEASURE batches=%u certificate_gets=%u verified=%u signatures=%u\n", certificate_batches, certificate_requests, certificate_verifications, certificate_signatures );
+    CHECK( "certificate-operation-separated-no-retention", certificate_operation( 65 ) == S_OK && certificate_requests == 1 && certificate_verifications == 2 );
+    CHECK( "certificate-operation-five-batches-one-get", certificate_operation( 257 ) == S_OK && certificate_batches == 5 && certificate_requests == 1 && certificate_verifications == 5 && certificate_signatures == 5 );
+    LONG canceled = 1;
+    CHECK( "certificate-operation-precancel-no-work", certificate_operation( 65, &canceled ) == E_ABORT && !certificate_batches && !certificate_requests );
+    canceled = 0; certificate_stop_after_reply = true; certificate_cancel_target = &canceled;
+    CHECK( "certificate-operation-observed-cancel-before-cache-hit", certificate_operation( 65, &canceled ) == E_ABORT && certificate_batches == 2 && certificate_requests == 1 && certificate_verifications == 1 );
+    certificate_stop_after_reply = false; certificate_cancel_target = nullptr;
+    certificate_advance_clock = true;
+    CHECK( "certificate-operation-deadline-before-next-hit", certificate_operation( 65 ) == HRESULT_FROM_WIN32( ERROR_TIMEOUT ) && certificate_batches == 1 && certificate_requests == 1 && certificate_verifications == 1 );
+    certificate_advance_clock = false; metadata_ticks = 0;
+
+    receipt_certificate_cache cache{}; certificate_requests = certificate_verifications = certificate_signatures = 0;
+    CHECK( "certificate-cache-first-success", certificate_cached_load( &cache ) == S_OK && cache.der && certificate_requests == 1 );
+    CHECK( "certificate-cache-fresh-nonce-reverified", certificate_cached_load( &cache, "other-nonce", "other-nonce" ) == S_OK && certificate_requests == 1 && certificate_verifications == 2 && certificate_signatures == 2 );
+    CHECK( "certificate-cache-tampered-signature-denied", FAILED( certificate_cached_load( &cache, "fresh-nonce", "fresh-nonce", 0, true ) ) && certificate_requests == 1 );
+    CHECK( "certificate-cache-wrong-nonce-denied", FAILED( certificate_cached_load( &cache, "issued", "different" ) ) && certificate_requests == 1 );
+    CHECK( "certificate-cache-expired-jwt-denied", FAILED( certificate_cached_load( &cache, "fresh-nonce", "fresh-nonce", 3 ) ) && certificate_requests == 1 );
+    CHECK( "certificate-cache-future-jwt-denied", FAILED( certificate_cached_load( &cache, "fresh-nonce", "fresh-nonce", 4 ) ) && certificate_requests == 1 );
+    CHECK( "certificate-cache-wrong-algorithm-denied", FAILED( certificate_cached_load( &cache, "fresh-nonce", "fresh-nonce", 1 ) ) && certificate_requests == 1 );
+    certificate_expired = true;
+    CHECK( "certificate-cache-expired-certificate-denied", FAILED( certificate_cached_load( &cache ) ) && certificate_requests == 1 );
+    certificate_expired = false; free( cache.der );
+    for ( unsigned mode = 0; mode < 4; ++mode )
+    {
+        receipt_certificate_cache fresh{}; certificate_requests = 0;
+        if ( mode == 1 ) certificate_document = "{}";
+        if ( mode == 2 ) certificate_document = std::string( 64001, 'x' );
+        if ( mode == 3 ) metadata_status = 400;
+        CHECK( "certificate-cache-failure-not-admitted", FAILED( certificate_cached_load( &fresh, "fresh-nonce", "fresh-nonce", 0, mode == 0 ) ) && !fresh.der && certificate_requests == 1 );
+        certificate_document = document; metadata_status = 200;
+        CHECK( "certificate-cache-failure-not-negative-cached", certificate_cached_load( &fresh ) == S_OK && fresh.der && certificate_requests == 2 );
+        free( fresh.der );
+    }
+    certificate_requests = 0; certificate_id[0] = 'G'; receipt_certificate_cache invalid{};
+    CHECK( "certificate-cache-malformed-id-no-request", FAILED( certificate_cached_load( &invalid ) ) && !invalid.der && !certificate_requests );
+    strcpy( certificate_id, id );
+
+    CERT_NAME_BLOB name{}; CRYPT_ALGORITHM_IDENTIFIER algorithm{ szOID_RSA_SHA256RSA, {0} };
+    SYSTEMTIME start{2020,1,0,1}, end{2099,1,0,1}; PCCERT_CONTEXT rotated = nullptr;
+    CHECK( "certificate-rotation-name-size", CertStrToNameW( X509_ASN_ENCODING, L"CN=Nexus synthetic rotated certificate", CERT_X500_NAME_STR, nullptr, nullptr, &name.cbData, nullptr ) );
+    name.pbData = static_cast<BYTE *>( malloc( name.cbData ) );
+    if ( name.pbData && CertStrToNameW( X509_ASN_ENCODING, L"CN=Nexus synthetic rotated certificate", CERT_X500_NAME_STR, nullptr, name.pbData, &name.cbData, nullptr ) )
+        rotated = CertCreateSelfSignCertificate( provider, &name, CERT_CREATE_SELFSIGN_NO_KEY_INFO, nullptr, &algorithm, &start, &end, nullptr );
+    CHECK( "certificate-rotation-context", rotated != nullptr );
+    if ( rotated )
+    {
+        BYTE digest[20]; DWORD size = sizeof( digest ); char rotated_id[41]{};
+        CHECK( "certificate-rotation-thumbprint", CryptHashCertificate( 0, CALG_SHA1, 0, rotated->pbCertEncoded, rotated->cbCertEncoded, digest, &size ) );
+        for ( unsigned i = 0; i < 20; ++i ) sprintf( rotated_id + i * 2, "%02X", digest[i] );
+        CHECK( "certificate-rotation-distinct-id", strcmp( rotated_id, id ) != 0 );
+        receipt_certificate_cache rotation{}; certificate_requests = 0;
+        CHECK( "certificate-cache-rotation-a", certificate_cached_load( &rotation ) == S_OK && certificate_requests == 1 );
+        strcpy( certificate_id, rotated_id ); certificate_document = certificate_json( rotated );
+        CHECK( "certificate-cache-rotation-b-refetch", certificate_cached_load( &rotation ) == S_OK && certificate_requests == 2 && !strcmp( rotation.id, rotated_id ) );
+        strcpy( certificate_id, id ); certificate_document = document;
+        CHECK( "certificate-cache-one-slot-a-b-a", certificate_cached_load( &rotation ) == S_OK && certificate_requests == 3 && !strcmp( rotation.id, id ) );
+        free( rotation.der ); CertFreeCertificateContext( rotated );
+    }
+    free( name.pbData );
+    metadata_mode = certificate_mode = false; certificate_provider = 0; certificate_document.clear(); certificate_nonce.clear(); certificate_nonces.clear();
 }
 
 static void test_metadata_reuse( IJsonObject *claim );
@@ -358,6 +506,8 @@ static void test_receipts( void )
            CryptHashCertificate( 0, CALG_SHA1, 0, cert->pbCertEncoded, cert->cbCertEncoded, digest, &size ) );
     for ( i = 0; i < 20; i++ )
         sprintf( cert_id + i * 2, "%02X", digest[i] );
+    test_certificate_operation( provider, cert_id, cert );
+    if ( certificate_stage_only ) goto done;
     for ( i = 0; i < 5; i++ )
     {
         jwt = token( provider, cert_id, i );
@@ -2162,7 +2312,8 @@ int main( int argc, char **argv )
         printf( "CHECKS %u FAILURES %u\n", checks, failures );
         return failures ? 1 : 0;
     }
-    if ( argc == 2 && !strcmp( argv[1], "--metadata-stage" ) )
+    if ( argc == 2 && !strcmp( argv[1], "--certificate-stage" ) ) certificate_stage_only = true;
+    if ( argc == 2 && ( !strcmp( argv[1], "--metadata-stage" ) || certificate_stage_only ) )
     {
         const auto hr = RoInitialize( RO_INIT_MULTITHREADED );
         CHECK( "metadata-stage-winrt", SUCCEEDED( hr ) );

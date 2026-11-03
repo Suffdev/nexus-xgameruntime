@@ -38,11 +38,12 @@ try{
  const key='HKLM\\Software\\Microsoft\\WindowsRuntime\\ActivatableClassId\\Windows.Services.Store.StoreContext';
  run('register-context',engine,['reg.exe','add',key,'/v','DllPath','/t','REG_SZ','/d','C:\\windows\\system32\\xgameruntime.dll','/f','/reg:'+view]);
  run('register-threading',engine,['reg.exe','add',key,'/v','ThreadingModel','/t','REG_DWORD','/d','0','/f','/reg:'+view]);
- for(const [name,minimum]of [['store-entitlements',1156],['package-content',423],['store-context',61],['store-context-raw',11],['store-context-cancellation',67],['receipt-ipc',122]]){
+ for(const [name,minimum]of [['store-entitlements',1237],['package-content',423],['store-context',61],['store-context-raw',11],['store-context-cancellation',67],['receipt-ipc',122]]){
   const output=run(name,engine,[path.join(bin,'nexus_'+name+'.exe')]);
   const summary=output.match(/(?:^|\n)CHECKS (\d+) FAILURES (\d+)/);
   if(!summary||Number(summary[1])<minimum||Number(summary[2])||/(?:^|\n)FAIL /.test(output))throw Error(name+' lost required coverage');
   if(name==='store-entitlements'&&!/(?:^|\n)METADATA_MEASURE same_product_skus=2 get_requests=1\r?(?:\n|$)/.test(output))throw Error('Missing bounded product metadata reuse regression');
+  if(name==='store-entitlements'&&!/(?:^|\n)CERTIFICATE_MEASURE batches=2 certificate_gets=1 verified=2 signatures=2\r?(?:\n|$)/.test(output))throw Error('Missing operation-local certificate reuse regression');
   proof.results.push({name,checks:Number(summary[1]),failures:0});
  }
  if(JSON.stringify(snapshot())!==JSON.stringify(before)||hash(staged)!==before['xgameruntime.dll'])throw Error('Candidate changed during validation');
