@@ -299,6 +299,21 @@ target_link_options(nexus_taskqueue-composite-waiters PRIVATE -static -static-li
 set_target_properties(nexus_taskqueue-composite-waiters PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
+add_executable(nexus_taskqueue-unwind-wait
+    Nexus/taskqueue-unwind-wait.cpp
+    "${PROJECT_SOURCE_DIR}/src/System/Threading/XTaskQueue.cpp")
+add_dependencies(nexus_taskqueue-unwind-wait xgameruntime-idl)
+target_include_directories(nexus_taskqueue-unwind-wait PRIVATE
+    "${PROJECT_SOURCE_DIR}" "${IDL_BINARY_DIR}" "${PROJECT_SOURCE_DIR}/include")
+target_compile_definitions(nexus_taskqueue-unwind-wait PRIVATE LIBXML_STATIC)
+target_compile_features(nexus_taskqueue-unwind-wait PRIVATE cxx_std_23)
+target_link_libraries(nexus_taskqueue-unwind-wait PRIVATE
+    xgameruntime-impl nexus-xml2 xgameruntime-common shell32 bcrypt crypt32 advapi32
+    runtimeobject ole32 winhttp wininet ws2_32 iphlpapi)
+target_link_options(nexus_taskqueue-unwind-wait PRIVATE -static -static-libgcc -static-libstdc++)
+set_target_properties(nexus_taskqueue-unwind-wait PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
 # Explicit native Wine/XGR contract probe; not part of the portable shim gate.
 add_executable(nexus_http-native-cancellation Nexus/http-native-cancellation.cpp)
 add_dependencies(nexus_http-native-cancellation xgameruntime-idl)

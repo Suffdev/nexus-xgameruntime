@@ -629,8 +629,8 @@ void TaskQueuePortImpl::WaitForUnwind()
     while(m_processingCallback.load() != 0)
     {
         std::chrono::milliseconds ms{10};
-        auto when = std::chrono::steady_clock::time_point(ms);
-        m_processingCallbackCv.wait_until(lock, when);
+        // Notifications race the atomic count check, so retain a bounded recheck.
+        m_processingCallbackCv.wait_for(lock, ms);
     }
 }
 
