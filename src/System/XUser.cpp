@@ -1684,6 +1684,7 @@ static HRESULT WINAPI gamer_picture_phase( XAsyncOp op, const XAsyncProviderData
         break;
 
     case XAsyncOp::DoWork:
+        if ( InterlockedCompareExchange( &context->canceled, 0, 0 ) ) { hr = E_ABORT; goto cleanup; }
         switch ( context->pictureSize )
         {
         case XUserGamerPictureSize::Small:
@@ -1704,6 +1705,7 @@ static HRESULT WINAPI gamer_picture_phase( XAsyncOp op, const XAsyncProviderData
         }
 
         if ( FAILED( hr = ( context->user )->GetAuthorization( L"http://xboxlive.com", &auth ) ) ) goto cleanup;
+        if ( InterlockedCompareExchange( &context->canceled, 0, 0 ) ) { hr = E_ABORT; goto cleanup; }
         /* This internal call needs the same proof-of-possession signature
          * as title requests, and the profile service's v2 contract. Never
          * forward the Xbox credential or signature to the image CDN. */
@@ -1751,9 +1753,11 @@ static HRESULT WINAPI gamer_picture_phase( XAsyncOp op, const XAsyncProviderData
             wcscat( headers, signatureW );
             wcscat( headers, L"\r\n" );
         }
+        if ( InterlockedCompareExchange( &context->canceled, 0, 0 ) ) { hr = E_ABORT; goto cleanup; }
         if ( FAILED( hr = context->user->transport.Http( L"GET", profileUrlW, NULL, headers, ACCEPT_JSON, &buffer,
                                                          &size ) ) )
             goto cleanup;
+        if ( InterlockedCompareExchange( &context->canceled, 0, 0 ) ) { hr = E_ABORT; goto cleanup; }
         if ( FAILED( hr = parse_json( ( char * )buffer, size, &object ) ) ) goto cleanup;
         if ( FAILED( hr = get_json_array( object, L"profileUsers", &profiles ) ) ) goto cleanup;
         if ( FAILED( hr = ( profiles )->GetObjectAt( 0, &profile ) ) ) goto cleanup;
@@ -1771,9 +1775,11 @@ static HRESULT WINAPI gamer_picture_phase( XAsyncOp op, const XAsyncProviderData
         wcscpy( url, valueBuffer );
         wcscat( url, suffix );
         if ( !wcschr( valueBuffer, '?' ) ) url[wcslen( valueBuffer )] = '?';
+        if ( InterlockedCompareExchange( &context->canceled, 0, 0 ) ) { hr = E_ABORT; goto cleanup; }
         hr = context->user->transport.Http( L"GET", url, NULL, NULL, accept, &context->buffer, &context->bufferSize );
 
     cleanup:
+        if ( InterlockedCompareExchange( &context->canceled, 0, 0 ) ) hr = E_ABORT;
         ( xthreading )->XAsyncComplete( data->async, hr, SUCCEEDED( hr ) ? context->bufferSize : 0 );
         if ( profiles ) ( profiles )->Release();
         if ( settings ) ( settings )->Release();

@@ -552,3 +552,9 @@ test('native authentication gate requires silent overlap ownership and readiness
         assert.ok(read('scripts/test-authentication.mjs').includes("'"+name+"'"));
     assert.ok(read('scripts/test-authentication.mjs').includes('if(!silentOverlapPassed)proof.passed=false;'));
 });
+
+test('native authentication gate rejects a canceled picture that starts downstream work',()=>{
+    for(const name of ['HeldProfileReplyCannotStartImageAfterCancellation','HeldAuthorizationAndImageCancellationRemainRequestLocal'])
+        assert.ok(read('scripts/test-authentication.mjs').includes("'"+name+"'"));
+    assert.ok(read('scripts/test-authentication.mjs').includes('if(!pictureCancellationPassed)proof.passed=false;'));
+});

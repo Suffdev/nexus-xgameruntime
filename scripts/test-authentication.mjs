@@ -35,6 +35,8 @@ const criticalPathCases=['SuccessfulColdHandshakeAndWarmAuthorizationRemainSepar
 const criticalPathPassed=criticalPathCases.every(name=>new RegExp('\\[\\s*OK\\s*\\]\\s+NexusAuthCriticalPath\\.'+name+'(?:\\s|$)').test(output));
 const silentOverlapCases=['SilentStartsIndependentPhasesButPublishesOnlyAfterBoth', 'AllowingUiKeepsOrderedDiscoveryBeforeTickets', 'DefaultFailureCancelsChildAndRetainsItsOwnError', 'ParentCancellationWhileWaitingTicketsDrainsChild', 'LateLegacyReplyIsJoinedAndNeverPublishedAfterDefaultFailure', 'TicketFailureWaitsForDefaultValidationWithoutPublishingIdentity', 'ThreadStartupFailurePreservesSequentialHandshakeAndReadiness', 'CurrentMetadataStillGatesCompletionThenGamertagNeedsNoRequest', 'CancellationBetweenAdmissionAndChildRunStartsNoBackendRequest'];
 const silentOverlapPassed=silentOverlapCases.every(name=>new RegExp('\\[\\s*OK\\s*\\]\\s+NexusSilentAuthOverlap\\.'+name+'(?:\\s|$)').test(output));
+const pictureCancellationCases=['HeldProfileReplyCannotStartImageAfterCancellation','HeldAuthorizationAndImageCancellationRemainRequestLocal'];
+const pictureCancellationPassed=pictureCancellationCases.every(name=>new RegExp('\\[\\s*OK\\s*\\]\\s+NexusPictureCancellation\\.'+name+'(?:\\s|$)').test(output));
 const proof={scope:'C++ authentication implementation, synthetic transport only',engine,engineHash:engine==='wine'?null:hash(engine),exeHash:before,unchanged:hash(exe)===before,status:result.status,signal:result.signal,error:result.error?.message,checks:match?Number(match[1]):0,realAccounts:false,realCloud:false,fullRuntime:false,passed:result.status===0&&!result.error&&!!match&&Number(match[1])>=27&&!/\[\s*(FAILED|SKIPPED)\s*\]/.test(output)};
 proof.cancellationCases=cancellationCases.length;proof.cancellationPassed=cancellationPassed;
 if(!cancellationPassed)proof.passed=false;
@@ -42,6 +44,8 @@ proof.authorizationCacheCases=authorizationCacheCases.length;proof.authorization
 if(!authorizationCachePassed)proof.passed=false;
 proof.presenceCases=presenceCases.length;proof.presencePassed=presencePassed;
 if(!presencePassed)proof.passed=false;
+proof.pictureCancellationPassed=pictureCancellationPassed;
+if(!pictureCancellationPassed)proof.passed=false;
 proof.silentOverlapCases=silentOverlapCases.length;proof.silentOverlapPassed=silentOverlapPassed;
 if(!silentOverlapPassed)proof.passed=false;
 proof.criticalPathCases=criticalPathCases.length;proof.criticalPathPassed=criticalPathPassed;

@@ -1963,3 +1963,132 @@ TEST( NexusSilentAuthOverlap, CancellationBetweenAdmissionAndChildRunStartsNoBac
     EXPECT_EQ( transport.backendCalls, 0u ); EXPECT_EQ( transport.httpCalls, 0u );
     EXPECT_EQ( user->xuid, 0u ); EXPECT_EQ( user->ref, 1 );
 }
+
+namespace
+{
+class PictureTransport final : public UserTransport
+{
+public:
+    SyntheticTransport authentication;
+    std::atomic<unsigned> profileCalls{0}, imageCalls{0};
+    bool blockImage = false;
+    HANDLE imageEntered = CreateEventW( nullptr, TRUE, FALSE, nullptr );
+    HANDLE imageContinue = CreateEventW( nullptr, TRUE, FALSE, nullptr );
+    HANDLE profileEntered = CreateEventW( nullptr, TRUE, FALSE, nullptr );
+    HANDLE profileContinue = CreateEventW( nullptr, TRUE, FALSE, nullptr );
+    PictureTransport()
+    {
+        authentication.notAfter = FutureAuthorizationExpiry();
+        authentication.currentEndpoints = R"({"SignaturePolicies":[{"Version":1,"MaxBodyBytes":1024}],"EndPoints":[{"Protocol":"https","Host":"profile.xboxlive.com","RelyingParty":"http://xboxlive.com","TokenType":"JWT","SignaturePolicyIndex":0}]})";
+    }
+    ~PictureTransport() { CloseHandle( profileEntered ); CloseHandle( profileContinue ); CloseHandle( imageEntered ); CloseHandle( imageContinue ); }
+    HRESULT Backend( UINT16 type, const char *body, UINT16 size, char **response, UINT16 *length ) override
+    { return authentication.Backend( type, body, size, response, length ); }
+    HRESULT HttpRaw( const WCHAR *method, const WCHAR *url, const WCHAR *headers, const void *body, DWORD size,
+                     DWORD *status, BYTE **output, SIZE_T *length ) override
+    { return authentication.HttpRaw( method, url, headers, body, size, status, output, length ); }
+    HRESULT Http( const WCHAR *method, const WCHAR *url, char *body, const WCHAR *headers,
+                  const WCHAR **accept, BYTE **output, SIZE_T *length ) override
+    {
+        if ( !wcscmp( url, L"https://profile.xboxlive.com/users/me/profile/settings?settings=PublicGamerpic" ) )
+        {
+            ++profileCalls;
+            EXPECT_TRUE( headers && wcsstr( headers, L"Authorization: " ) && wcsstr( headers, L"Signature: " ) );
+            SetEvent( profileEntered );
+            if ( WaitForSingleObject( profileContinue, 5000 ) != WAIT_OBJECT_0 ) return E_ABORT;
+            return SyntheticTransport::Reply( R"({"profileUsers":[{"settings":[{"value":"https://images.example.invalid/avatar"}]}]})", output, length );
+        }
+        if ( !wcsncmp( url, L"https://images.example.invalid/avatar?", 38 ) )
+        {
+            ++imageCalls; EXPECT_TRUE( headers == nullptr );
+            SetEvent( imageEntered );
+            if ( blockImage && WaitForSingleObject( imageContinue, 5000 ) != WAIT_OBJECT_0 ) return E_ABORT;
+            return SyntheticTransport::Reply( "synthetic-picture", output, length );
+        }
+        return authentication.Http( method, url, body, headers, accept, output, length );
+    }
+};
+}
+
+TEST( NexusPictureCancellation, HeldProfileReplyCannotStartImageAfterCancellation )
+{
+    Apartment apartment;
+    for ( bool cancel : { false, true } )
+    {
+        PictureTransport transport; XUserImpl api( transport ); auto user = CreateUser( transport );
+        ASSERT_EQ( user->InitializeNetwork( XUserAddOptions::AddDefaultUserSilently ), S_OK );
+        user->initDone = 1; user->initResult = S_OK;
+        IXThreadingImpl *threads = nullptr;
+        ASSERT_EQ( QueryApiImpl( CLSID_XThreadingImpl, __uuidof( IXThreadingImpl ), reinterpret_cast<void **>( &threads ) ), S_OK );
+        XTaskQueueHandle queue = nullptr;
+        ASSERT_EQ( threads->XTaskQueueCreate( XTaskQueueDispatchMode::Manual, XTaskQueueDispatchMode::Manual, &queue ), S_OK );
+        LONG completions = 0; XAsyncBlock block{}; block.queue = queue; block.context = &completions; block.callback = CountTokenCompletion;
+        ASSERT_EQ( api.XUserGetGamerPictureAsync( user.get(), XUserGamerPictureSize::Medium, &block ), S_OK );
+        ASSERT_TRUE( threads->XTaskQueueDispatch( queue, XTaskQueuePort::Work, 0 ) );
+        const auto entered = WaitForSingleObject( transport.profileEntered, 2000 );
+        EXPECT_EQ( entered, WAIT_OBJECT_0 );
+        if ( cancel ) threads->XAsyncCancel( &block );
+        EXPECT_EQ( transport.imageCalls.load(), 0u );
+        SetEvent( transport.profileContinue );
+        ASSERT_TRUE( threads->XTaskQueueDispatch( queue, XTaskQueuePort::Completion, 5000 ) );
+        const auto result = threads->XAsyncGetStatus( &block, FALSE );
+        const auto expected = cancel ? E_ABORT : S_OK;
+        EXPECT_EQ( result, expected ); EXPECT_EQ( completions, 1 );
+        if ( !cancel )
+        {
+            SIZE_T size = 0; ASSERT_EQ( api.XUserGetGamerPictureResultSize( &block, &size ), S_OK );
+            std::vector<BYTE> image( size );
+            EXPECT_EQ( api.XUserGetGamerPictureResult( &block, image.size(), image.data(), nullptr ), S_OK );
+            EXPECT_EQ( size, strlen( "synthetic-picture" ) );
+        }
+        const auto deadline = GetTickCount64() + 5000;
+        while ( InterlockedCompareExchange( &user->ref, 0, 0 ) != 1 && GetTickCount64() < deadline ) Sleep( 1 );
+        EXPECT_EQ( user->ref, 1 ); EXPECT_EQ( transport.profileCalls.load(), 1u );
+        EXPECT_EQ( transport.imageCalls.load(), cancel ? 0u : 1u );
+        EXPECT_FALSE( threads->XTaskQueueDispatch( queue, XTaskQueuePort::Completion, 0 ) );
+        EXPECT_FALSE( user->cancelled );
+        printf( "PICTURE_MEASURE canceled=%u profile=%u image=%u completions=%ld result=%08lx\n", cancel,
+                transport.profileCalls.load(), transport.imageCalls.load(), completions, static_cast<unsigned long>( result ) );
+        threads->XTaskQueueCloseHandle( queue ); threads->Release();
+    }
+}
+
+
+TEST( NexusPictureCancellation, HeldAuthorizationAndImageCancellationRemainRequestLocal )
+{
+    Apartment apartment;
+    for ( bool imageStage : { false, true } )
+    {
+        PictureTransport transport; XUserImpl api( transport ); auto user = CreateUser( transport );
+        ASSERT_EQ( user->InitializeNetwork( XUserAddOptions::AddDefaultUserSilently ), S_OK );
+        user->initDone = 1; user->initResult = S_OK;
+        transport.authentication.blockAuthorization = !imageStage; transport.blockImage = imageStage;
+        SetEvent( transport.profileContinue );
+        IXThreadingImpl *threads = nullptr;
+        ASSERT_EQ( QueryApiImpl( CLSID_XThreadingImpl, __uuidof( IXThreadingImpl ), reinterpret_cast<void **>( &threads ) ), S_OK );
+        XTaskQueueHandle queue = nullptr;
+        ASSERT_EQ( threads->XTaskQueueCreate( XTaskQueueDispatchMode::Manual, XTaskQueueDispatchMode::Manual, &queue ), S_OK );
+        LONG completions = 0; XAsyncBlock block{}; block.queue = queue; block.context = &completions; block.callback = CountTokenCompletion;
+        ASSERT_EQ( api.XUserGetGamerPictureAsync( user.get(), XUserGamerPictureSize::Medium, &block ), S_OK );
+        ASSERT_TRUE( threads->XTaskQueueDispatch( queue, XTaskQueuePort::Work, 0 ) );
+        const auto entered = WaitForSingleObject( imageStage ? transport.imageEntered : transport.authentication.authorizationEntered, 2000 );
+        EXPECT_EQ( entered, WAIT_OBJECT_0 ); threads->XAsyncCancel( &block );
+        EXPECT_EQ( threads->XAsyncGetStatus( &block, FALSE ), E_PENDING );
+        EXPECT_EQ( InterlockedCompareExchange( &user->ref, 0, 0 ), 2 );
+        SetEvent( transport.authentication.authorizationContinue ); SetEvent( transport.imageContinue );
+        ASSERT_TRUE( threads->XTaskQueueDispatch( queue, XTaskQueuePort::Completion, 5000 ) );
+        EXPECT_EQ( threads->XAsyncGetStatus( &block, FALSE ), E_ABORT );
+        SIZE_T size = 0; EXPECT_EQ( api.XUserGetGamerPictureResultSize( &block, &size ), E_ABORT ); EXPECT_EQ( size, 0u );
+        EXPECT_EQ( completions, 1 );
+        const auto deadline = GetTickCount64() + 5000;
+        while ( InterlockedCompareExchange( &user->ref, 0, 0 ) != 1 && GetTickCount64() < deadline ) Sleep( 1 );
+        EXPECT_EQ( user->ref, 1 ); EXPECT_FALSE( user->cancelled );
+        EXPECT_EQ( transport.profileCalls.load(), imageStage ? 1u : 0u ); EXPECT_EQ( transport.imageCalls.load(), imageStage ? 1u : 0u );
+        EXPECT_FALSE( threads->XTaskQueueDispatch( queue, XTaskQueuePort::Completion, 0 ) );
+        // The retained XUser and its independent authorization cache still work.
+        WCHAR *auth = nullptr; EXPECT_EQ( user->GetAuthorization( L"http://xboxlive.com", &auth ), S_OK ); free( auth );
+        printf( "PICTURE_MEASURE canceled_at=%s profile=%u image=%u result=E_ABORT bytes=%llu completions=%ld\n",
+                imageStage ? "image" : "authorization", transport.profileCalls.load(), transport.imageCalls.load(), static_cast<unsigned long long>( size ), completions );
+        threads->XTaskQueueCloseHandle( queue ); threads->Release();
+    }
+}
