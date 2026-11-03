@@ -350,7 +350,7 @@ TEST( NexusOptionalAbi, IXAppCaptureImpl4OriginalSlotsRemainCallable )
     }
     {
         // Frozen original C table slot 4: capture_XAppCaptureRecordDiagnosticClip
-        using Function = HRESULT( WINAPI * )( void *self, time_t startTime, UINT32 durationInMs,
+        using Function = HRESULT( WINAPI * )( void *self, INT64 startTime, UINT32 durationInMs,
                                               const char *filenamePrefix, XAppCaptureRecordClipResult *result );
         auto call = reinterpret_cast<Function>( table[4] );
         EXPECT_EQ( call( object, {}, {}, {}, {} ), E_NOTIMPL );

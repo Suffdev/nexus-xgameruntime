@@ -201,7 +201,7 @@ IMPL_CALL( BOOLEAN, XAppCaptureUnRegisterMetadataPurged, (XTaskQueueRegistration
 #define CONSUMED_INTERFACE IXAppCaptureImpl*
 
 IMPL_CALL( HRESULT, XAppCaptureTakeDiagnosticScreenshot, (BOOLEAN gamescreenOnly, XAppCaptureScreenshotFormatFlag captureFlags, const char *filenamePrefix, XAppCaptureDiagnosticScreenshotResult *result), (gamescreenOnly, captureFlags, filenamePrefix, result) )
-IMPL_CALL( HRESULT, XAppCaptureRecordDiagnosticClip, (time_t startTime, UINT32 durationInMs, const char *filenamePrefix, XAppCaptureRecordClipResult *result), (startTime, durationInMs, filenamePrefix, result) )
+IMPL_CALL( HRESULT, XAppCaptureRecordDiagnosticClip, (INT64 startTime, UINT32 durationInMs, const char *filenamePrefix, XAppCaptureRecordClipResult *result), (startTime, durationInMs, filenamePrefix, result) )
 IMPL_CALL( HRESULT, XAppCaptureTakeScreenshot, (XUserHandle requestingUser, XAppCaptureTakeScreenshotResult *result), (requestingUser, result) )
 IMPL_CALL( HRESULT, XAppCaptureOpenScreenshotStream, (const char *localId, XAppCaptureScreenshotFormatFlag screenshotFormat, XAppCaptureScreenshotStreamHandle *handle, UINT64 *totalBytes), (localId, screenshotFormat, handle, totalBytes) )
 IMPL_CALL( HRESULT, XAppCaptureReadScreenshotStream, (XAppCaptureScreenshotStreamHandle handle, UINT64 startPosition, UINT32 bytesToRead, UINT8 *buffer, UINT32 *bytesWritten), (handle, startPosition, bytesToRead, buffer, bytesWritten) )

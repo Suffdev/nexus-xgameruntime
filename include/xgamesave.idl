@@ -22,10 +22,6 @@ import "unknwn.idl";
 import "xasync.h";
 import "xuser.idl";
 
-cpp_quote("#if 0")
-typedef UINT64 time_t;
-cpp_quote("#endif")
-
 typedef struct XGameSaveContainer *XGameSaveContainerHandle;
 typedef struct XGameSaveProvider *XGameSaveProviderHandle;
 typedef struct XGameSaveUpdate *XGameSaveUpdateHandle;
@@ -55,7 +51,7 @@ struct XGameSaveContainerInfo
     const char *displayName;
     UINT32 blobCount;
     UINT64 totalSize;
-    time_t lastModifiedTime;
+    INT64 lastModifiedTime;
     BOOLEAN needsSync;
 };
 
