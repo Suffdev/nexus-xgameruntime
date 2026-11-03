@@ -33,5 +33,5 @@ int main() {
  port->WaitForUnwind(); CHECK(true);
  CHECK(SUCCEEDED(XTaskQueueTerminate(q,true,nullptr,nullptr)));XTaskQueueCloseHandle(q);
  for(HANDLE e:{held.entered,held.release,entered,done})CloseHandle(e);
- printf("HELD_MS 250 WAITER_CPU_100NS %llu CHECKS %u FAILURES %u\n",(unsigned long long)cpu,checks,failures);return failures?1:0;
+ printf("HELD_MS 250 WAITER_CPU_100NS %llu\nCHECKS %u FAILURES %u\n",(unsigned long long)cpu,checks,failures);return failures?1:0;
 }
