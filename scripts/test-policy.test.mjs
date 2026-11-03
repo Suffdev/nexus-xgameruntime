@@ -313,7 +313,7 @@ test('current game licenses require proof-bound genuine SKU and support safe can
     assert.doesNotMatch(source,/4102444800|0010|isActive\s*=\s*TRUE[\s\S]*return E_NOTIMPL/);
     assert.match(read('src/System/Store/Entitled.h').replace(/\s+/g,''),/InterlockedCompareExchange\(&context->terminal,1,0\)/);
     assert.match(read('tests/Nexus/store-entitlements.cpp').replace(/\s+/g,''),/VirtualFree\(block,0,MEM_RELEASE\)/);
-    assert.match(read('scripts/test-store.mjs'),/\['store-entitlements',1143\]/);
+    assert.match(read('scripts/test-store.mjs'),/\['store-entitlements',1156\]/);
     assert.match(read('scripts/test-store.mjs'),/realAccounts:false,realCloud:false,fullRuntime:false/);
 });
 
@@ -564,4 +564,12 @@ test('Store native gate requires bounded within-operation metadata reuse coverag
     for(const name of ['same-product-single-public-get','nonadjacent-products-evict','separate-operation-fetches','separate-market-fetches','metadata-reuse-missing-sku','metadata-reuse-malformed-trial','metadata-reuse-body-limit','metadata-reuse-http-failure','metadata-reuse-between-row-stop','metadata-reuse-sku-order-trial-expiry'])
         assert.ok(read('tests/Nexus/store-entitlements.cpp').includes('"'+name+'"'));
 
+});
+
+test('Store ABI timestamps are signed 64-bit independently of CRT time_t',()=>{
+    const idl=read('include/xstore.idl');
+    assert.equal([...idl.matchAll(/\bINT64\s+(?:expirationDate|saleEndDate|endDate|acquiredDate|startDate)\s*;/g)].length,7);
+    assert.doesNotMatch(idl,/^\s*time_t\s+/m);
+    for(const name of ['store-abi-future-time-roundtrip','store-abi-signed-time-max','store-abi-signed-time-min','store-abi-timestamp-field-isolation'])
+        assert.ok(read('tests/Nexus/store-entitlements.cpp').includes('"'+name+'"'));
 });

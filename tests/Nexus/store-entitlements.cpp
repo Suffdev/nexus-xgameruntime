@@ -6,6 +6,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <string>
+#include <type_traits>
+#include <limits>
+#include <stddef.h>
 #include <libxml/parser.h>
 #include <libxml/tree.h>
 #include "../../src/private.h"
@@ -145,6 +148,82 @@ static unsigned checks, failures, callbacks, enumerated;
             printf( "FAIL %s line=%d\n", name, __LINE__ );                                                             \
         }                                                                                                              \
     } while ( 0 )
+
+template<typename T> constexpr bool store_timestamp_abi = sizeof( T ) == 8 && std::is_signed_v<T>;
+static_assert( store_timestamp_abi<decltype( XStoreAddonLicense{}.expirationDate )> );
+static_assert( store_timestamp_abi<decltype( XStorePrice{}.saleEndDate )> );
+static_assert( store_timestamp_abi<decltype( XStoreAvailability{}.endDate )> );
+static_assert( store_timestamp_abi<decltype( XStoreCollectionData{}.acquiredDate )> );
+static_assert( store_timestamp_abi<decltype( XStoreCollectionData{}.startDate )> );
+static_assert( store_timestamp_abi<decltype( XStoreCollectionData{}.endDate )> );
+static_assert( store_timestamp_abi<decltype( XStoreGameLicense{}.expirationDate )> );
+// Microsoft default packing and signed __time64_t, not the compiler's CRTtime_t.
+static_assert( sizeof( XStoreAddonLicense ) == 96 && offsetof( XStoreAddonLicense, expirationDate ) == 88 );
+static_assert( sizeof( XStoreGameLicense ) == 104 && offsetof( XStoreGameLicense, expirationDate ) == 96 );
+static_assert( sizeof( XStorePrice ) == ( sizeof( void * ) == 8 ? 88 : 80 ) );
+static_assert( offsetof( XStorePrice, saleEndDate ) == ( sizeof( void * ) == 8 ? 80 : 72 ) );
+static_assert( sizeof( XStoreAvailability ) == ( sizeof( void * ) == 8 ? 104 : 96 ) );
+static_assert( sizeof( XStoreCollectionData ) == ( sizeof( void * ) == 8 ? 56 : 48 ) );
+static_assert( offsetof( XStoreCollectionData, endDate ) == 16 && offsetof( XStoreCollectionData, isTrial ) == 24 );
+static_assert( sizeof( XStoreSku ) == ( sizeof( void * ) == 8 ? 272 : 208 ) );
+static_assert( offsetof( XStoreSku, collectionData ) == ( sizeof( void * ) == 8 ? 128 : 104 ) );
+static_assert( sizeof( XStoreProduct ) == ( sizeof( void * ) == 8 ? 208 : 152 ) );
+static_assert( offsetof( XStoreProduct, price ) == ( sizeof( void * ) == 8 ? 56 : 32 ) );
+static void test_store_time_abi()
+{
+    const INT64 future = 253402300799LL;
+    XStoreAddonLicense addon{}; XStorePrice price{}; XStoreAvailability available{};
+    XStoreCollectionData collection{}; XStoreGameLicense game{};
+    addon.expirationDate = price.saleEndDate = available.endDate = collection.acquiredDate =
+        collection.startDate = collection.endDate = game.expirationDate = future;
+    CHECK( "store-abi-future-time-roundtrip", addon.expirationDate == future && price.saleEndDate == future &&
+           available.endDate == future && collection.acquiredDate == future && collection.startDate == future &&
+           collection.endDate == future && game.expirationDate == future );
+    collection.endDate = INT64_MAX;
+    CHECK( "store-abi-signed-time-max", collection.endDate == INT64_MAX );
+    collection.endDate = INT64_MIN;
+    CHECK( "store-abi-signed-time-min", collection.endDate == INT64_MIN && collection.endDate < 0 );
+    struct Guarded { UINT64 before; XStoreCollectionData value; UINT64 after; } guarded{};
+    guarded.before = 0x123456789abcdef0ULL; guarded.after = 0xfedcba9876543210ULL;
+    guarded.value.acquiredDate = future; guarded.value.startDate = future - 1; guarded.value.endDate = future - 2;
+    guarded.value.quantity = 9; guarded.value.isTrial = TRUE;
+    CHECK( "store-abi-timestamp-field-isolation", guarded.before == 0x123456789abcdef0ULL && guarded.after == 0xfedcba9876543210ULL &&
+           guarded.value.acquiredDate == future && guarded.value.startDate == future - 1 && guarded.value.endDate == future - 2 &&
+           guarded.value.quantity == 9 && guarded.value.isTrial );
+    printf( "STORE_TIME_ABI crt=%u field=%u collection=%u end_offset=%u future=%llu\n", static_cast<unsigned>( sizeof( time_t ) ),
+            static_cast<unsigned>( sizeof( collection.endDate ) ), static_cast<unsigned>( sizeof( collection ) ),
+            static_cast<unsigned>( offsetof( XStoreCollectionData, endDate ) ), static_cast<unsigned long long>( future ) );
+}
+
+static void test_store_time_consumers()
+{
+    IJsonObject *object = nullptr;
+    const char *json = R"({"Conditions":{"StartDate":"1753-01-01T00:00:00.0000000Z","EndDate":"9999-12-31T23:59:59Z"},"Actions":["Purchase"],"OrderManagementData":{"Price":{"ListPrice":10,"MSRP":20,"CurrencyCode":"USD"}},"Future":"9999-12-31T23:59:59Z","Past":"1753-01-01T00:00:00.0000000Z","Bad":"not-a-date","Overflow":"999999999999-12-31T23:59:59Z"})";
+    CHECK( "store-time-consumer-json", receipt_json( reinterpret_cast<const BYTE *>( json ), strlen( json ), &object ) == S_OK );
+    if ( object )
+    {
+        INT64 end = 0;
+        CHECK( "store-time-catalog-future-unclamped", catalog_date( object, L"Future", &end ) == S_OK && end == 253402300799LL );
+        CHECK( "store-time-catalog-unbounded-start", catalog_date( object, L"Past", &end ) == S_OK && end == 0 );
+        CHECK( "store-time-catalog-malformed-refused", FAILED( catalog_date( object, L"Bad", &end ) ) );
+        CHECK( "store-time-catalog-overflow-refused", FAILED( catalog_date( object, L"Overflow", &end ) ) );
+        BOOL include = FALSE, purchase = FALSE;
+        CHECK( "store-time-availability-future", catalog_availability( object, nullptr, 0, &include, &purchase, &end ) == S_OK &&
+               include && purchase && end == 253402300799LL );
+        XStorePrice price{};
+        CHECK( "store-time-sale-future", catalog_price( object, end, &price ) == S_OK && price.isOnSale && price.saleEndDate == end );
+        free( const_cast<char *>( price.currencyCode ) ); object->Release();
+    }
+    XStoreSku sku{}; sku.skuId = "AB12"; sku.isInUserCollection = TRUE; sku.collectionData.endDate = 253402300799LL;
+    XStoreProduct product{}; product.storeId = storeId; product.productKind = XStoreProductKind::Game;
+    product.isInUserCollection = TRUE; product.skusCount = 1; product.skus = &sku;
+    entitled_snapshot snapshot{}; snapshot.count = 1; snapshot.products = &product; snapshot.proof_until = 253402300789ULL;
+    XStoreGameLicense result{};
+    CHECK( "store-time-game-proof-future", game_license_from_snapshot( &snapshot, storeId, &result ) == S_OK &&
+           result.isActive && result.expirationDate == 253402300789LL );
+    sku.collectionData.endDate = -1;
+    CHECK( "store-time-negative-expiry-denied", game_license_from_snapshot( &snapshot, storeId, &result ) == E_ACCESSDENIED && !result.isActive );
+}
 
 static char *encode( const BYTE *bytes, DWORD size, BOOL url )
 {
@@ -2070,6 +2149,15 @@ static void test_public_catalog()
 
 int main( int argc, char **argv )
 {
+    test_store_time_abi();
+    if ( argc == 2 && !strcmp( argv[1], "--store-time-abi" ) )
+    {
+        const auto status = RoInitialize( RO_INIT_MULTITHREADED );
+        CHECK( "store-time-mode-winrt", SUCCEEDED( status ) );
+        if ( SUCCEEDED( status ) ) { test_store_time_consumers(); RoUninitialize(); }
+        printf( "CHECKS %u FAILURES %u\n", checks, failures );
+        return failures ? 1 : 0;
+    }
     if ( argc == 2 && !strcmp( argv[1], "--metadata-stage" ) )
     {
         const auto hr = RoInitialize( RO_INIT_MULTITHREADED );
@@ -2084,6 +2172,7 @@ int main( int argc, char **argv )
         return 2;
     HRESULT hr = RoInitialize( RO_INIT_MULTITHREADED );
     CHECK( "winrt", SUCCEEDED( hr ) );
+    if ( SUCCEEDED( hr ) ) test_store_time_consumers();
     IXStoreImpl6 *store_api = NULL;
     XStoreContextHandle store = NULL;
     CHECK( "runtime-store-abi",
