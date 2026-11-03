@@ -383,7 +383,8 @@ private:
         QueueEntry queueEntry;
         std::atomic_flag appended;
         std::atomic<uint32_t> refs;
-        bool deleted;
+        std::atomic<bool> deleted;
+        uint32_t activeCallbacks = 0; // Protected by the port lock.
     };
 
     XTaskQueuePortObject m_header = { };
@@ -392,6 +393,7 @@ private:
     std::atomic<uint32_t> m_processingSerializedTbCallback{ 0 };
     std::atomic<uint32_t> m_processingCallback{ 0 };
     std::condition_variable m_processingCallbackCv;
+    std::condition_variable m_waitCallbackCv;
     std::mutex m_lock;
     std::unique_ptr<LocklessQueue<QueueEntry>> m_queueList;
     std::unique_ptr<LocklessQueue<QueueEntry>> m_pendingList;
@@ -452,8 +454,9 @@ private:
     HRESULT InitializeWaitRegistration(
         WaitRegistration* waitReg);
 
-    bool AppendWaitRegistrationEntry(
-        WaitRegistration* waitReg);
+    enum class WaitAppendResult { Skipped, Handled, AllocationFailed };
+    WaitAppendResult AppendWaitRegistrationEntry(
+        WaitRegistration* waitReg, bool allowDeleted = false);
 
     bool ReleaseWaitRegistration(
         WaitRegistration* waitReg);

@@ -268,3 +268,22 @@ target_compile_features(nexus_gamesave-conflict-ui PRIVATE cxx_std_23)
 target_link_options(nexus_gamesave-conflict-ui PRIVATE -static -static-libgcc -static-libstdc++)
 set_target_properties(nexus_gamesave-conflict-ui PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 endif()
+
+# This target compiles the actual queue with fixture-only API interposition.
+# Production library objects never include the shim.
+add_executable(nexus_taskqueue-composite-waiters
+    Nexus/taskqueue-composite-waiters.cpp
+    "${PROJECT_SOURCE_DIR}/src/System/Threading/XTaskQueue.cpp")
+add_dependencies(nexus_taskqueue-composite-waiters xgameruntime-idl)
+target_include_directories(nexus_taskqueue-composite-waiters PRIVATE
+    "${PROJECT_SOURCE_DIR}" "${IDL_BINARY_DIR}" "${PROJECT_SOURCE_DIR}/include")
+target_compile_definitions(nexus_taskqueue-composite-waiters PRIVATE LIBXML_STATIC)
+target_compile_options(nexus_taskqueue-composite-waiters PRIVATE
+    -include "${CMAKE_CURRENT_SOURCE_DIR}/Nexus/taskqueue-composite-waiters-shim.h")
+target_compile_features(nexus_taskqueue-composite-waiters PRIVATE cxx_std_23)
+target_link_libraries(nexus_taskqueue-composite-waiters PRIVATE
+    xgameruntime-impl nexus-xml2 xgameruntime-common shell32 bcrypt crypt32 advapi32
+    runtimeobject ole32 winhttp wininet ws2_32 iphlpapi)
+target_link_options(nexus_taskqueue-composite-waiters PRIVATE -static -static-libgcc -static-libstdc++)
+set_target_properties(nexus_taskqueue-composite-waiters PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")

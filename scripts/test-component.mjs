@@ -16,7 +16,7 @@ const probes = [
     ['nexus_store-public-fetch', 98],
     ['nexus_user-device-association',6309], ['nexus_user-audio',334], ['nexus_windows-account-metadata',1713],
     ['nexus_game-relaunch',64], ['nexus_game-relaunch-search', 116], ['nexus_async-provider-contract',116], ['nexus_system_device_id', 332], ['nexus_async-schedule', 16],
-    ['nexus_async-completion-lifetime', 2805], ['nexus_taskqueue-teardown', 20],
+    ['nexus_async-completion-lifetime', 2805], ['nexus_taskqueue-teardown', 20], ['nexus_taskqueue-composite-waiters', 96],
     ['nexus_taskqueue-close', 1137], ['nexus_taskqueue-contract', 1374],
     ['nexus_package-identity', 15], ['nexus_package-legacy', 175], ['nexus_package-chunks', 312],
     ['nexus_package-content',423], ['nexus_package-installed',110], ['nexus_package-monitors', 362], ['nexus_package-progress-bytes', 115],

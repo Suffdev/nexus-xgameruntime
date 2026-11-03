@@ -20,6 +20,17 @@
 #include "XTaskQueue.h"
 #include "QueueHandles.h"
 
+namespace
+{
+struct WaitCallbackFrame
+{
+    void* registration;
+    WaitCallbackFrame* previous;
+};
+thread_local WaitCallbackFrame* currentWaitCallback = nullptr;
+
+}
+
 inline referenced_ptr<ITaskQueue> GetQueue(XTaskQueueHandle handle)
 {
     return nexus::acquire_queue(handle);
@@ -371,6 +382,13 @@ void TaskQueuePortImpl::UnregisterWaitHandle(
         SetThreadpoolWait(toDelete->threadpoolWait, nullptr, nullptr);
         WaitForThreadpoolWaitCallbacks(toDelete->threadpoolWait, TRUE);
         CloseThreadpoolWait(toDelete->threadpoolWait);
+        if (!currentWaitCallback || currentWaitCallback->registration != toDelete)
+        {
+            // The CV releases m_lock while waiting. Only external unregister
+            // drains caller callbacks; asynchronous termination must not do so.
+            std::unique_lock<std::mutex> lock(m_lock);
+            m_waitCallbackCv.wait(lock, [&] { return toDelete->activeCallbacks == 0; });
+        }
         ReleaseWaitRegistration(toDelete);
     }
 
@@ -572,29 +590,22 @@ bool TaskQueuePortImpl::Wait(
         {
             for (uint32_t idx = 0; idx < waits.count(); idx++)
             {
-                if (waits[idx]->waitHandle == events[waitResult - WAIT_OBJECT_0])
+                if (waits[idx]->waitHandle != events[waitResult - WAIT_OBJECT_0]) continue;
+                auto result = AppendWaitRegistrationEntry(waits[idx]);
+                if (result == WaitAppendResult::Skipped) continue;
+                if (result == WaitAppendResult::AllocationFailed)
                 {
-                    if (!AppendWaitRegistrationEntry(waits[idx]))
-                    {
-                        LOG_IF_FAILED(InitializeWaitRegistration(waits[idx]));
-                    }
-                    break;
+                    std::lock_guard<std::mutex> lock(m_lock);
+                    if (!waits[idx]->deleted) LOG_IF_FAILED(InitializeWaitRegistration(waits[idx]));
                 }
+                break;
             }
+        }
 
-            for (uint32_t idx = 0; idx < waits.count(); idx++)
-            {
-                ReleaseWaitRegistration(waits[idx]);
-            }
-        }
-        else if (waitResult == WAIT_TIMEOUT)
-        {
-            return false;
-        }
-        else if (waitResult == WAIT_FAILED)
-        {
-            FAIL_FAST_IF_FAILED(HRESULT_FROM_WIN32(GetLastError()));
-        }
+        // Every snapshot owns references, even when the queue wakes or times out.
+        for (uint32_t idx = 0; idx < waits.count(); idx++) ReleaseWaitRegistration(waits[idx]);
+        if (waitResult == WAIT_TIMEOUT) return false;
+        if (waitResult == WAIT_FAILED) FAIL_FAST_IF_FAILED(HRESULT_FROM_WIN32(GetLastError()));
     }
 
     return true;
@@ -800,30 +811,37 @@ void TaskQueuePortImpl::CancelPendingEntries(
     }
 
     StaticArray<WaitRegistration*, PORT_WAIT_MAX> waits;
-
     {
-        std::unique_lock<std::mutex> lock(m_lock);
-        waits = m_waits;
-        m_waits.clear();
-    }
-
-    for (uint32_t index = waits.count(); index > 0; index--)
-    {
-        uint32_t idx = index - 1;
-        if (waits[idx]->queueEntry.portContext == portContext)
+        std::lock_guard<std::mutex> lock(m_lock);
+        for (uint32_t index = m_waits.count(); index > 0; --index)
         {
-            CloseThreadpoolWait(waits[idx]->threadpoolWait);
-            waits[idx]->queueEntry.waitRegistration = nullptr;
-
-            if (appendToQueue)
+            auto registration = m_waits[index - 1];
+            if (registration->queueEntry.portContext != portContext) continue;
+            registration->deleted = true;
+            waits.append(registration);
+            m_waits.removeAt(index - 1);
+            // One event slot belongs to each registration, including duplicate handles.
+            for (uint32_t event = 1; event < m_events.count(); ++event)
             {
-                AppendWaitRegistrationEntry(waits[idx]);
+                if (m_events[event] != registration->waitHandle) continue;
+                m_events.removeAt(event);
+                break;
             }
-            
-            delete waits[idx];
-            waits.removeAt(idx);
         }
     }
+
+    for (uint32_t index = 0; index < waits.count(); ++index)
+    {
+        auto registration = waits[index];
+        SetThreadpoolWait(registration->threadpoolWait, nullptr, nullptr);
+        WaitForThreadpoolWaitCallbacks(registration->threadpoolWait, TRUE);
+        CloseThreadpoolWait(registration->threadpoolWait);
+        if (appendToQueue) AppendWaitRegistrationEntry(registration, true);
+        // Snapshots, callbacks and queued entries retain their own references.
+        ReleaseWaitRegistration(registration);
+    }
+    // A manual dispatcher may still hold the previous event snapshot on plain close.
+    if (waits.count()) SignalQueue();
 }
 
 void TaskQueuePortImpl::EraseQueue(
@@ -1127,8 +1145,41 @@ void CALLBACK TaskQueuePortImpl::WaitCallback(
 
     if (waitResult == WAIT_OBJECT_0 && context != nullptr)
     {
-        WaitRegistration* waitReg = static_cast<WaitRegistration*>(context);
-        waitReg->port->ProcessWaitCallback(waitReg);
+        auto registration = static_cast<WaitRegistration*>(context);
+        auto port = registration->port;
+        auto owner = static_cast<TaskQueueImpl*>(registration->queueEntry.portContext->GetQueue());
+        // An associated callback keeps rundown waiting until this non-resurrection check.
+        if (!owner->TryAddRef()) return;
+        port->AddRef();
+        ++registration->refs;
+        {
+            std::lock_guard<std::mutex> lock(port->m_lock);
+            ++registration->activeCallbacks;
+        }
+        // Count retained TP work before OS drain can return, including the
+        // interval before its queued entry is published.
+        ++port->m_processingCallback;
+        WaitCallbackFrame frame{registration, currentWaitCallback};
+        currentWaitCallback = &frame;
+        DisassociateCurrentThreadFromCallback(instance);
+        port->ProcessWaitCallback(registration);
+        --port->m_processingCallback;
+        port->m_processingCallbackCv.notify_all();
+        if (port->m_queueList->empty() && port->m_processingCallback.load() == 0)
+        {
+            port->SignalTerminations();
+            port->SignalQueue();
+        }
+        // Last owner release may itself run down this registration.
+        owner->Release();
+        {
+            std::lock_guard<std::mutex> lock(port->m_lock);
+            --registration->activeCallbacks;
+        }
+        port->m_waitCallbackCv.notify_all();
+        currentWaitCallback = frame.previous;
+        port->ReleaseWaitRegistration(registration);
+        port->Release();
     }
 }
 
@@ -1148,26 +1199,27 @@ HRESULT TaskQueuePortImpl::InitializeWaitRegistration(
     return S_OK;
 }
 
-bool TaskQueuePortImpl::AppendWaitRegistrationEntry(
-    WaitRegistration* waitReg
+TaskQueuePortImpl::WaitAppendResult TaskQueuePortImpl::AppendWaitRegistrationEntry(
+    WaitRegistration* waitReg,
+    bool allowDeleted
 ) {
-    QueueEntry entry = waitReg->queueEntry;
-    bool success = true;
-
-    if (waitReg->appended.test_and_set() == false)
+    QueueEntry entry;
     {
-        entry.portContext->AddRef();
-        waitReg->refs++;
-
-        success = AppendEntry(entry, 0);
-        if (!success)
-        {
-            entry.portContext->Release();
-            waitReg->refs--;
-        }
+        std::lock_guard<std::mutex> lock(m_lock);
+        if (waitReg->deleted && !allowDeleted) return WaitAppendResult::Skipped;
+        if (waitReg->appended.test()) return WaitAppendResult::Handled;
+        entry = waitReg->queueEntry;
+        auto owner = static_cast<TaskQueueImpl*>(entry.portContext->GetQueue());
+        if (!owner->TryAddRef()) return WaitAppendResult::Skipped;
+        waitReg->appended.test_and_set();
+        // Port-context Release delegates to this owner reference. Never resurrect rundown.
+        ++waitReg->refs;
     }
-
-    return success;
+    // Notification may synchronously dispatch Immediate user callbacks. Never hold m_lock.
+    if (AppendEntry(entry, 0)) return WaitAppendResult::Handled;
+    entry.portContext->Release();
+    ReleaseWaitRegistration(waitReg);
+    return WaitAppendResult::AllocationFailed;
 }
 
 bool TaskQueuePortImpl::ReleaseWaitRegistration(
@@ -1187,9 +1239,10 @@ bool TaskQueuePortImpl::ReleaseWaitRegistration(
 void TaskQueuePortImpl::ProcessWaitCallback(
     WaitRegistration* waitReg
 ) {
-    if (!AppendWaitRegistrationEntry(waitReg))
+    if (AppendWaitRegistrationEntry(waitReg) == WaitAppendResult::AllocationFailed)
     {
-        LOG_IF_FAILED(InitializeWaitRegistration(waitReg));
+        std::lock_guard<std::mutex> lock(m_lock);
+        if (!waitReg->deleted) LOG_IF_FAILED(InitializeWaitRegistration(waitReg));
     }
 }
 
