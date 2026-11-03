@@ -2923,6 +2923,8 @@ HRESULT xuser_signed_request( XUserHandle user, const char *method, const char *
                                                           bufferSize ) ) &&
                  *status < 500 )
                 break;
+            if ( hr == E_ABORT || hr == E_INVALIDARG || hr == E_OUTOFMEMORY )
+                break;
             if ( SUCCEEDED( hr ) )
             {
                 free( *buffer );

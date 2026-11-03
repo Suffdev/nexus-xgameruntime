@@ -46,6 +46,10 @@ class SyntheticTransport final : public UserTransport
 public:
     unsigned backendCalls = 0, httpCalls = 0, unexpected = 0;
     std::atomic<unsigned> rawCalls{0};
+    bool signedRetryFixture = false;
+    HRESULT signedRetryResult = S_OK;
+    DWORD signedRetryStatus = 200;
+    unsigned signedRetryRecoverAfter = 0;
     std::mutex rawMutex;
     std::string notAfter;
     unsigned defaultFailures = 0, retryMilliseconds = 0, retryCalls = 0;
@@ -200,6 +204,12 @@ public:
         *output = nullptr;
         *length = 0;
         *status = 0;
+        if ( signedRetryFixture )
+        {
+            if ( FAILED( signedRetryResult ) ) return signedRetryResult;
+            *status = signedRetryRecoverAfter && rawCalls > signedRetryRecoverAfter ? 200 : signedRetryStatus;
+            return Reply( "synthetic-response", output, length );
+        }
         if ( wcscmp( method, L"POST" ) || wcscmp( url, L"https://xsts.auth.xboxlive.com/xsts/authorize" ) )
         {
             ++unexpected;
@@ -2091,4 +2101,57 @@ TEST( NexusPictureCancellation, HeldAuthorizationAndImageCancellationRemainReque
                 imageStage ? "image" : "authorization", transport.profileCalls.load(), transport.imageCalls.load(), static_cast<unsigned long long>( size ), completions );
         threads->XTaskQueueCloseHandle( queue ); threads->Release();
     }
+}
+
+TEST( NexusSignedRequestRetry, TerminalTransportErrorsDoNotRepeatSignedRequests )
+{
+    for ( HRESULT failure : { E_ABORT, E_INVALIDARG, E_OUTOFMEMORY } )
+    {
+        Apartment apartment; SyntheticTransport transport; auto user = CreateUser( transport );
+        ASSERT_EQ( user->InitializeNetwork( XUserAddOptions::AddDefaultUserSilently ), S_OK );
+        transport.signedRetryFixture = true; transport.signedRetryResult = failure; transport.rawCalls = 0;
+        BYTE *output = nullptr; SIZE_T size = 0; DWORD status = 0;
+        auto began = GetTickCount64();
+        EXPECT_EQ( xuser_signed_request( user.get(), "GET", "https://gamesave.example.invalid/containers", "synthetic-auth", nullptr, nullptr, 0, &status, &output, &size ), failure );
+        printf( "SIGNED_TERMINAL hr=%08lx calls=%u wall_ms=%llu\n", (unsigned long)failure, transport.rawCalls.load(), (unsigned long long)(GetTickCount64()-began) );
+        EXPECT_EQ( transport.rawCalls, 1u ); EXPECT_EQ( status, 0u ); EXPECT_EQ( output, nullptr ); EXPECT_EQ( size, 0u ); free(output);
+    }
+}
+TEST( NexusSignedRequestRetry, GenericAndAccessDeniedTransportFailuresKeepThreeAttempts )
+{
+    for ( HRESULT failure : { E_FAIL, E_ACCESSDENIED } )
+    {
+        Apartment apartment; SyntheticTransport transport; auto user = CreateUser( transport );
+        ASSERT_EQ( user->InitializeNetwork( XUserAddOptions::AddDefaultUserSilently ), S_OK );
+        transport.signedRetryFixture = true; transport.signedRetryResult = failure; transport.rawCalls = 0;
+        BYTE *output = nullptr; SIZE_T size = 0; DWORD status = 0;auto began=GetTickCount64();
+        EXPECT_EQ( xuser_signed_request( user.get(), "GET", "https://gamesave.example.invalid/containers", nullptr, nullptr, nullptr, 0, &status, &output, &size ), failure );
+        printf("SIGNED_TRANSIENT hr=%08lx calls=%u wall_ms=%llu\n",(unsigned long)failure,transport.rawCalls.load(),(unsigned long long)(GetTickCount64()-began));
+        EXPECT_EQ( transport.rawCalls, 3u ); EXPECT_EQ( output, nullptr ); EXPECT_EQ( size, 0u ); free(output);
+    }
+}
+TEST( NexusSignedRequestRetry, HttpServerErrorsRetainRetriesAndReleaseBodies )
+{
+    Apartment apartment; SyntheticTransport transport; auto user = CreateUser( transport );
+    ASSERT_EQ( user->InitializeNetwork( XUserAddOptions::AddDefaultUserSilently ), S_OK );
+    transport.signedRetryFixture = true; transport.signedRetryStatus = 503; transport.rawCalls = 0;
+    BYTE *output = nullptr; SIZE_T size = 0; DWORD status = 0;
+    EXPECT_EQ( xuser_signed_request( user.get(), "GET", "https://gamesave.example.invalid/containers", nullptr, nullptr, nullptr, 0, &status, &output, &size ), S_OK );
+    EXPECT_EQ( transport.rawCalls, 3u ); EXPECT_EQ(status,503u);EXPECT_EQ(output,nullptr);EXPECT_EQ(size,0u);
+    transport.rawCalls=0;transport.signedRetryStatus=403;
+    EXPECT_EQ( xuser_signed_request( user.get(), "GET", "https://gamesave.example.invalid/containers", nullptr, nullptr, nullptr, 0, &status, &output, &size ), S_OK );
+    EXPECT_EQ(transport.rawCalls,1u);EXPECT_EQ(status,403u);ASSERT_NE(output,nullptr);EXPECT_EQ(std::string((char*)output,size),"synthetic-response");free(output);
+    transport.rawCalls=0;transport.signedRetryStatus=503;transport.signedRetryRecoverAfter=1;output=nullptr;size=0;
+    EXPECT_EQ( xuser_signed_request( user.get(), "GET", "https://gamesave.example.invalid/containers", nullptr, nullptr, nullptr, 0, &status, &output, &size ), S_OK );
+    EXPECT_EQ(transport.rawCalls,2u);EXPECT_EQ(status,200u);ASSERT_NE(output,nullptr);free(output);
+}
+TEST( NexusSignedRequestRetry, XstsCallerPropagatesTerminalFailureWithoutRetrying )
+{
+    Apartment apartment; SyntheticTransport transport; auto user=CreateUser(transport);
+    ASSERT_EQ(user->InitializeNetwork(XUserAddOptions::AddDefaultUserSilently),S_OK);
+    user->initDone=1;user->initResult=S_OK;
+    transport.signedRetryFixture=true;transport.signedRetryResult=E_ABORT;transport.rawCalls=0;
+    WCHAR *authorization=nullptr;
+    EXPECT_EQ(user->GetAuthorization(L"https://service.example.invalid/",&authorization),E_ABORT);
+    EXPECT_EQ(transport.rawCalls,1u);EXPECT_EQ(authorization,nullptr);free(authorization);
 }

@@ -37,7 +37,11 @@ const silentOverlapCases=['SilentStartsIndependentPhasesButPublishesOnlyAfterBot
 const silentOverlapPassed=silentOverlapCases.every(name=>new RegExp('\\[\\s*OK\\s*\\]\\s+NexusSilentAuthOverlap\\.'+name+'(?:\\s|$)').test(output));
 const pictureCancellationCases=['HeldProfileReplyCannotStartImageAfterCancellation','HeldAuthorizationAndImageCancellationRemainRequestLocal'];
 const pictureCancellationPassed=pictureCancellationCases.every(name=>new RegExp('\\[\\s*OK\\s*\\]\\s+NexusPictureCancellation\\.'+name+'(?:\\s|$)').test(output));
+const signedRetryCases=['TerminalTransportErrorsDoNotRepeatSignedRequests','GenericAndAccessDeniedTransportFailuresKeepThreeAttempts','HttpServerErrorsRetainRetriesAndReleaseBodies','XstsCallerPropagatesTerminalFailureWithoutRetrying'];
+const signedRetryPassed=signedRetryCases.every(name=>new RegExp('\\[\\s*OK\\s*\\]\\s+NexusSignedRequestRetry\\.'+name+'(?:\\s|$)').test(output));
 const proof={scope:'C++ authentication implementation, synthetic transport only',engine,engineHash:engine==='wine'?null:hash(engine),exeHash:before,unchanged:hash(exe)===before,status:result.status,signal:result.signal,error:result.error?.message,checks:match?Number(match[1]):0,realAccounts:false,realCloud:false,fullRuntime:false,passed:result.status===0&&!result.error&&!!match&&Number(match[1])>=27&&!/\[\s*(FAILED|SKIPPED)\s*\]/.test(output)};
+proof.signedRetryCases=signedRetryCases.length;proof.signedRetryPassed=signedRetryPassed;
+if(!signedRetryPassed)proof.passed=false;
 proof.cancellationCases=cancellationCases.length;proof.cancellationPassed=cancellationPassed;
 if(!cancellationPassed)proof.passed=false;
 proof.authorizationCacheCases=authorizationCacheCases.length;proof.authorizationCachePassed=authorizationCachePassed;
