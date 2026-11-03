@@ -1089,6 +1089,16 @@ struct UserNetworkInit
     XUserAddContext *context;
     IXThreadingImpl *threading;
 };
+// These results require the caller to correct its request/configuration or
+// release resources, or explicitly cancel the operation. Restarting the whole
+// handshake cannot repair them. Remote/transport/authentication failures retain
+// the existing bounded retry policy; no failure is cached across XUserAdd calls.
+static bool sign_in_retryable( HRESULT result ) noexcept
+{
+    return result != E_ABORT && result != E_INVALIDARG && result != E_OUTOFMEMORY &&
+           result != E_GAME_MISSING_GAME_CONFIG;
+}
+
 static DWORD WINAPI UserNetworkInitThread( void *arg )
 {
     auto init = static_cast<UserNetworkInit *>( arg );
@@ -1105,7 +1115,7 @@ static DWORD WINAPI UserNetworkInitThread( void *arg )
         auth_metadata( "init-attempt-begin", user, E_PENDING, 0, FALSE, FALSE );
         hr = user->InitializeNetwork( context->options );
         auth_metadata( "init-attempt-end", user, hr, 0, FALSE, FALSE );
-        if ( SUCCEEDED( hr ) || user->cancelled ) break;
+        if ( SUCCEEDED( hr ) || user->cancelled || !sign_in_retryable( hr ) ) break;
         /* An unreachable Microsoft on an offline-licensed launch is not a
          * start race: the cached identity takes over without the retry waits. */
         if ( nexus::user::IsConnectivityFailure( hr ) &&

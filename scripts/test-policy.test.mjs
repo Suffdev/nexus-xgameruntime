@@ -540,3 +540,9 @@ test('sign-in HTTP cancellation retains synchronous ownership and stops later wo
     assert.ok(read('scripts/test-authentication.mjs').includes("'"+name+"'"));
     assert.equal([...read('src/System/XUser.cpp').matchAll(/user->transport\.HttpCancellable\(/g)].length,4);
 });
+
+test('native authentication gate requires production cold-path and terminal-retry regressions',()=>{
+    for(const name of ['SuccessfulColdHandshakeAndWarmAuthorizationRemainSeparate','TerminalLocalErrorsDoNotRepeatTheHandshakeOrRetryWait'])
+        assert.ok(read('scripts/test-authentication.mjs').includes("'"+name+"'"));
+    assert.ok(read('scripts/test-authentication.mjs').includes('if(!criticalPathPassed)proof.passed=false;'));
+});

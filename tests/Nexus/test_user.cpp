@@ -50,10 +50,13 @@ public:
     std::string notAfter;
     unsigned defaultFailures = 0, retryMilliseconds = 0, retryCalls = 0;
     bool unreachable = false;
+    DWORD phaseDelayMs = 0, retrySliceDelayMs = 0;
+    HRESULT measuredSisuFailure = S_OK;
     void WaitForSignInRetry( DWORD milliseconds ) noexcept override
     {
         retryMilliseconds += milliseconds;
         ++retryCalls;
+        if ( retrySliceDelayMs ) Sleep( retrySliceDelayMs );
     }
     bool currentFails = false, titleToken = true;
     std::string currentEndpoints = Endpoints();
@@ -98,6 +101,7 @@ public:
     HRESULT Backend( UINT16 type, const char *body, UINT16 size, char **response, UINT16 *length ) override
     {
         ++backendCalls;
+        if ( phaseDelayMs ) Sleep( phaseDelayMs );
         if ( blockBackend )
         {
             SetEvent( backendEntered );
@@ -142,6 +146,7 @@ public:
                   SIZE_T *length ) override
     {
         ++httpCalls;
+        if ( phaseDelayMs ) Sleep( phaseDelayMs );
         *output = nullptr;
         *length = 0;
         if ( blockedHttpStage && httpCalls == blockedHttpStage )
@@ -163,6 +168,7 @@ public:
             return Reply( R"({"Token":"synthetic-device-token"})", output, length );
         if ( !wcscmp( url, L"https://sisu.xboxlive.com/authorize" ) && !wcscmp( method, L"POST" ) )
         {
+            if ( FAILED( measuredSisuFailure ) ) return measuredSisuFailure;
             std::string response = R"({"UserToken":{"Token":"synthetic-user-token"},)";
             if ( titleToken ) response += R"("TitleToken":{"Token":"synthetic-title-token"},)";
             response += R"("AuthorizationToken":{"Token":"synthetic-authorization","DisplayClaims":{"xui":[{"xid":")" +
@@ -1720,4 +1726,73 @@ TEST( NexusAuthorizationCache, DelayedWaiterDoesNotReceiveAnExpiredToken )
     release.set_value();
     EXPECT_EQ( owner.get(), S_OK );
     EXPECT_EQ( waiter.get(), HRESULT_FROM_WIN32( ERROR_RETRY ) );
+}
+
+
+TEST( NexusAuthCriticalPath, SuccessfulColdHandshakeAndWarmAuthorizationRemainSeparate )
+{
+    Apartment apartment;
+    SyntheticTransport transport;
+    transport.phaseDelayMs = 20;
+    transport.notAfter = FutureAuthorizationExpiry();
+    XUserImpl api( transport );
+    IXThreadingImpl *threads = nullptr;
+    ASSERT_EQ( QueryApiImpl( CLSID_XThreadingImpl, __uuidof( IXThreadingImpl ), reinterpret_cast<void **>( &threads ) ), S_OK );
+    XTaskQueueHandle queue = nullptr;
+    ASSERT_EQ( threads->XTaskQueueCreate( XTaskQueueDispatchMode::ThreadPool, XTaskQueueDispatchMode::Manual, &queue ), S_OK );
+    XAsyncBlock block{}; block.queue = queue;
+    unsigned completions = 0; block.context = &completions;
+    block.callback = []( XAsyncBlock *b ) WINAPI { ++*static_cast<unsigned *>( b->context ); };
+    const auto started = GetTickCount64();
+    ASSERT_EQ( api.XUserAddAsync( XUserAddOptions::AddDefaultUserSilently, &block ), S_OK );
+    ASSERT_TRUE( threads->XTaskQueueDispatch( queue, XTaskQueuePort::Completion, 5000 ) );
+    const auto coldMs = GetTickCount64() - started;
+    XUserHandle user = nullptr;
+    ASSERT_EQ( api.XUserAddResult( &block, &user ), S_OK );
+    ASSERT_NE( user, nullptr );
+    ASSERT_EQ( WaitForUserSignInWorkers( 5000 ), S_OK );
+    EXPECT_EQ( completions, 1u ); EXPECT_EQ( transport.httpCalls, 4u ); EXPECT_EQ( transport.backendCalls, 1u );
+    EXPECT_EQ( transport.retryMilliseconds, 0u ); EXPECT_EQ( transport.rawCalls, 0u );
+    const auto warmStart = GetTickCount64();
+    for ( unsigned i = 0; i < 20; ++i )
+    {
+        WCHAR *auth = nullptr; ASSERT_EQ( user->GetAuthorization( L"https://service.example.invalid/", &auth ), S_OK );
+        ASSERT_NE( auth, nullptr ); free( auth );
+    }
+    EXPECT_EQ( transport.rawCalls, 1u );
+    printf( "AUTH_MEASURE cold_ms=%llu http=%u backend=%u warm20_ms=%llu xsts=%u completions=%u\n",
+            coldMs, transport.httpCalls, transport.backendCalls, GetTickCount64() - warmStart,
+            transport.rawCalls.load(), completions );
+    user->Release(); threads->XTaskQueueCloseHandle( queue ); threads->Release();
+}
+
+TEST( NexusAuthCriticalPath, TerminalLocalErrorsDoNotRepeatTheHandshakeOrRetryWait )
+{
+    Apartment apartment;
+    for ( HRESULT failure : { E_ABORT, E_INVALIDARG, E_OUTOFMEMORY, E_GAME_MISSING_GAME_CONFIG } )
+    {
+        SyntheticTransport transport;
+        transport.phaseDelayMs = 10; transport.retrySliceDelayMs = 2;
+        transport.measuredSisuFailure = failure;
+        XUserImpl api( transport );
+        IXThreadingImpl *threads = nullptr;
+        ASSERT_EQ( QueryApiImpl( CLSID_XThreadingImpl, __uuidof( IXThreadingImpl ), reinterpret_cast<void **>( &threads ) ), S_OK );
+        XTaskQueueHandle queue = nullptr;
+        ASSERT_EQ( threads->XTaskQueueCreate( XTaskQueueDispatchMode::ThreadPool, XTaskQueueDispatchMode::Manual, &queue ), S_OK );
+        XAsyncBlock block{}; block.queue = queue;
+        unsigned completions = 0; block.context = &completions;
+        block.callback = []( XAsyncBlock *b ) WINAPI { ++*static_cast<unsigned *>( b->context ); };
+        const auto started = GetTickCount64();
+        ASSERT_EQ( api.XUserAddAsync( XUserAddOptions::AddDefaultUserSilently, &block ), S_OK );
+        ASSERT_TRUE( threads->XTaskQueueDispatch( queue, XTaskQueuePort::Completion, 5000 ) );
+        EXPECT_EQ( threads->XAsyncGetStatus( &block, TRUE ), failure );
+        XUserHandle user = nullptr; EXPECT_EQ( api.XUserAddResult( &block, &user ), failure ); EXPECT_EQ( user, nullptr );
+        ASSERT_EQ( WaitForUserSignInWorkers( 5000 ), S_OK );
+        printf( "AUTH_MEASURE terminal_hr=%08lx elapsed_ms=%llu http=%u backend=%u planned_retry_ms=%u retry_slices=%u completions=%u\n",
+                static_cast<unsigned long>( failure ), GetTickCount64() - started, transport.httpCalls,
+                transport.backendCalls, transport.retryMilliseconds, transport.retryCalls, completions );
+        EXPECT_EQ( transport.httpCalls, 3u ); EXPECT_EQ( transport.backendCalls, 1u );
+        EXPECT_EQ( transport.retryMilliseconds, 0u ); EXPECT_EQ( completions, 1u ); EXPECT_EQ( transport.unexpected, 0u );
+        threads->XTaskQueueCloseHandle( queue ); threads->Release();
+    }
 }
