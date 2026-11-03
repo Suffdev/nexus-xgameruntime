@@ -329,7 +329,8 @@ void xodus_store_license_note( const char *phase, HRESULT hr )
     auth_metadata( phase, NULL, hr, 0, FALSE, FALSE );
 }
 
-HRESULT xodus_store_license_xml( const char *request, SIZE_T request_size, char **token )
+HRESULT xodus_store_license_xml( const char *request, SIZE_T request_size, char **token,
+                                LONG *canceled, ULONGLONG entitlement_deadline )
 {
     char *response = NULL, *code = NULL, *end;
     UINT16 response_size = 0;
@@ -337,12 +338,20 @@ HRESULT xodus_store_license_xml( const char *request, SIZE_T request_size, char 
     xmlNodePtr root;
     HRESULT hr;
     unsigned long value;
+    DWORD timeout = 95000;
 
     *token = NULL;
-    if ( request_size > 0xffff ) return E_INVALIDARG;
+    if ( request_size > 0xffff || ( !request && request_size ) ) return E_INVALIDARG;
+    if ( canceled && InterlockedCompareExchange( canceled, 0, 0 ) ) return E_ABORT;
+    if ( entitlement_deadline )
+    {
+        const auto now = GetTickCount64();
+        if ( now >= entitlement_deadline ) return HRESULT_FROM_WIN32( ERROR_TIMEOUT );
+        timeout = static_cast<DWORD>( std::min<ULONGLONG>( timeout, entitlement_deadline - now ) );
+    }
     /* Request 5 returns only a genuine Microsoft licensing token, request 6.
      * Older services cannot provide it and must fail, never fabricate success. */
-    if ( FAILED( hr = xodus_request( 5, request, request_size, &response, &response_size ) ) ) goto cleanup;
+    if ( FAILED( hr = xodus_request_with_shared_cancellation( 5, request, request_size, &response, &response_size, timeout, nullptr, canceled ) ) ) goto cleanup;
     if ( !( doc = xmlReadMemory( response, response_size, NULL, NULL, XML_PARSE_NONET ) ) )
     {
         hr = E_UNEXPECTED;
@@ -382,6 +391,12 @@ cleanup:
     }
     free( code );
     return hr;
+}
+
+// Direct token queries retain their original IPC budget and behavior.
+HRESULT xodus_store_license_xml( const char *request, SIZE_T request_size, char **token )
+{
+    return xodus_store_license_xml( request, request_size, token, nullptr, 0 );
 }
 
 #include "User/Tickets.h"

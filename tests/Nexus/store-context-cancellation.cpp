@@ -41,6 +41,10 @@ HRESULT xodus_store_license_xml(const char *, SIZE_T, char **out)
     if (SUCCEEDED(bridge_hr)) *out = strdup(bridge_jwt.c_str());
     return bridge_hr;
 }
+HRESULT xodus_store_license_xml(const char *request, SIZE_T size, char **out, LONG *, ULONGLONG)
+{
+    return xodus_store_license_xml(request, size, out);
+}
 void xodus_store_license_note(const char *phase, HRESULT hr)
 {
     if (!strcmp(phase, "store-entitled-result")) { worker_hr = hr; SetEvent(worker_result); }

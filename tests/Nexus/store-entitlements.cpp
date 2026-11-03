@@ -60,6 +60,10 @@ HRESULT xodus_store_license_xml( const char *request, SIZE_T size, char **out )
     InterlockedDecrement( &bridge_active );
     return E_FAIL;
 }
+HRESULT xodus_store_license_xml(const char *request, SIZE_T size, char **out, LONG *, ULONGLONG)
+{
+    return xodus_store_license_xml(request, size, out);
+}
 static const char *GetStoreProductId()
 {
     return storeId;

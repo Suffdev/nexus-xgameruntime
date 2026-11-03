@@ -188,7 +188,7 @@ if(NEXUS_MIGRATION_PROBES)
     endforeach()
 endif()
 
-foreach(probe store-entitlements package-content store-context-cancellation)
+foreach(probe store-entitlements package-content store-context-cancellation receipt-ipc)
     add_executable(nexus_${probe} Nexus/${probe}.cpp)
     add_dependencies(nexus_${probe} xgameruntime-idl)
     target_include_directories(nexus_${probe} PRIVATE "${IDL_BINARY_DIR}" "${PROJECT_SOURCE_DIR}/include")
@@ -198,6 +198,13 @@ foreach(probe store-entitlements package-content store-context-cancellation)
     set_target_properties(nexus_${probe} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 endforeach()
 target_link_libraries(nexus_package-content PRIVATE xgameruntime-impl)
+# Compile the real licensing helper against a fixture-only monotonic clock.
+# Its normal production object is never compiled with this forced include.
+target_sources(nexus_receipt-ipc PRIVATE "${PROJECT_SOURCE_DIR}/src/System/XUser.cpp")
+target_link_libraries(nexus_receipt-ipc PRIVATE xgameruntime-impl)
+target_compile_options(nexus_receipt-ipc PRIVATE -ffunction-sections -fdata-sections
+    -include "${CMAKE_CURRENT_SOURCE_DIR}/Nexus/receipt-ipc-clock.h")
+target_link_options(nexus_receipt-ipc PRIVATE -Wl,--gc-sections)
 
 add_executable(nexus_package-installed Nexus/package-installed.cpp)
 add_dependencies(nexus_package-installed xgameruntime-idl)

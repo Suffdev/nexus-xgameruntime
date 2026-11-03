@@ -46,10 +46,15 @@ class backend_deadline
     ULONGLONG started = GetTickCount64();
     DWORD budget;
     const std::atomic<bool> *cancel;
+    LONG *shared_cancel;
 public:
-    explicit backend_deadline( DWORD milliseconds, const std::atomic<bool> *cancellation = nullptr )
-        : budget( milliseconds ), cancel( cancellation ) {}
-    BOOL canceled() const { return cancel && cancel->load( std::memory_order_acquire ); }
+    explicit backend_deadline( DWORD milliseconds, const std::atomic<bool> *cancellation = nullptr, LONG *sharedCancellation = nullptr )
+        : budget( milliseconds ), cancel( cancellation ), shared_cancel( sharedCancellation ) {}
+    BOOL canceled() const
+    {
+        return ( cancel && cancel->load( std::memory_order_acquire ) ) ||
+               ( shared_cancel && InterlockedCompareExchange( shared_cancel, 0, 0 ) );
+    }
     BOOL wait( SOCKET socket, bool writing, bool connecting = false ) const
     {
         for ( ;; )
@@ -60,7 +65,7 @@ public:
             DWORD remaining = budget - static_cast<DWORD>( elapsed );
             // A request-local view, retained by its worker, interrupts readiness
             // without cross-thread socket closure or restarting the total budget.
-            if ( cancel && remaining > 50 ) remaining = 50;
+            if ( ( cancel || shared_cancel ) && remaining > 50 ) remaining = 50;
             timeval timeout = { static_cast<long>( remaining / 1000 ), static_cast<long>( remaining % 1000 * 1000 ) };
             fd_set ready, errors;
             FD_ZERO( &ready ); FD_SET( socket, &ready );
@@ -74,7 +79,7 @@ public:
             }
             if ( !result )
             {
-                if ( cancel ) continue;
+                if ( cancel || shared_cancel ) continue;
                 WSASetLastError( WSAETIMEDOUT ); return FALSE;
             }
             if ( canceled() ) { WSASetLastError( WSA_OPERATION_ABORTED ); return FALSE; }
@@ -129,8 +134,8 @@ static BOOL xodus_recv( SOCKET socket, char *data, int size, const backend_deadl
     return TRUE;
 }
 
-static HRESULT xodus_request( UINT16 type, const char *body, UINT16 size, char **response, UINT16 *responseSize, DWORD timeoutMilliseconds = 95000,
-                               const std::atomic<bool> *cancellation = nullptr )
+static HRESULT xodus_request_with_shared_cancellation( UINT16 type, const char *body, UINT16 size, char **response, UINT16 *responseSize, DWORD timeoutMilliseconds,
+                                                       const std::atomic<bool> *cancellation, LONG *sharedCancellation )
 {
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
     UINT32 magic = XODUS_XML_MAGIC;
@@ -148,7 +153,7 @@ static HRESULT xodus_request( UINT16 type, const char *body, UINT16 size, char *
     if ( !response || !responseSize || ( !body && size ) ) return E_INVALIDARG;
     *response = NULL;
     *responseSize = 0;
-    backend_deadline deadline( timeoutMilliseconds, cancellation );
+    backend_deadline deadline( timeoutMilliseconds, cancellation, sharedCancellation );
     if ( deadline.canceled() ) return E_ABORT;
 
     portLen = GetEnvironmentVariableA( "XODUS_BRIDGE_PORT", bridgePort, sizeof( bridgePort ) );
@@ -223,3 +228,11 @@ done:
     return hr;
 }
 
+
+// Preserve the existing typed entrypoint for atomic-cancellation callers.
+static HRESULT xodus_request( UINT16 type, const char *body, UINT16 size, char **response, UINT16 *responseSize,
+                               DWORD timeoutMilliseconds = 95000, const std::atomic<bool> *cancellation = nullptr )
+{
+    return xodus_request_with_shared_cancellation( type, body, size, response, responseSize,
+                                                   timeoutMilliseconds, cancellation, nullptr );
+}

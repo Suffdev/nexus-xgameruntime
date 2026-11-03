@@ -643,7 +643,7 @@ static HRESULT entitled_fetch( const char *request, LONG *canceled, struct entit
             sprintf( nonce + j * 2, "%02x", random[j] );
         hr = xodus_store_license_body( ( const char ** )&ids[batch], std::min<UINT32>( 64, count - batch ), nonce,
                                        &body );
-        if ( SUCCEEDED( hr ) ) hr = xodus_store_license_xml( body, strlen( body ), &jwt );
+        if ( SUCCEEDED( hr ) ) hr = xodus_store_license_xml( body, strlen( body ), &jwt, canceled, deadline );
         free( body );
         if ( SUCCEEDED( hr ) && InterlockedCompareExchange( canceled, 0, 0 ) ) hr = E_ABORT;
         if ( SUCCEEDED( hr ) ) hr = receipt_load( jwt, nonce, &claim, &token_expiry );

@@ -210,7 +210,7 @@ test('backend framing has a shared total deadline and mandatory stalled transpor
     const source=read('src/System/User/BackendRequest.h');
     assert.match(read('src/System/XUser.cpp'),/#include "User\/BackendRequest.h"/);
     assert.match(source,/DWORD timeoutMilliseconds = 95000/);
-    assert.match(source,/backend_deadline deadline\( timeoutMilliseconds, cancellation \)/);
+    assert.match(source,/backend_deadline deadline\( timeoutMilliseconds, cancellation, sharedCancellation \)/);
     assert.doesNotMatch(source,/type == 5|SO_RCVTIMEO|SO_SNDTIMEO/);
     assert.match(read('scripts/test-component.mjs'),/\['nexus_backend-request', 356\]/);
     const fixture=read('tests/Nexus/backend-request.cpp');
