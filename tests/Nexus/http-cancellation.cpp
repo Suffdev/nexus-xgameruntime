@@ -22,6 +22,8 @@ static BOOL WINAPI fake_close( HINTERNET );
 static void WINAPI fake_sleep( DWORD );
 static void *tracked_realloc( void *, size_t );
 static void tracked_free( void * );
+static FARPROC WINAPI no_private_abort(HMODULE,LPCSTR) { return nullptr; }
+#define GetProcAddress no_private_abort // deterministic older-Wine cooperative fallback fixture
 #define WinHttpCrackUrl fake_crack
 #define WinHttpOpen fake_open
 #define WinHttpConnect fake_connect
@@ -36,6 +38,7 @@ static void tracked_free( void * );
 #define realloc tracked_realloc
 #define free tracked_free
 #include "../../src/HttpClient.cpp"
+#undef GetProcAddress
 #undef WinHttpCrackUrl
 #undef WinHttpOpen
 #undef WinHttpConnect

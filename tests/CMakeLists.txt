@@ -1,4 +1,4 @@
-foreach(probe IN ITEMS auth-rejection-metadata token-endpoint store-public-fetch backend-request backend-cancellation http-cancellation)
+foreach(probe IN ITEMS auth-rejection-metadata token-endpoint store-public-fetch backend-request backend-cancellation http-cancellation http-cancellation-monitor)
     add_executable(nexus_${probe} Nexus/${probe}.cpp)
     add_dependencies(nexus_${probe} xgameruntime-idl)
     target_include_directories(nexus_${probe} PRIVATE "${IDL_BINARY_DIR}" "${PROJECT_SOURCE_DIR}/include")
@@ -290,3 +290,12 @@ target_link_libraries(nexus_taskqueue-composite-waiters PRIVATE
 target_link_options(nexus_taskqueue-composite-waiters PRIVATE -static -static-libgcc -static-libstdc++)
 set_target_properties(nexus_taskqueue-composite-waiters PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
+# Explicit native Wine/XGR contract probe; not part of the portable shim gate.
+add_executable(nexus_http-native-cancellation Nexus/http-native-cancellation.cpp)
+add_dependencies(nexus_http-native-cancellation xgameruntime-idl)
+target_include_directories(nexus_http-native-cancellation PRIVATE "${IDL_BINARY_DIR}" "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(nexus_http-native-cancellation PRIVATE xgameruntime-common winhttp ws2_32 runtimeobject ole32)
+target_compile_features(nexus_http-native-cancellation PRIVATE cxx_std_23)
+target_link_options(nexus_http-native-cancellation PRIVATE -static -static-libgcc -static-libstdc++)
+set_target_properties(nexus_http-native-cancellation PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")

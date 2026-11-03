@@ -19,6 +19,7 @@
 #include "private.h"
 #include "HttpClient.h"
 #include <winhttp.h>
+#include "HttpCancellation.h"
 
 static const WCHAR USER_AGENT[] = L"curl/1.0";
 
@@ -85,6 +86,7 @@ static HRESULT http_request_once( const WCHAR *method, const WCHAR *url, char *d
     WCHAR *hostName = NULL;
     UCHAR *tmpBuffer = NULL;
     HRESULT hr = S_OK;
+    HttpCancellationMonitor cancellation;
 
     if ( http_canceled( cancel ) ) { hr = E_ABORT; goto cleanup; }
     if ( !WinHttpCrackUrl( url, 0, 0, &uc ) ) goto error;
@@ -106,6 +108,7 @@ static HRESULT http_request_once( const WCHAR *method, const WCHAR *url, char *d
     if ( !( request = WinHttpOpenRequest( connection, method, uc.lpszUrlPath, NULL, WINHTTP_NO_REFERER, accept,
                                           WINHTTP_FLAG_SECURE ) ) )
         goto error;
+    if ( FAILED( hr = cancellation.start( request, cancel ) ) ) goto cleanup;
     if ( http_canceled( cancel ) ) { hr = E_ABORT; goto cleanup; }
     if ( !WinHttpSendRequest( request, headers ? headers : WINHTTP_NO_ADDITIONAL_HEADERS, headers ? -1 : 0, data,
                               ( data ? strlen( data ) : 0 ), ( data ? strlen( data ) : 0 ), 0 ) )
@@ -151,8 +154,9 @@ static HRESULT http_request_once( const WCHAR *method, const WCHAR *url, char *d
 error:
     hr = HRESULT_FROM_WIN32( GetLastError() );
 cleanup:
-    if ( connection ) WinHttpCloseHandle( connection );
+    cancellation.join();
     if ( request ) WinHttpCloseHandle( request );
+    if ( connection ) WinHttpCloseHandle( connection );
     if ( session ) WinHttpCloseHandle( session );
     if ( hostName ) free( hostName );
     if ( http_canceled( cancel ) ) hr = E_ABORT;
