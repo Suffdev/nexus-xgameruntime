@@ -51,7 +51,15 @@ public:
     unsigned defaultFailures = 0, retryMilliseconds = 0, retryCalls = 0;
     bool unreachable = false;
     DWORD phaseDelayMs = 0, retrySliceDelayMs = 0;
-    HRESULT measuredSisuFailure = S_OK;
+    HRESULT measuredSisuFailure = S_OK, backendFailure = S_OK;
+    bool allowUiObserved = false, failSilentTicketThread = false;
+    std::atomic<bool> *cancelOnTicketThreadStart = nullptr;
+    HANDLE StartSilentTicketThread( LPTHREAD_START_ROUTINE work, void *context ) override
+    {
+        if ( cancelOnTicketThreadStart ) *cancelOnTicketThreadStart = true;
+        if ( failSilentTicketThread ) { SetLastError( ERROR_NOT_ENOUGH_MEMORY ); return nullptr; }
+        return UserTransport::StartSilentTicketThread( work, context );
+    }
     void WaitForSignInRetry( DWORD milliseconds ) noexcept override
     {
         retryMilliseconds += milliseconds;
@@ -132,6 +140,8 @@ public:
     }
     HRESULT BackendReply( UINT16 type, const char *body, UINT16 size, char **response, UINT16 *length )
     {
+        allowUiObserved = body && strstr( body, "<AllowUi>true</AllowUi>" );
+        if ( FAILED( backendFailure ) ) return backendFailure;
         if ( type != 3 || !body || !size || !strstr( body, "<MSATokenRequest>" ) )
         {
             ++unexpected;
@@ -789,7 +799,10 @@ TEST( NexusAuthentication, SignInHttpCancellationRetainsHeldCallAndStopsEveryLat
         EXPECT_EQ( state.callbacks, 2u ); // one abort, one new operation on the reused block
         EXPECT_EQ( WaitForUserSignInWorkers( 0 ), HRESULT_FROM_WIN32( ERROR_TIMEOUT ) );
         SetEvent( transport.httpContinue ); EXPECT_EQ( WaitForUserSignInWorkers( 3000 ), S_OK );
-        EXPECT_EQ( transport.httpCalls, stage ); EXPECT_EQ( transport.backendCalls, stage == 1 ? 0u : 1u );
+        EXPECT_EQ( transport.httpCalls, stage );
+        // Silent tickets may already have started alongside the first GET.
+        if ( stage == 1 ) EXPECT_LE( transport.backendCalls, 1u );
+        else EXPECT_EQ( transport.backendCalls, 1u );
         EXPECT_EQ( transport.rawCalls, 0u ); EXPECT_EQ( transport.unexpected, 0u );
         threads->XTaskQueueCloseHandle( queue ); threads->Release();
     }
@@ -1211,7 +1224,10 @@ TEST( NexusAuthentication, SignInRetryKeepsFiveAttemptBoundAndNumericDiagnostics
             EXPECT_EQ( WaitForUserSignInWorkers( 5000 ), S_OK );
             EXPECT_EQ( transport.retryMilliseconds, failures == 2 ? 6000u : 12000u );
             EXPECT_EQ( transport.retryCalls, failures == 2 ? 60u : 120u );
-            EXPECT_EQ( transport.backendCalls, failures == 2 ? 1u : 0u );
+            // A canceled child may finish a silent refresh on an otherwise
+            // failed attempt; never more than one ticket request per attempt.
+            EXPECT_LE( transport.backendCalls, failures == 2 ? 3u : 5u );
+            if ( failures == 2 ) EXPECT_GE( transport.backendCalls, 1u );
             EXPECT_EQ( transport.unexpected, 0u );
             auto file = CreateFileA( log, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
                                      FILE_ATTRIBUTE_NORMAL, nullptr );
@@ -1795,4 +1811,155 @@ TEST( NexusAuthCriticalPath, TerminalLocalErrorsDoNotRepeatTheHandshakeOrRetryWa
         EXPECT_EQ( transport.retryMilliseconds, 0u ); EXPECT_EQ( completions, 1u ); EXPECT_EQ( transport.unexpected, 0u );
         threads->XTaskQueueCloseHandle( queue ); threads->Release();
     }
+}
+
+
+TEST( NexusSilentAuthOverlap, SilentStartsIndependentPhasesButPublishesOnlyAfterBoth )
+{
+    Apartment apartment; SyntheticTransport transport;
+    transport.blockedHttpStage = 1; transport.blockBackend = true;
+    auto user = CreateUser( transport );
+    auto work = std::async( std::launch::async, [&] { Apartment com; return user->InitializeNetwork( XUserAddOptions::AddDefaultUserSilently ); } );
+    EXPECT_EQ( WaitForSingleObject( transport.httpEntered, 1000 ), WAIT_OBJECT_0 );
+    EXPECT_EQ( WaitForSingleObject( transport.backendEntered, 1000 ), WAIT_OBJECT_0 );
+    EXPECT_EQ( work.wait_for( std::chrono::milliseconds( 20 ) ), std::future_status::timeout );
+    SetEvent( transport.httpContinue );
+    EXPECT_EQ( work.wait_for( std::chrono::milliseconds( 20 ) ), std::future_status::timeout );
+    SetEvent( transport.backendContinue );
+    ASSERT_EQ( work.wait_for( std::chrono::seconds( 5 ) ), std::future_status::ready );
+    EXPECT_EQ( work.get(), S_OK ); EXPECT_EQ( transport.httpCalls, 4u ); EXPECT_EQ( transport.backendCalls, 1u );
+    EXPECT_FALSE( transport.allowUiObserved ); EXPECT_EQ( user->ref, 1 );
+}
+
+TEST( NexusSilentAuthOverlap, AllowingUiKeepsOrderedDiscoveryBeforeTickets )
+{
+    Apartment apartment; SyntheticTransport transport;
+    transport.blockedHttpStage = 1; transport.blockBackend = true;
+    auto user = CreateUser( transport );
+    auto work = std::async( std::launch::async, [&] { Apartment com; return user->InitializeNetwork( XUserAddOptions::AddDefaultUserAllowingUI ); } );
+    EXPECT_EQ( WaitForSingleObject( transport.httpEntered, 1000 ), WAIT_OBJECT_0 );
+    EXPECT_EQ( WaitForSingleObject( transport.backendEntered, 50 ), WAIT_TIMEOUT );
+    SetEvent( transport.httpContinue );
+    EXPECT_EQ( WaitForSingleObject( transport.backendEntered, 1000 ), WAIT_OBJECT_0 );
+    SetEvent( transport.backendContinue );
+    ASSERT_EQ( work.wait_for( std::chrono::seconds( 5 ) ), std::future_status::ready );
+    EXPECT_EQ( work.get(), S_OK ); EXPECT_TRUE( transport.allowUiObserved ); EXPECT_EQ( user->ref, 1 );
+}
+
+TEST( NexusSilentAuthOverlap, DefaultFailureCancelsChildAndRetainsItsOwnError )
+{
+    Apartment apartment; SyntheticTransport transport;
+    transport.blockedHttpStage = 1; transport.defaultFailures = 1;
+    transport.blockBackend = true; transport.cooperativeBackend = true;
+    auto user = CreateUser( transport );
+    auto work = std::async( std::launch::async, [&] { Apartment com; return user->InitializeNetwork( XUserAddOptions::AddDefaultUserSilently ); } );
+    EXPECT_EQ( WaitForSingleObject( transport.httpEntered, 1000 ), WAIT_OBJECT_0 );
+    EXPECT_EQ( WaitForSingleObject( transport.backendEntered, 1000 ), WAIT_OBJECT_0 );
+    SetEvent( transport.httpContinue );
+    const auto ready = work.wait_for( std::chrono::seconds( 2 ) );
+    SetEvent( transport.backendContinue ); // Also drains a failed fixture safely.
+    ASSERT_EQ( ready, std::future_status::ready ); EXPECT_EQ( work.get(), E_ACCESSDENIED );
+    EXPECT_FALSE( user->cancelled ); EXPECT_EQ( user->xuid, 0u ); EXPECT_EQ( user->xbox_msa_id[0], 0 );
+    EXPECT_EQ( transport.httpCalls, 1u ); EXPECT_EQ( user->ref, 1 );
+}
+
+TEST( NexusSilentAuthOverlap, ParentCancellationWhileWaitingTicketsDrainsChild )
+{
+    Apartment apartment; SyntheticTransport transport;
+    transport.blockBackend = true; transport.cooperativeBackend = true;
+    auto user = CreateUser( transport );
+    auto work = std::async( std::launch::async, [&] { Apartment com; return user->InitializeNetwork( XUserAddOptions::AddDefaultUserSilently ); } );
+    EXPECT_EQ( WaitForSingleObject( transport.backendEntered, 1000 ), WAIT_OBJECT_0 );
+    user->cancelled = true;
+    const auto ready = work.wait_for( std::chrono::seconds( 2 ) ); SetEvent( transport.backendContinue );
+    ASSERT_EQ( ready, std::future_status::ready ); EXPECT_EQ( work.get(), E_ABORT );
+    EXPECT_EQ( transport.httpCalls, 1u ); EXPECT_EQ( user->xuid, 0u ); EXPECT_EQ( user->ref, 1 );
+}
+
+TEST( NexusSilentAuthOverlap, LateLegacyReplyIsJoinedAndNeverPublishedAfterDefaultFailure )
+{
+    Apartment apartment; SyntheticTransport transport;
+    transport.blockedHttpStage = 1; transport.defaultFailures = 1; transport.blockBackend = true;
+    auto user = CreateUser( transport );
+    auto work = std::async( std::launch::async, [&] { Apartment com; return user->InitializeNetwork( XUserAddOptions::AddDefaultUserSilently ); } );
+    EXPECT_EQ( WaitForSingleObject( transport.httpEntered, 1000 ), WAIT_OBJECT_0 );
+    EXPECT_EQ( WaitForSingleObject( transport.backendEntered, 1000 ), WAIT_OBJECT_0 );
+    SetEvent( transport.httpContinue );
+    EXPECT_EQ( work.wait_for( std::chrono::milliseconds( 50 ) ), std::future_status::timeout );
+    EXPECT_EQ( user->xuid, 0u ); EXPECT_EQ( user->ref, 2 );
+    SetEvent( transport.backendContinue );
+    ASSERT_EQ( work.wait_for( std::chrono::seconds( 5 ) ), std::future_status::ready );
+    EXPECT_EQ( work.get(), E_ACCESSDENIED ); EXPECT_FALSE( user->cancelled );
+    EXPECT_EQ( user->xbox_msa_id[0], 0 ); EXPECT_EQ( user->store_msa_id[0], 0 );
+    EXPECT_EQ( transport.httpCalls, 1u ); EXPECT_EQ( user->ref, 1 );
+}
+
+TEST( NexusSilentAuthOverlap, TicketFailureWaitsForDefaultValidationWithoutPublishingIdentity )
+{
+    Apartment apartment; SyntheticTransport transport;
+    transport.blockedHttpStage = 1; transport.backendFailure = E_ABORT;
+    auto user = CreateUser( transport );
+    auto work = std::async( std::launch::async, [&] { Apartment com; return user->InitializeNetwork( XUserAddOptions::AddDefaultUserSilently ); } );
+    EXPECT_EQ( WaitForSingleObject( transport.httpEntered, 1000 ), WAIT_OBJECT_0 );
+    EXPECT_EQ( work.wait_for( std::chrono::milliseconds( 50 ) ), std::future_status::timeout );
+    SetEvent( transport.httpContinue );
+    ASSERT_EQ( work.wait_for( std::chrono::seconds( 5 ) ), std::future_status::ready );
+    EXPECT_EQ( work.get(), E_ABORT ); EXPECT_FALSE( user->cancelled );
+    EXPECT_EQ( transport.httpCalls, 1u ); EXPECT_EQ( transport.backendCalls, 1u );
+    EXPECT_EQ( user->xuid, 0u ); EXPECT_EQ( user->ref, 1 );
+}
+
+
+TEST( NexusSilentAuthOverlap, ThreadStartupFailurePreservesSequentialHandshakeAndReadiness )
+{
+    Apartment apartment; SyntheticTransport transport;
+    transport.failSilentTicketThread = true; transport.blockedHttpStage = 1; transport.blockBackend = true;
+    auto user = CreateUser( transport );
+    auto work = std::async( std::launch::async, [&] { Apartment com; return user->InitializeNetwork( XUserAddOptions::AddDefaultUserSilently ); } );
+    EXPECT_EQ( WaitForSingleObject( transport.httpEntered, 1000 ), WAIT_OBJECT_0 );
+    EXPECT_EQ( WaitForSingleObject( transport.backendEntered, 50 ), WAIT_TIMEOUT );
+    SetEvent( transport.httpContinue );
+    EXPECT_EQ( WaitForSingleObject( transport.backendEntered, 1000 ), WAIT_OBJECT_0 );
+    SetEvent( transport.backendContinue );
+    ASSERT_EQ( work.wait_for( std::chrono::seconds( 5 ) ), std::future_status::ready );
+    EXPECT_EQ( work.get(), S_OK ); EXPECT_FALSE( transport.allowUiObserved );
+    EXPECT_EQ( transport.httpCalls, 4u ); EXPECT_EQ( transport.backendCalls, 1u ); EXPECT_EQ( user->ref, 1 );
+}
+
+TEST( NexusSilentAuthOverlap, CurrentMetadataStillGatesCompletionThenGamertagNeedsNoRequest )
+{
+    Apartment apartment; SyntheticTransport transport; transport.blockedHttpStage = 4;
+    XUserImpl api( transport ); IXThreadingImpl *threads = nullptr;
+    ASSERT_EQ( QueryApiImpl( CLSID_XThreadingImpl, __uuidof( IXThreadingImpl ), reinterpret_cast<void **>( &threads ) ), S_OK );
+    XTaskQueueHandle queue = nullptr;
+    ASSERT_EQ( threads->XTaskQueueCreate( XTaskQueueDispatchMode::ThreadPool, XTaskQueueDispatchMode::Manual, &queue ), S_OK );
+    XAsyncBlock block{}; block.queue = queue;
+    unsigned completions = 0; block.context = &completions;
+    block.callback = []( XAsyncBlock *b ) WINAPI { ++*static_cast<unsigned *>( b->context ); };
+    ASSERT_EQ( api.XUserAddAsync( XUserAddOptions::AddDefaultUserSilently, &block ), S_OK );
+    EXPECT_EQ( WaitForSingleObject( transport.httpEntered, 1000 ), WAIT_OBJECT_0 );
+    EXPECT_EQ( threads->XAsyncGetStatus( &block, FALSE ), E_PENDING );
+    EXPECT_FALSE( threads->XTaskQueueDispatch( queue, XTaskQueuePort::Completion, 0 ) );
+    EXPECT_EQ( completions, 0u ); SetEvent( transport.httpContinue );
+    ASSERT_TRUE( threads->XTaskQueueDispatch( queue, XTaskQueuePort::Completion, 5000 ) );
+    XUserHandle user = nullptr; ASSERT_EQ( api.XUserAddResult( &block, &user ), S_OK );
+    ASSERT_EQ( WaitForUserSignInWorkers( 5000 ), S_OK );
+    const auto http = transport.httpCalls, backend = transport.backendCalls, raw = transport.rawCalls.load();
+    char gamertag[32]{}; SIZE_T used = 0; const auto started = GetTickCount64();
+    EXPECT_EQ( api.XUserGetGamertag( user, XUserGamertagComponent::Classic, sizeof( gamertag ), gamertag, &used ), S_OK );
+    printf( "AUTH_MEASURE after_completion_gamertag_ms=%llu extra_http=%u extra_backend=%u extra_xsts=%u\n",
+            GetTickCount64() - started, transport.httpCalls - http, transport.backendCalls - backend, transport.rawCalls.load() - raw );
+    EXPECT_STREQ( gamertag, "Synthetic" ); EXPECT_EQ( completions, 1u );
+    EXPECT_EQ( transport.httpCalls, http ); EXPECT_EQ( transport.backendCalls, backend ); EXPECT_EQ( transport.rawCalls.load(), raw );
+    user->Release(); threads->XTaskQueueCloseHandle( queue ); threads->Release();
+}
+
+
+TEST( NexusSilentAuthOverlap, CancellationBetweenAdmissionAndChildRunStartsNoBackendRequest )
+{
+    Apartment apartment; SyntheticTransport transport;
+    auto user = CreateUser( transport ); transport.cancelOnTicketThreadStart = &user->cancelled;
+    EXPECT_EQ( user->InitializeNetwork( XUserAddOptions::AddDefaultUserSilently ), E_ABORT );
+    EXPECT_EQ( transport.backendCalls, 0u ); EXPECT_EQ( transport.httpCalls, 0u );
+    EXPECT_EQ( user->xuid, 0u ); EXPECT_EQ( user->ref, 1 );
 }

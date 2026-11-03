@@ -546,3 +546,9 @@ test('native authentication gate requires production cold-path and terminal-retr
         assert.ok(read('scripts/test-authentication.mjs').includes("'"+name+"'"));
     assert.ok(read('scripts/test-authentication.mjs').includes('if(!criticalPathPassed)proof.passed=false;'));
 });
+
+test('native authentication gate requires silent overlap ownership and readiness contracts',()=>{
+    for(const name of ['SilentStartsIndependentPhasesButPublishesOnlyAfterBoth', 'AllowingUiKeepsOrderedDiscoveryBeforeTickets', 'DefaultFailureCancelsChildAndRetainsItsOwnError', 'ParentCancellationWhileWaitingTicketsDrainsChild', 'LateLegacyReplyIsJoinedAndNeverPublishedAfterDefaultFailure', 'TicketFailureWaitsForDefaultValidationWithoutPublishingIdentity', 'ThreadStartupFailurePreservesSequentialHandshakeAndReadiness', 'CurrentMetadataStillGatesCompletionThenGamertagNeedsNoRequest', 'CancellationBetweenAdmissionAndChildRunStartsNoBackendRequest'])
+        assert.ok(read('scripts/test-authentication.mjs').includes("'"+name+"'"));
+    assert.ok(read('scripts/test-authentication.mjs').includes('if(!silentOverlapPassed)proof.passed=false;'));
+});

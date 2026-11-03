@@ -801,14 +801,18 @@ HRESULT XUser::InitializeNetwork( XUserAddOptions options )
     WCHAR *auth = NULL;
     SIZE_T size, defaultSize = 0;
     HRESULT hr;
+    SilentUserTickets silentTickets( user );
+    bool overlappingTickets = false;
 
     /* The launcher already found Microsoft unreachable; fail as the network would. */
     if ( nexus::user::ForcedOffline() ) return HRESULT_FROM_WIN32( ERROR_WINHTTP_CANNOT_CONNECT );
+    if ( !GetMsaAppId() && GetFullTrust() && !GetLegacyFullTrust() ) return E_GAME_MISSING_GAME_CONFIG;
+    if ( !( options & XUserAddOptions::AddDefaultUserAllowingUI ) ) overlappingTickets = silentTickets.Start();
     auth_metadata( "init-default-begin", user, E_PENDING, 0, FALSE, FALSE );
     hr = user->transport.HttpCancellable( L"GET", L"https://title.mgt.xboxlive.com/titles/default/endpoints?type=1", NULL, NULL,
                                           ACCEPT_JSON, &defaultBuffer, &defaultSize, user->cancelled );
     auth_metadata( "init-default-end", user, hr, 0, FALSE, FALSE );
-    if ( FAILED( hr ) ) return hr;
+    if ( FAILED( hr ) ) goto cleanup;
     if ( cancelled )
     {
         hr = E_ABORT;
@@ -822,10 +826,11 @@ HRESULT XUser::InitializeNetwork( XUserAddOptions options )
         hr = E_ABORT;
         goto cleanup;
     }
-    auth_metadata( "init-tickets-begin", user, E_PENDING, 0, FALSE, FALSE );
-    hr = get_rps_tickets( user, options & XUserAddOptions::AddDefaultUserAllowingUI, &userTicket, &deviceTicket,
-                          impl->xbox_msa_id, impl->store_msa_id );
-    auth_metadata( "init-tickets-end", user, hr, 0, FALSE, FALSE );
+    if ( !overlappingTickets ) auth_metadata( "init-tickets-begin", user, E_PENDING, 0, FALSE, FALSE );
+    hr = overlappingTickets ? silentTickets.Take( &userTicket, &deviceTicket, impl->xbox_msa_id, impl->store_msa_id ) :
+        get_rps_tickets( user, options & XUserAddOptions::AddDefaultUserAllowingUI, &userTicket, &deviceTicket,
+                         impl->xbox_msa_id, impl->store_msa_id );
+    if ( !overlappingTickets ) auth_metadata( "init-tickets-end", user, hr, 0, FALSE, FALSE );
     if ( FAILED( hr ) ) goto cleanup;
     if ( cancelled )
     {
@@ -877,6 +882,7 @@ HRESULT XUser::InitializeNetwork( XUserAddOptions options )
     impl->RememberOfflineIdentity( defaultBuffer, defaultSize, currentBuffer, size );
 
 cleanup:
+    if ( FAILED( hr ) || cancelled ) silentTickets.Cancel();
     if ( currentBuffer ) free( currentBuffer );
     if ( defaultBuffer ) free( defaultBuffer );
     if ( deviceTicket ) free( deviceTicket );

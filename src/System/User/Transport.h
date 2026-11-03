@@ -48,6 +48,13 @@ public:
         return hr;
     }
 
+    // Internal worker ownership seam, not an exported runtime API. Failure
+    // preserves ordered ticket retrieval on the existing authentication worker.
+    virtual HANDLE StartSilentTicketThread( LPTHREAD_START_ROUTINE work, void *context )
+    {
+        return CreateThread( nullptr, 0, work, context, 0, nullptr );
+    }
+
 };
 
 UserTransport &GetUserTransport() noexcept;
