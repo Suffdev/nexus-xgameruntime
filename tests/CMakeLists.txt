@@ -188,7 +188,7 @@ if(NEXUS_MIGRATION_PROBES)
     endforeach()
 endif()
 
-foreach(probe store-entitlements package-content)
+foreach(probe store-entitlements package-content store-context-cancellation)
     add_executable(nexus_${probe} Nexus/${probe}.cpp)
     add_dependencies(nexus_${probe} xgameruntime-idl)
     target_include_directories(nexus_${probe} PRIVATE "${IDL_BINARY_DIR}" "${PROJECT_SOURCE_DIR}/include")

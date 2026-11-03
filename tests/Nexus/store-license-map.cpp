@@ -10,7 +10,7 @@
 // clang-format on
 namespace nexus_store_context
 {
-static HRESULT query_game_license(XStoreGameLicense *out, const std::atomic<bool> &)
+static HRESULT query_game_license(XStoreGameLicense *out, const std::atomic<bool> &, HANDLE)
 {
     *out = {};
     return E_ACCESSDENIED;

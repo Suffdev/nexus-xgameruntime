@@ -14,7 +14,7 @@ static XStoreGameLicense receipt{};
 namespace nexus_store_context
 {
 static HRESULT query_addon_licenses(AddonLicenseSnapshot *out) { *out = {}; return E_ACCESSDENIED; }
-static HRESULT query_game_license( XStoreGameLicense *out, const std::atomic<bool> &canceled )
+static HRESULT query_game_license( XStoreGameLicense *out, const std::atomic<bool> &canceled, HANDLE )
 {
     ++queries;
     for ( int i=0; gate && !canceled && i<500; ++i ) Sleep(1);

@@ -17,8 +17,8 @@ test('StoreContext uses the existing receipt transport without a stale global li
  const objects=read('src/System/Store/StoreContext.h');
  const transport=read('src/System/Store/StoreContextLicense.h');
  assert.doesNotMatch(objects,/license_cached|LICENSE_REUSE_MS/);
- assert.match(objects,/query_game_license\( &license, operation->canceled \)/);
- assert.match(transport,/entitled_begin\([\s\S]*TRUE, TRUE \)/);
+ assert.match(objects,/query_game_license\( &license, operation->canceled, operation->cancel_event \)/);
+ assert.match(transport,/entitled_begin\([\s\S]*TRUE, TRUE, drained \)/);
  assert.match(transport,/XAsyncGetResult\( &block, &entitled_game_identity/);
  assert.doesNotMatch(transport,/https?:\/\//);
  assert.match(objects,/if \( user \) return E_NOTIMPL/);
@@ -38,4 +38,19 @@ test('both ABI export lists and account-free native gates include StoreContext',
  assert.doesNotMatch(probe,/AppLicense\(&/);
  assert.match(read('scripts/test-component.mjs'),/\['nexus_store-context', 61\]/);
  assert.match(read('scripts/test-store.mjs'),/\['store-context-raw',11\]/);
+});
+
+test('WinRT child cancellation and detached-provider lifetime remain mandatory Store coverage',()=>{
+ const fixture=read('tests/Nexus/store-context-cancellation.cpp');
+ assert.match(read('tests/CMakeLists.txt'),/foreach\(probe store-entitlements package-content store-context-cancellation\)/);
+ assert.match(read('scripts/test-store.mjs'),/'nexus_store-context-cancellation.exe'/);
+ assert.match(read('scripts/test-store.mjs'),/\['store-context-cancellation',67\]/);
+ for(const label of ['held-forwarded-to-real-child','held-child-abort','held-certificate-get-skipped',
+  'held-operation-retained-after-client-release','held-callback-fence-retains-operation',
+  'held-no-resurrection','ordinary-error-preserved','ordinary-cleanup-drained',
+  'begin-failure-no-drain-deadlock','registration-failure-truthful','pre-cancel-no-child'])
+  assert.ok(fixture.includes('"'+label+'"'));
+ assert.match(fixture,/#include "..\/..\/src\/System\/Store\/StoreContextLicense.h"/);
+ assert.match(fixture,/if \(!synthetic_mode\) return entitled_begin/);
+ assert.match(fixture,/SetLastError\(ERROR_CANCELLED\); return FALSE/);
 });

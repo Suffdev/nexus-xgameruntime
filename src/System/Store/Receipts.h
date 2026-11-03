@@ -645,6 +645,7 @@ static HRESULT entitled_fetch( const char *request, LONG *canceled, struct entit
                                        &body );
         if ( SUCCEEDED( hr ) ) hr = xodus_store_license_xml( body, strlen( body ), &jwt );
         free( body );
+        if ( SUCCEEDED( hr ) && InterlockedCompareExchange( canceled, 0, 0 ) ) hr = E_ABORT;
         if ( SUCCEEDED( hr ) ) hr = receipt_load( jwt, nonce, &claim, &token_expiry );
         xodus_store_license_note( "store-entitled-receipt", hr );
         if ( jwt )

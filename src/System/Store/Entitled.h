@@ -475,6 +475,7 @@ done:
 struct entitled_async
 {
     LONG refs, canceled, started, terminal;
+    HANDLE drained; // Optional duplicated event, signaled only after the final provider/worker reference.
     LONG begin_active;
     DWORD begin_thread;
     BOOL game;
@@ -503,7 +504,9 @@ static void entitled_async_release( struct entitled_async *context )
     if ( context->page ) entitled_page_release( context->page );
     free( context->request );
     ( context->threading )->Release();
+    HANDLE drained = context->drained;
     free( context );
+    if ( drained ) { SetEvent( drained ); CloseHandle( drained ); }
 }
 
 static void entitled_complete( entitled_async *context, XAsyncBlock *async, HRESULT hr, SIZE_T size )
@@ -633,7 +636,9 @@ static HRESULT entitled_start( struct entitled_async *context, XAsyncBlock *asyn
     {
         if ( context->page ) entitled_page_release( context->page );
         free( context->request );
+        HANDLE drained = context->drained;
         free( context );
+        if ( drained ) { SetEvent( drained ); CloseHandle( drained ); }
         return hr;
     }
     /* Successful Begin transfers ownership, including provider Begin failure.
@@ -656,7 +661,7 @@ static HRESULT entitled_start( struct entitled_async *context, XAsyncBlock *asyn
 }
 
 static HRESULT entitled_begin( XStoreContextHandle store, UINT32 kinds, UINT32 page_size, XAsyncBlock *async,
-                               BOOL game = FALSE, BOOL current_only = FALSE )
+                               BOOL game = FALSE, BOOL current_only = FALSE, HANDLE drained = nullptr )
 {
     struct entitled_async *context;
     xmlDocPtr doc;
@@ -711,6 +716,14 @@ static HRESULT entitled_begin( XStoreContextHandle store, UINT32 kinds, UINT32 p
     {
         free( context );
         return E_OUTOFMEMORY;
+    }
+    if ( drained && !DuplicateHandle( GetCurrentProcess(), drained, GetCurrentProcess(), &context->drained,
+                                      0, FALSE, DUPLICATE_SAME_ACCESS ) )
+    {
+        hr = HRESULT_FROM_WIN32( GetLastError() );
+        free( context->request );
+        free( context );
+        return hr;
     }
     context->store_serial = serial;
     context->store = store;
