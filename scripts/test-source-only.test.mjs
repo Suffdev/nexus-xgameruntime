@@ -22,3 +22,10 @@ test('shared waiter regression remains mandatory and its shim is fixture-only',(
   assert.ok(runner.includes("['nexus_taskqueue-composite-waiters', 96]"));
   assert.ok(!fs.readFileSync(path.join(root,'src/CMakeLists.txt'),'utf8').includes('taskqueue-composite-waiters-shim'));
 });
+
+test('actual queue unwind regression remains a required native component',()=>{
+  const cmake=fs.readFileSync(path.join(root,'tests/CMakeLists.txt'),'utf8');
+  const runner=fs.readFileSync(path.join(root,'scripts/test-component.mjs'),'utf8');
+  assert.match(cmake,/add_executable\(nexus_taskqueue-unwind-wait\s+Nexus\/taskqueue-unwind-wait\.cpp/);
+  assert.ok(runner.includes("['nexus_taskqueue-unwind-wait', 17]"));
+});
