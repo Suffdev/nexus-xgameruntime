@@ -623,8 +623,7 @@ bool TaskQueuePortImpl::IsEmpty()
 
 void TaskQueuePortImpl::WaitForUnwind()
 {
-    std::mutex mutex;
-    std::unique_lock<std::mutex> lock(mutex);
+    std::unique_lock<std::mutex> lock(m_processingCallbackMutex);
 
     while(m_processingCallback.load() != 0)
     {

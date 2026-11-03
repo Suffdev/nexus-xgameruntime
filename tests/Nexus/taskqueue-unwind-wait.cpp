@@ -20,8 +20,12 @@ int main() {
  HANDLE entered=CreateEventW(nullptr,TRUE,FALSE,nullptr),done=CreateEventW(nullptr,TRUE,FALSE,nullptr);
  uint64_t cpu=0; std::thread waiter([&]{FILETIME c,e,k0,u0,k1,u1; GetThreadTimes(GetCurrentThread(),&c,&e,&k0,&u0);SetEvent(entered);port->WaitForUnwind();GetThreadTimes(GetCurrentThread(),&c,&e,&k1,&u1);cpu=value(k1)+value(u1)-value(k0)-value(u0);SetEvent(done);});
  CHECK(WaitForSingleObject(entered,5000)==WAIT_OBJECT_0);
+ HANDLE entered2=CreateEventW(nullptr,TRUE,FALSE,nullptr),done2=CreateEventW(nullptr,TRUE,FALSE,nullptr);
+ std::thread waiter2([&]{SetEvent(entered2);port->WaitForUnwind();SetEvent(done2);});
+ CHECK(WaitForSingleObject(entered2,5000)==WAIT_OBJECT_0);
+ CHECK(WaitForSingleObject(done2,0)==WAIT_TIMEOUT);
  CHECK(WaitForSingleObject(done,250)==WAIT_TIMEOUT);
- CHECK(SetEvent(held.release)); CHECK(WaitForSingleObject(done,5000)==WAIT_OBJECT_0);waiter.join();
+ CHECK(SetEvent(held.release)); CHECK(WaitForSingleObject(done,5000)==WAIT_OBJECT_0);waiter.join();CHECK(WaitForSingleObject(done2,5000)==WAIT_OBJECT_0);waiter2.join();CloseHandle(entered2);CloseHandle(done2);
  CHECK(port->m_processingCallback.load()==0);
  // A second call with no active work must return immediately, not require a notification.
  port->WaitForUnwind(); CHECK(true);

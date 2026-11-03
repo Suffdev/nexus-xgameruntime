@@ -392,6 +392,7 @@ private:
     AtomicVector<ITaskQueuePortContext*> m_attachedContexts;
     std::atomic<uint32_t> m_processingSerializedTbCallback{ 0 };
     std::atomic<uint32_t> m_processingCallback{ 0 };
+    std::mutex m_processingCallbackMutex;
     std::condition_variable m_processingCallbackCv;
     std::condition_variable m_waitCallbackCv;
     std::mutex m_lock;
