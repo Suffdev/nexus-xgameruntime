@@ -546,18 +546,39 @@ done:
     return hr;
 }
 
-static HRESULT receipt_metadata( struct receipt_license *license, UINT32 kinds, const char *market,
-                                 const char *language, xmlNodePtr root )
+static HRESULT receipt_metadata_fetch( const char *id, const char *market, const char *language,
+                                       BYTE **bytes, SIZE_T *size )
 {
     WCHAR path[256];
-    BYTE *bytes = NULL;
-    SIZE_T size;
-    HRESULT hr;
-    if ( swprintf( path, ARRAY_SIZE( path ), L"/v7.0/products?bigIds=%hs&market=%hs&languages=%hs", license->id,
-                   market, language ) < 0 )
-        return E_UNEXPECTED;
-    hr = receipt_public_get( L"displaycatalog.mp.microsoft.com", path, 4 * 1024 * 1024, &bytes, &size );
-    if ( SUCCEEDED( hr ) ) hr = receipt_metadata_parse( license, kinds, bytes, size, root );
+    if ( swprintf( path, ARRAY_SIZE( path ), L"/v7.0/products?bigIds=%hs&market=%hs&languages=%hs", id,
+                   market, language ) < 0 ) return E_UNEXPECTED;
+    return receipt_public_get( L"displaycatalog.mp.microsoft.com", path, 4 * 1024 * 1024, bytes, size );
+}
+
+// One product document only, confined to this operation/market/language. Keep
+// original SKU/error order; changing products evicts before the next fetch.
+static HRESULT receipt_metadata_rows( struct receipt_license *licenses, UINT32 license_count, UINT32 kinds,
+                                      const char *market, const char *language, xmlNodePtr response_root,
+                                      LONG *canceled, ULONGLONG deadline )
+{
+    BYTE *bytes = nullptr;
+    SIZE_T size = 0;
+    char previous[13]{};
+    HRESULT hr = S_OK;
+    for ( UINT32 i = 0; i < license_count; ++i )
+    {
+        if ( InterlockedCompareExchange( canceled, 0, 0 ) ) { hr = E_ABORT; break; }
+        if ( GetTickCount64() >= deadline ) { hr = HRESULT_FROM_WIN32( ERROR_TIMEOUT ); break; }
+        if ( strcmp( previous, licenses[i].id ) )
+        {
+            free( bytes ); bytes = nullptr; size = 0;
+            hr = receipt_metadata_fetch( licenses[i].id, market, language, &bytes, &size );
+            if ( SUCCEEDED( hr ) ) memcpy( previous, licenses[i].id, sizeof( previous ) );
+        }
+        if ( SUCCEEDED( hr ) ) hr = receipt_metadata_parse( &licenses[i], kinds, bytes, size, response_root );
+        xodus_store_license_note( "store-entitled-metadata", hr );
+        if ( FAILED( hr ) ) break;
+    }
     free( bytes );
     return hr;
 }
@@ -652,22 +673,8 @@ static HRESULT entitled_fetch( const char *request, LONG *canceled, struct entit
     }
     xmlDocSetRootElement( result, response_root );
     xmlNewTextChild( response_root, NULL, BAD_CAST "HResult", BAD_CAST "0" );
-    for ( i = 0; i < license_count; i++ )
-    {
-        if ( InterlockedCompareExchange( canceled, 0, 0 ) )
-        {
-            hr = E_ABORT;
-            goto done;
-        }
-        if ( GetTickCount64() >= deadline )
-        {
-            hr = HRESULT_FROM_WIN32( ERROR_TIMEOUT );
-            goto done;
-        }
-        hr = receipt_metadata( &licenses[i], kinds, market, language, response_root );
-        xodus_store_license_note( "store-entitled-metadata", hr );
-        if ( FAILED( hr ) ) goto done;
-    }
+    hr = receipt_metadata_rows( licenses, license_count, kinds, market, language, response_root, canceled, deadline );
+    if ( FAILED( hr ) ) goto done;
     proof_until = expiry;
     if ( expiry > ( UINT64 )time( NULL ) + 60 ) expiry = ( UINT64 )time( NULL ) + 60;
     snprintf( number, sizeof( number ), "%llu", ( unsigned long long )expiry );

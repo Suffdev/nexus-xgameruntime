@@ -313,7 +313,7 @@ test('current game licenses require proof-bound genuine SKU and support safe can
     assert.doesNotMatch(source,/4102444800|0010|isActive\s*=\s*TRUE[\s\S]*return E_NOTIMPL/);
     assert.match(read('src/System/Store/Entitled.h').replace(/\s+/g,''),/InterlockedCompareExchange\(&context->terminal,1,0\)/);
     assert.match(read('tests/Nexus/store-entitlements.cpp').replace(/\s+/g,''),/VirtualFree\(block,0,MEM_RELEASE\)/);
-    assert.match(read('scripts/test-store.mjs'),/\['store-entitlements',1116\]/);
+    assert.match(read('scripts/test-store.mjs'),/\['store-entitlements',1143\]/);
     assert.match(read('scripts/test-store.mjs'),/realAccounts:false,realCloud:false,fullRuntime:false/);
 });
 
@@ -557,4 +557,11 @@ test('native authentication gate rejects a canceled picture that starts downstre
     for(const name of ['HeldProfileReplyCannotStartImageAfterCancellation','HeldAuthorizationAndImageCancellationRemainRequestLocal'])
         assert.ok(read('scripts/test-authentication.mjs').includes("'"+name+"'"));
     assert.ok(read('scripts/test-authentication.mjs').includes('if(!pictureCancellationPassed)proof.passed=false;'));
+});
+
+test('Store native gate requires bounded within-operation metadata reuse coverage',()=>{
+    assert.ok(read('scripts/test-store.mjs').includes('METADATA_MEASURE same_product_skus=2 get_requests=1'));
+    for(const name of ['same-product-single-public-get','nonadjacent-products-evict','separate-operation-fetches','separate-market-fetches','metadata-reuse-missing-sku','metadata-reuse-malformed-trial','metadata-reuse-body-limit','metadata-reuse-http-failure','metadata-reuse-between-row-stop','metadata-reuse-sku-order-trial-expiry'])
+        assert.ok(read('tests/Nexus/store-entitlements.cpp').includes('"'+name+'"'));
+
 });

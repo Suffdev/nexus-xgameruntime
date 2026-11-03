@@ -25,7 +25,24 @@ UINT64 xuser_get_xuid( XUserHandle user )
 {
     return 1;
 }
-void xodus_store_license_note( const char *phase, HRESULT hr ) {}
+static bool metadata_mode, metadata_oversize, metadata_match_product = true, metadata_advance_clock;
+static ULONGLONG metadata_ticks;
+static LONG *metadata_cancel_after_row;
+static std::string metadata_body, public_body;
+static SIZE_T public_cursor;
+static DWORD metadata_status = 200;
+void xodus_store_license_note( const char *phase, HRESULT hr )
+{
+    if ( metadata_mode && !strcmp( phase, "store-entitled-metadata" ) )
+    {
+        if ( metadata_cancel_after_row ) InterlockedExchange( metadata_cancel_after_row, 1 );
+        if ( metadata_advance_clock ) metadata_ticks = 100000;
+    }
+}
+static ULONGLONG FixturePublicTick()
+{
+    return metadata_mode ? metadata_ticks : GetTickCount64();
+}
 HRESULT xodus_store_license_body( const char **ids, SIZE_T count, const char *nonce, char **out )
 {
     *out = strdup( "synthetic" );
@@ -55,21 +72,54 @@ static HINTERNET WINAPI FixturePublicOpenRequest( HINTERNET connection, LPCWSTR 
     public_flags = flags;
     public_path[0] = 0;
     if ( path && wcslen( path ) < ARRAY_SIZE( public_path ) ) wcscpy( public_path, path );
+    public_cursor = 0; public_body = metadata_body;
+    if ( metadata_mode && metadata_match_product && path && wcsstr( path, L"bigIds=B00000000002&" ) )
+    {
+        const auto pos = public_body.find( "B00000000001" );
+        if ( pos != std::string::npos ) public_body.replace( pos, 12, "B00000000002" );
+    }
     return WinHttpOpenRequest( connection, verb, path, version, referrer, accept, flags );
 }
 static BOOL WINAPI FixturePublicSendRequest( HINTERNET request, LPCWSTR headers, DWORD headers_size,
                                             void *body, DWORD body_size, DWORD total_size, DWORD_PTR context )
 {
     ++public_sends;
+    if ( metadata_mode ) return TRUE;
     SetLastError( ERROR_CANCELLED );
     return FALSE;
 }
+static BOOL WINAPI FixturePublicReceive( HINTERNET, void * ) { return metadata_mode; }
+static BOOL WINAPI FixturePublicHeaders( HINTERNET, DWORD, LPCWSTR, void *buffer, DWORD *size, DWORD * )
+{
+    if ( !metadata_mode || !buffer || !size || *size < sizeof( DWORD ) ) return FALSE;
+    *static_cast<DWORD *>( buffer ) = metadata_status; *size = sizeof( DWORD ); return TRUE;
+}
+static BOOL WINAPI FixturePublicAvailable( HINTERNET, DWORD *available )
+{
+    *available = metadata_oversize ? 4 * 1024 * 1024 + 1 : static_cast<DWORD>( public_body.size() - public_cursor );
+    return metadata_mode;
+}
+static BOOL WINAPI FixturePublicRead( HINTERNET, void *buffer, DWORD size, DWORD *read )
+{
+    *read = std::min<SIZE_T>( size, public_body.size() - public_cursor );
+    memcpy( buffer, public_body.data() + public_cursor, *read ); public_cursor += *read; return metadata_mode;
+}
+#define GetTickCount64 FixturePublicTick
+#define WinHttpReceiveResponse FixturePublicReceive
+#define WinHttpQueryHeaders FixturePublicHeaders
+#define WinHttpQueryDataAvailable FixturePublicAvailable
+#define WinHttpReadData FixturePublicRead
 #define QueryApiImpl FixtureQueryApiImpl
 #define WinHttpOpenRequest FixturePublicOpenRequest
 #define WinHttpSendRequest FixturePublicSendRequest
 #include "../../src/System/Store/Entitled.h"
 #undef WinHttpOpenRequest
 #undef WinHttpSendRequest
+#undef WinHttpReceiveResponse
+#undef WinHttpQueryHeaders
+#undef WinHttpQueryDataAvailable
+#undef WinHttpReadData
+#undef GetTickCount64
 /* Only this account-free executable has a synthetic installed-package index. */
 HRESULT xpackage_query_content_store( const char *identifier, SIZE_T size, char *store )
 {
@@ -137,7 +187,12 @@ static char *token( HCRYPTPROV provider, const char *cert_id, int variant )
               "\"licensableProducts\":[{\"productId\":\"B00000000001\",\"skuId\":\"0010\",\"endDate\":\"9999-12-31T23:"
               "59:59Z\"}]}",
               cert_id );
-    c = encode( ( BYTE * )claim, strlen( claim ), FALSE );
+    std::string rows = claim;
+    if ( variant == 5 )
+        rows.insert( rows.size() - 2,
+            ",{\"productId\":\"B00000000002\",\"skuId\":\"0010\",\"endDate\":\"9999-12-31T23:59:59Z\"},"
+            "{\"productId\":\"B00000000001\",\"skuId\":\"0020\",\"endDate\":\"9999-12-31T23:59:59Z\"}" );
+    c = encode( ( BYTE * )rows.data(), rows.size(), FALSE );
     if ( !c ) goto done;
     snprintf( payload, sizeof( payload ),
               "{\"iss\":\"LicensingFD\",\"aud\":\"%s\",\"nbf\":%llu,\"exp\":%llu,\"LicenseTokenClaim\":\"%s\"}",
@@ -173,6 +228,8 @@ done:
     free( input );
     return jwt;
 }
+
+static void test_metadata_reuse( IJsonObject *claim );
 
 static void test_receipts( void )
 {
@@ -296,6 +353,11 @@ static void test_receipts( void )
                    !claim );
         free( jwt );
     }
+    jwt = token( provider, cert_id, 5 );
+    CHECK( "metadata-stage-signed-token", jwt && receipt_verify( jwt, "synthetic-nonce", cert_id,
+           cert->pbCertEncoded, cert->cbCertEncoded, &claim, &expiry ) == S_OK );
+    if ( claim ) { test_metadata_reuse( claim ); claim->Release(); claim = nullptr; }
+    free( jwt );
     expired = "{\"tokenVersion\":1,\"licensableProducts\":[{\"productId\":\"B00000000001\",\"skuId\":\"0010\","
               "\"endDate\":\"2020-01-01T00:00:00Z\"}]}";
     CHECK( "inventory-json", receipt_json( ( BYTE * )expired, strlen( expired ), &claim ) == S_OK );
@@ -320,6 +382,72 @@ done:
     CryptReleaseContext( provider, 0 );
 }
 
+static void test_metadata_reuse( IJsonObject *claim )
+{
+    const char *ids[] = { "B00000000001", "B00000000002" };
+    receipt_license verified[ENTITLED_MAX_PRODUCTS]{}; UINT32 count = 0; UINT64 expiry = UINT64_MAX;
+    CHECK( "metadata-stage-verified-inventory", receipt_inventory( claim, ids, 2, verified, &count, &expiry ) == S_OK && count == 3 );
+    if ( count != 3 ) return;
+    const std::string valid = R"({"Products":[{"ProductId":"B00000000001","ProductType":"Durable","LocalizedProperties":[{"ProductTitle":"Synthetic","Language":"en-US"}],"DisplaySkuAvailabilities":[{"Sku":{"SkuId":"0010","Properties":{"IsTrial":false}}},{"Sku":{"SkuId":"0020","Properties":{"IsTrial":true}}}]}]})";
+    metadata_mode = true; metadata_body = valid;
+    receipt_license same[] = { verified[0], verified[2] };
+    auto run = [&]( receipt_license *licenses, UINT32 size, const char *market = "US" ) {
+        metadata_ticks = 0; public_requests = public_sends = 0;
+        auto doc = xmlNewDoc( BAD_CAST "1.0" ); auto root = xmlNewNode( nullptr, BAD_CAST "Response" ); xmlDocSetRootElement( doc, root );
+        LONG canceled = 0;
+        const auto hr = receipt_metadata_rows( licenses, size, 31, market, "en-US", root, &canceled, 50000 );
+        if ( SUCCEEDED( hr ) )
+        {
+            char until[32]; snprintf( until, sizeof( until ), "%llu", static_cast<unsigned long long>( time( nullptr ) + 60 ) );
+            xmlNewTextChild( root, nullptr, BAD_CAST "HResult", BAD_CAST "0" );
+            xmlNewTextChild( root, nullptr, BAD_CAST "ValidUntil", BAD_CAST until );
+            xmlChar *bytes = nullptr; int length = 0; xmlDocDumpMemory( doc, &bytes, &length );
+            entitled_snapshot *snapshot = nullptr;
+            CHECK( "metadata-reuse-output-parse", bytes && entitled_parse( reinterpret_cast<char *>( bytes ), length, &snapshot ) == S_OK );
+            if ( snapshot )
+            {
+                CHECK( "metadata-reuse-product-order", snapshot->count == ( size == 3 ? 2u : 1u ) &&
+                       !strcmp( snapshot->products[0].storeId, licenses[0].id ) );
+                if ( size >= 2 )
+                    CHECK( "metadata-reuse-sku-order-trial-expiry", snapshot->products[0].skusCount == 2 &&
+                           !strcmp( snapshot->products[0].skus[0].skuId, "0010" ) &&
+                           !strcmp( snapshot->products[0].skus[1].skuId, "0020" ) &&
+                           !snapshot->products[0].skus[0].isTrial && snapshot->products[0].skus[1].isTrial &&
+                           snapshot->products[0].skus[0].collectionData.endDate == licenses[0].expiry );
+                entitled_snapshot_release( snapshot );
+            }
+            if ( bytes ) xmlFree( bytes );
+        }
+        xmlFreeDoc( doc ); return hr;
+    };
+    CHECK( "same-product-two-verified-skus", run( same, 2 ) == S_OK );
+    printf( "METADATA_MEASURE same_product_skus=2 get_requests=%u\n", public_requests );
+    CHECK( "same-product-single-public-get", public_requests == 1 && public_sends == 1 );
+    CHECK( "nonadjacent-products-evict", run( verified, 3 ) == S_OK && public_requests == 3 );
+    CHECK( "separate-operation-fetches", run( same, 2 ) == S_OK && public_requests == 1 );
+    CHECK( "separate-market-fetches", run( same, 2, "CZ" ) == S_OK && public_requests == 1 && wcsstr( public_path, L"market=CZ&" ) );
+    metadata_body = "{}"; CHECK( "metadata-reuse-malformed", FAILED( run( same, 2 ) ) && public_requests == 1 );
+    metadata_body = valid; metadata_match_product = false;
+    CHECK( "metadata-reuse-mismatched-product", FAILED( run( &verified[1], 1 ) ) && public_requests == 1 );
+    metadata_match_product = true;
+    auto missing = same[1]; strcpy( missing.sku, "0030" ); receipt_license absent[] = { same[0], missing };
+    CHECK( "metadata-reuse-missing-sku", FAILED( run( absent, 2 ) ) );
+    metadata_body.replace( metadata_body.find( "true" ), 4, "null" );
+    CHECK( "metadata-reuse-malformed-trial", FAILED( run( same, 2 ) ) ); metadata_body = valid;
+    metadata_oversize = true; CHECK( "metadata-reuse-body-limit", FAILED( run( same, 2 ) ) && public_requests == 1 ); metadata_oversize = false;
+    metadata_status = 400; CHECK( "metadata-reuse-http-failure", FAILED( run( same, 2 ) ) && public_requests == 1 ); metadata_status = 200;
+    for ( bool timeout : { false, true } )
+    {
+        metadata_ticks = 0; public_requests = public_sends = 0; LONG canceled = 0;
+        auto doc = xmlNewDoc( BAD_CAST "1.0" ); auto root = xmlNewNode( nullptr, BAD_CAST "Response" ); xmlDocSetRootElement( doc, root );
+        metadata_cancel_after_row = timeout ? nullptr : &canceled; metadata_advance_clock = timeout;
+        const auto hr = receipt_metadata_rows( same, 2, 31, "US", "en-US", root, &canceled, 50000 );
+        CHECK( "metadata-reuse-between-row-stop", hr == ( timeout ? HRESULT_FROM_WIN32( ERROR_TIMEOUT ) : E_ABORT ) && public_requests == 1 );
+        metadata_cancel_after_row = nullptr; metadata_advance_clock = false; xmlFreeDoc( doc );
+    }
+    metadata_mode = false; metadata_body.clear(); public_body.clear();
+}
+
 static struct entitled_snapshot *test_metadata( void )
 {
     const char *json = "{\"Products\":[{\"ProductId\":\"B00000000001\",\"ProductType\":\"Durable\",\"Properties\":{"
@@ -338,14 +466,15 @@ static struct entitled_snapshot *test_metadata( void )
     struct entitled_snapshot *snapshot = NULL;
     xmlDocSetRootElement( doc, root );
     public_requests = public_sends = 0;
-    CHECK( "public-catalog-no-network-grant", FAILED( receipt_metadata( &license, 31, "US", "en-US", root ) ) );
+    LONG metadata_canceled = 0;
+    CHECK( "public-catalog-no-network-grant", FAILED( receipt_metadata_rows( &license, 1, 31, "US", "en-US", root, &metadata_canceled, GetTickCount64() + 5000 ) ) );
     CHECK( "public-catalog-request-captured", public_requests == 1 && public_sends == 1 );
     CHECK( "public-catalog-path-exact",
            !wcscmp( public_path, L"/v7.0/products?bigIds=B00000000001&market=US&languages=en-US" ) );
     CHECK( "public-catalog-remains-https", public_flags == WINHTTP_FLAG_SECURE );
     public_requests = public_sends = 0;
     CHECK( "public-catalog-language-no-network-grant",
-           FAILED( receipt_metadata( &license, 31, "CZ", "zh-Hans-CN", root ) ) );
+           FAILED( receipt_metadata_rows( &license, 1, 31, "CZ", "zh-Hans-CN", root, &metadata_canceled, GetTickCount64() + 5000 ) ) );
     CHECK( "public-catalog-language-request-captured", public_requests == 1 && public_sends == 1 );
     CHECK( "public-catalog-language-path-exact",
            !wcscmp( public_path, L"/v7.0/products?bigIds=B00000000001&market=CZ&languages=zh-Hans-CN" ) );
@@ -1939,8 +2068,16 @@ static void test_public_catalog()
     entitled_store_close( store );
 }
 
-int main( void )
+int main( int argc, char **argv )
 {
+    if ( argc == 2 && !strcmp( argv[1], "--metadata-stage" ) )
+    {
+        const auto hr = RoInitialize( RO_INIT_MULTITHREADED );
+        CHECK( "metadata-stage-winrt", SUCCEEDED( hr ) );
+        if ( SUCCEEDED( hr ) ) { test_receipts(); RoUninitialize(); }
+        printf( "CHECKS %u FAILURES %u\n", checks, failures );
+        return failures ? 1 : 0;
+    }
     HMODULE dll = LoadLibraryA( "xgameruntime.dll" );
     if ( !dll ||
          !( runtime_query = reinterpret_cast<decltype( runtime_query )>( GetProcAddress( dll, "QueryApiImpl" ) ) ) )
