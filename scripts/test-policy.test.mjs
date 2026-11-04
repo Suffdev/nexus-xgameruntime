@@ -434,9 +434,21 @@ test('desktop streaming lifecycle never advertises remote streaming support or w
     const features=read('src/System/XGameRuntimeFeature.cpp');
     assert.doesNotMatch(features,/case XGameRuntimeFeature::XGameStreaming:/);
     assert.match(read('tests/Nexus/test_optional_providers.cpp'),/ConcurrentInitializationAndTeardownNeverInventClients/);
-    assert.match(read('scripts/test-component.mjs'),/Number\(match\[1\]\) < 76/);
+    assert.match(read('scripts/test-component.mjs'),/Number\(match\[1\]\) < 83/);
 });
 
+test('async reused-block regressions require both exact test names and the raised unit floor',()=>{
+    const source=read('tests/Nexus/test_async_results.cpp');
+    const runner=read('scripts/test-component.mjs');
+    for(const name of ['ReusedBlockLateCompletionLeavesANewerCallPending','ReusedBlockHandoffRaceCancelsOnlyTheOldCall']){
+        assert.match(source,new RegExp(name));
+        assert.ok(runner.includes(name),'native unit gate must require '+name);
+        assert.ok(runner.includes('Missing passed async reused-block regression'),'native unit gate must require a passed [OK] result');
+    }
+    assert.match(runner,/Number\(match\[1\]\) < 83/);
+    assert.doesNotMatch(runner,/Number\(match\[1\]\) < 78/);
+    assert.doesNotMatch(runner,/Number\(match\[1\]\) < 76/);
+});
 test('WinRT-dependent privilege validation has a separate matching-engine gate',()=>{
     assert.match(read('scripts/test-user-contracts.mjs'),/PINNED_WINE_EXECUTABLE/);
     assert.match(read('scripts/test-user-contracts.mjs'),/user-privilege',1162/);
