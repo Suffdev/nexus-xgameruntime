@@ -18,9 +18,15 @@
 
 #ifndef __WINE_XGAMERUNTIME_UTIL_H
 #define __WINE_XGAMERUNTIME_UTIL_H
+#include <atomic>
 
 HRESULT http_request( const WCHAR *method, const WCHAR *url, char *data, const WCHAR *headers, const WCHAR **accept,
                       UCHAR **buffer, SIZE_T *bufferSize );
+// Cooperative only: the owning worker retains inputs/handles until a current
+// synchronous WinHTTP call returns. No cross-thread native handle cancellation.
+HRESULT http_request_cancellable( const WCHAR *method, const WCHAR *url, char *data, const WCHAR *headers,
+                                  const WCHAR **accept, UCHAR **buffer, SIZE_T *bufferSize,
+                                  const std::atomic<bool> &cancel );
 HRESULT http_request_raw( const WCHAR *method, const WCHAR *url, const WCHAR *headers, const void *body, DWORD bodySize,
                           DWORD *status, BYTE **buffer, SIZE_T *bufferSize );
 HRESULT encode_base64( const UINT32 dataSize, const BYTE *data, const UINT32 base64Size, char *base64, BOOLEAN pad );

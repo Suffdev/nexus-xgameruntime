@@ -11,7 +11,7 @@ public:
                                                         XAppCaptureScreenshotFormatFlag captureFlags,
                                                         const char *filenamePrefix,
                                                         XAppCaptureDiagnosticScreenshotResult *result ) override;
-    HRESULT WINAPI XAppCaptureRecordDiagnosticClip( time_t startTime, UINT32 durationInMs, const char *filenamePrefix,
+    HRESULT WINAPI XAppCaptureRecordDiagnosticClip( INT64 startTime, UINT32 durationInMs, const char *filenamePrefix,
                                                     XAppCaptureRecordClipResult *result ) override;
     HRESULT WINAPI XAppCaptureTakeScreenshot( XUserHandle requestingUser,
                                               XAppCaptureTakeScreenshotResult *result ) override;

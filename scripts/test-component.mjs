@@ -11,17 +11,18 @@ const probes = [
     ['nexus_legacy-service-client', 70],
     ['nexus_auth-rejection-metadata', 28],
     ['nexus_token-endpoint', 36],
+    ['nexus_backend-request', 356], ['nexus_backend-cancellation', 211], ['nexus_http-cancellation', 137], ['nexus_http-cancellation-monitor', 30],
     ['nexus_store-context', 61],
     ['nexus_store-license-map', 90],
     ['nexus_store-public-fetch', 98],
     ['nexus_user-device-association',6309], ['nexus_user-audio',334], ['nexus_windows-account-metadata',1713],
     ['nexus_game-relaunch',64], ['nexus_game-relaunch-search', 116], ['nexus_async-provider-contract',116], ['nexus_system_device_id', 332], ['nexus_async-schedule', 16],
-    ['nexus_async-completion-lifetime', 2805], ['nexus_taskqueue-teardown', 20],
+    ['nexus_async-completion-lifetime', 2805], ['nexus_taskqueue-teardown', 20], ['nexus_taskqueue-composite-waiters', 96], ['nexus_taskqueue-unwind-wait', 17],
     ['nexus_taskqueue-close', 1137], ['nexus_taskqueue-contract', 1374],
     ['nexus_package-identity', 15], ['nexus_package-legacy', 175], ['nexus_package-chunks', 312],
     ['nexus_package-content',423], ['nexus_package-installed',110], ['nexus_package-monitors', 362], ['nexus_package-progress-bytes', 115],
     ['nexus_package-selection', 750],
-    ['nexus_gamesave-sync', 4073], ['nexus_gamesave-conflict-ui', 51], ['nexus_gamesave-transfer', 263], ['nexus_gamesave-commit', 107], ['nexus_gamesave-files', 25],
+    ['nexus_gamesave-sync', 4073], ['nexus_gamesave-conflict-ui', 51], ['nexus_gamesave-transfer', 263], ['nexus_gamesave-commit', 183], ['nexus_gamesave-atomic', 598], ['nexus_gamesave-index', 1316], ['nexus_gamesave-fencing', 251], ['nexus_gamesave-files', 25],
     ['nexus_gamesave-file-paths', 55],
     ['nexus_game-invitations', 56, ['--component']],
     ['nexus_connectivity-events', 359],
@@ -65,8 +66,12 @@ try {
 
     const units = execute('unit', 'wine', [path.join(bin, 'test_xgameruntime.exe')], 120000);
     const match = units.match(/\[\s*PASSED\s*\]\s+(\d+) tests/);
-    if (!match || Number(match[1]) < 76 || /\[\s*(SKIPPED|FAILED)\s*\]/.test(units))
+    if (!match || Number(match[1]) < 83 || /\[\s*(SKIPPED|FAILED)\s*\]/.test(units))
         throw Error('Missing, skipped or failed C++ unit coverage');
+    for (const name of ['NexusAsyncResults.ReusedBlockLateCompletionLeavesANewerCallPending',
+                        'NexusAsyncResults.ReusedBlockHandoffRaceCancelsOnlyTheOldCall'])
+        if (!new RegExp('\\[\\s*OK\\s*\\]\\s+' + name.split('.').join('\\.') + '\\b').test(units))
+            throw Error('Missing passed async reused-block regression: ' + name);
     proof.results.push({name: 'cpp-unit', checks: Number(match[1]), failures: 0});
     const identities=execute('async-identity-unit','wine',[path.join(bin,'test_nexus_async_identity.exe')]);
     const identityMatch=identities.match(/\[\s*PASSED\s*\]\s+(\d+) tests/);

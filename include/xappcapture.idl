@@ -21,10 +21,6 @@
 import "unknwn.idl";
 import "xuser.idl";
 
-cpp_quote("#if 0")
-typedef UINT64 time_t;
-cpp_quote("#endif")
-
 cpp_quote("#ifdef __cplusplus")
 
 cpp_quote("enum class XAppCaptureMetadataPriority : UINT8")
@@ -138,7 +134,7 @@ struct XAppCaptureRecordClipResult
 {
     char path[260];
     SIZE_T fileSize;
-    time_t startTime;
+    INT64 startTime;
     UINT32 durationInMs;
     UINT32 width;
     UINT32 height;
@@ -209,7 +205,7 @@ interface IXAppCaptureMetadataImpl : IUnknown
 interface IXAppCaptureImpl : IUnknown
 {
     HRESULT XAppCaptureTakeDiagnosticScreenshot( [in] BOOLEAN gamescreenOnly, [in] XAppCaptureScreenshotFormatFlag captureFlags, [in, optional, string] const char *filenamePrefix, [out] XAppCaptureDiagnosticScreenshotResult *result );
-    HRESULT XAppCaptureRecordDiagnosticClip( [in] time_t startTime, [in] UINT32 durationInMs, [in, optional, string] const char *filenamePrefix, [out] XAppCaptureRecordClipResult *result );
+    HRESULT XAppCaptureRecordDiagnosticClip( [in] INT64 startTime, [in] UINT32 durationInMs, [in, optional, string] const char *filenamePrefix, [out] XAppCaptureRecordClipResult *result );
     HRESULT XAppCaptureTakeScreenshot( [in] XUserHandle requestingUser, [out] XAppCaptureTakeScreenshotResult *result );
     HRESULT XAppCaptureOpenScreenshotStream( [in, string] const char *localId, [in] XAppCaptureScreenshotFormatFlag screenshotFormat, [out] XAppCaptureScreenshotStreamHandle *handle, [out, optional] UINT64 *totalBytes );
     HRESULT XAppCaptureReadScreenshotStream( [in] XAppCaptureScreenshotStreamHandle handle, [in] UINT64 startPosition, [in] UINT32 bytesToRead, [out, size_is(bytesToRead)] UINT8 *buffer, [out] UINT32 *bytesWritten );

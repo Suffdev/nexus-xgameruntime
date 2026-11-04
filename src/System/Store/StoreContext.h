@@ -117,7 +117,7 @@ struct IStoreContextStatics_ : IInspectable
 
 /* Use the existing verified receipt path for every operation. A denial or an
  * account change must never fall back to a previously successful license. */
-static HRESULT query_game_license( XStoreGameLicense *out, const std::atomic<bool> &canceled );
+static HRESULT query_game_license( XStoreGameLicense *out, const std::atomic<bool> &canceled, HANDLE cancel_event );
 
 static HRESULT make_hstring( const char *text, HSTRING *out )
 {
@@ -247,6 +247,7 @@ class AppLicenseOperation final : public IAsyncOperation_StoreAppLicense, public
     BOOL handler_set = FALSE;
     bool closed = false;
     std::atomic<bool> canceled{ false };
+    HANDLE cancel_event = nullptr;
     HRESULT error = S_OK;
     ICompletedHandler_ *handler = nullptr;
     AppLicense *result = nullptr;
@@ -259,7 +260,7 @@ class AppLicenseOperation final : public IAsyncOperation_StoreAppLicense, public
 
         /* A failed query has no license result. Preserve its HRESULT for both
          * IAsyncInfo and GetResults instead of completing with an inactive license. */
-        HRESULT hr = query_game_license( &license, operation->canceled );
+        HRESULT hr = query_game_license( &license, operation->canceled, operation->cancel_event );
         AppLicense *value = SUCCEEDED( hr ) ? new ( std::nothrow ) AppLicense( license ) : nullptr;
         if ( SUCCEEDED( hr ) && !value ) hr = E_OUTOFMEMORY;
         AcquireSRWLockExclusive( &operation->lock );
@@ -289,6 +290,8 @@ class AppLicenseOperation final : public IAsyncOperation_StoreAppLicense, public
 public:
     HRESULT start()
     {
+        cancel_event = CreateEventW( nullptr, TRUE, canceled.load(), nullptr );
+        if ( !cancel_event ) return HRESULT_FROM_WIN32( GetLastError() );
         AddRef(); /* worker reference */
         HANDLE thread = CreateThread( nullptr, 0, worker, this, 0, nullptr );
         if ( !thread )
@@ -302,6 +305,7 @@ public:
 
     ~AppLicenseOperation()
     {
+        if ( cancel_event ) CloseHandle( cancel_event );
         if ( handler ) handler->Release();
         if ( result ) result->Release();
     }
@@ -427,6 +431,7 @@ public:
         if ( status == STATUS_STARTED )
         {
             canceled = true;
+            if ( cancel_event ) SetEvent( cancel_event );
             status = STATUS_CANCELED;
             error = E_ABORT;
             notify = handler;

@@ -50,7 +50,7 @@ static BOOL catalog_string_in_array ( IJsonArray *array, const char *wanted )
     return FALSE;
 }
 
-static HRESULT catalog_date ( IJsonObject *object, const WCHAR *key, time_t *out )
+static HRESULT catalog_date ( IJsonObject *object, const WCHAR *key, INT64 *out )
 {
     char *text = receipt_string ( object, key, 64 );
     UINT64 value;
@@ -65,10 +65,8 @@ static HRESULT catalog_date ( IJsonObject *object, const WCHAR *key, time_t *out
     free ( text );
     if ( SUCCEEDED ( hr ) )
     {
-        /* The legacy x86 ABI has a 32-bit time_t. Catalog offers use year
-         * 9998 for an open end, which must remain in the future there too.
-         * This presentation conversion is never applied to receipt proof. */
-        *out = (time_t)std::min<UINT64> ( value, std::numeric_limits<time_t>::max () );
+        if ( value > static_cast<UINT64>( INT64_MAX ) ) return E_UNEXPECTED;
+        *out = static_cast<INT64>( value );
     }
     return hr;
 }
@@ -76,11 +74,11 @@ static HRESULT catalog_date ( IJsonObject *object, const WCHAR *key, time_t *out
 /* Server availability ordering includes subscriptions and bundle-only licenses.
  * Only an active desktop Purchase offer supplies the displayed purchase price. */
 static HRESULT catalog_availability ( IJsonObject *object, const char *filters[], UINT32 filters_count, BOOL *include,
-                                      BOOL *purchase, time_t *end )
+                                      BOOL *purchase, INT64 *end )
 {
     catalog_json_ptr<IJsonObject> conditions, client;
     catalog_json_ptr<IJsonArray> actions, platforms;
-    time_t start;
+    INT64 start;
     *include = *purchase = FALSE;
     if ( FAILED ( receipt_get_object ( object, L"Conditions", &conditions.p ) ) ||
          FAILED ( catalog_date ( conditions.p, L"StartDate", &start ) ) ||
@@ -125,7 +123,7 @@ static HRESULT catalog_availability ( IJsonObject *object, const char *filters[]
     return S_OK;
 }
 
-static HRESULT catalog_price ( IJsonObject *availability, time_t end, XStorePrice *out )
+static HRESULT catalog_price ( IJsonObject *availability, INT64 end, XStorePrice *out )
 {
     catalog_json_ptr<IJsonObject> order, price;
     double list, base;
@@ -308,7 +306,7 @@ static HRESULT catalog_parse_product ( IJsonObject *source, UINT32 kinds, const 
         {
             catalog_json_ptr<IJsonObject> available;
             BOOL match, purchase;
-            time_t end;
+            INT64 end;
             if ( FAILED ( availabilities.p->GetObjectAt ( j, &available.p ) ) ||
                  FAILED ( hr = catalog_availability ( available.p, filters, filters_count, &match, &purchase, &end ) ) )
                 return E_UNEXPECTED;

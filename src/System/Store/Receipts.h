@@ -255,7 +255,17 @@ done:
     return hr;
 }
 
-static HRESULT receipt_load( const char *jwt, const char *nonce, IJsonObject **claim, UINT64 *expiry )
+/* One worker-owned slot per entitlement operation, never a claim/permission cache.
+ * Only a completely verified receipt may admit DER. Every hit verifies again. */
+struct receipt_certificate_cache
+{
+    char id[41];
+    BYTE *der;
+    DWORD size;
+};
+
+static HRESULT receipt_load( const char *jwt, const char *nonce, IJsonObject **claim, UINT64 *expiry,
+                             receipt_certificate_cache *cache = nullptr )
 {
     const char *dot = strchr( jwt, '.' ), *second;
     BYTE *payload = NULL, *decoded = NULL, *document = NULL, *der = NULL;
@@ -277,6 +287,11 @@ static HRESULT receipt_load( const char *jwt, const char *nonce, IJsonObject **c
     if ( i > 64 || i == decoded_size || FAILED( receipt_json( decoded + i, decoded_size - i, &data ) ) ) goto done;
     id = receipt_string( data, L"certificateId", 40 );
     if ( !receipt_cert_id( id ) ) goto done;
+    if ( cache && cache->der && !strcmp( cache->id, id ) )
+    {
+        hr = receipt_verify( jwt, nonce, id, cache->der, cache->size, claim, expiry );
+        goto done;
+    }
     /* Explicit narrow arguments, independent of the CRT's wide %S convention. */
     if ( swprintf( path, ARRAY_SIZE( path ), L"/v8.0/licenseToken/fullCertificate/%hs", id ) < 0 )
     {
@@ -291,6 +306,13 @@ static HRESULT receipt_load( const char *jwt, const char *nonce, IJsonObject **c
          FAILED( receipt_decode( certificate, strlen( certificate ), FALSE, &der, &der_size ) ) )
         goto done;
     hr = receipt_verify( jwt, nonce, id, der, der_size, claim, expiry );
+    if ( SUCCEEDED( hr ) && cache )
+    {
+        free( cache->der );
+        cache->der = der; cache->size = der_size;
+        memcpy( cache->id, id, sizeof( cache->id ) );
+        der = nullptr;
+    }
 done:
     if ( body ) ( body )->Release();
     if ( data ) ( data )->Release();
@@ -546,18 +568,39 @@ done:
     return hr;
 }
 
-static HRESULT receipt_metadata( struct receipt_license *license, UINT32 kinds, const char *market,
-                                 const char *language, xmlNodePtr root )
+static HRESULT receipt_metadata_fetch( const char *id, const char *market, const char *language,
+                                       BYTE **bytes, SIZE_T *size )
 {
     WCHAR path[256];
-    BYTE *bytes = NULL;
-    SIZE_T size;
-    HRESULT hr;
-    if ( swprintf( path, ARRAY_SIZE( path ), L"/v7.0/products?bigIds=%hs&market=%hs&languages=%hs", license->id,
-                   market, language ) < 0 )
-        return E_UNEXPECTED;
-    hr = receipt_public_get( L"displaycatalog.mp.microsoft.com", path, 4 * 1024 * 1024, &bytes, &size );
-    if ( SUCCEEDED( hr ) ) hr = receipt_metadata_parse( license, kinds, bytes, size, root );
+    if ( swprintf( path, ARRAY_SIZE( path ), L"/v7.0/products?bigIds=%hs&market=%hs&languages=%hs", id,
+                   market, language ) < 0 ) return E_UNEXPECTED;
+    return receipt_public_get( L"displaycatalog.mp.microsoft.com", path, 4 * 1024 * 1024, bytes, size );
+}
+
+// One product document only, confined to this operation/market/language. Keep
+// original SKU/error order; changing products evicts before the next fetch.
+static HRESULT receipt_metadata_rows( struct receipt_license *licenses, UINT32 license_count, UINT32 kinds,
+                                      const char *market, const char *language, xmlNodePtr response_root,
+                                      LONG *canceled, ULONGLONG deadline )
+{
+    BYTE *bytes = nullptr;
+    SIZE_T size = 0;
+    char previous[13]{};
+    HRESULT hr = S_OK;
+    for ( UINT32 i = 0; i < license_count; ++i )
+    {
+        if ( InterlockedCompareExchange( canceled, 0, 0 ) ) { hr = E_ABORT; break; }
+        if ( GetTickCount64() >= deadline ) { hr = HRESULT_FROM_WIN32( ERROR_TIMEOUT ); break; }
+        if ( strcmp( previous, licenses[i].id ) )
+        {
+            free( bytes ); bytes = nullptr; size = 0;
+            hr = receipt_metadata_fetch( licenses[i].id, market, language, &bytes, &size );
+            if ( SUCCEEDED( hr ) ) memcpy( previous, licenses[i].id, sizeof( previous ) );
+        }
+        if ( SUCCEEDED( hr ) ) hr = receipt_metadata_parse( &licenses[i], kinds, bytes, size, response_root );
+        xodus_store_license_note( "store-entitled-metadata", hr );
+        if ( FAILED( hr ) ) break;
+    }
     free( bytes );
     return hr;
 }
@@ -568,6 +611,7 @@ static HRESULT entitled_fetch( const char *request, LONG *canceled, struct entit
     xmlNodePtr root, node, response_root;
     char *ids[ENTITLED_MAX_PRODUCTS] = { 0 }, *market = NULL, *language = NULL;
     struct receipt_license licenses[ENTITLED_MAX_PRODUCTS];
+    receipt_certificate_cache certificate_cache = {};
     UINT32 count = 0, license_count = 0, i, j, batch;
     UINT64 kinds, expiry = UINT64_MAX, proof_until = 0;
     ULONGLONG deadline = GetTickCount64() + 120000;
@@ -622,9 +666,10 @@ static HRESULT entitled_fetch( const char *request, LONG *canceled, struct entit
             sprintf( nonce + j * 2, "%02x", random[j] );
         hr = xodus_store_license_body( ( const char ** )&ids[batch], std::min<UINT32>( 64, count - batch ), nonce,
                                        &body );
-        if ( SUCCEEDED( hr ) ) hr = xodus_store_license_xml( body, strlen( body ), &jwt );
+        if ( SUCCEEDED( hr ) ) hr = xodus_store_license_xml( body, strlen( body ), &jwt, canceled, deadline );
         free( body );
-        if ( SUCCEEDED( hr ) ) hr = receipt_load( jwt, nonce, &claim, &token_expiry );
+        if ( SUCCEEDED( hr ) && InterlockedCompareExchange( canceled, 0, 0 ) ) hr = E_ABORT;
+        if ( SUCCEEDED( hr ) ) hr = receipt_load( jwt, nonce, &claim, &token_expiry, &certificate_cache );
         xodus_store_license_note( "store-entitled-receipt", hr );
         if ( jwt )
         {
@@ -652,22 +697,8 @@ static HRESULT entitled_fetch( const char *request, LONG *canceled, struct entit
     }
     xmlDocSetRootElement( result, response_root );
     xmlNewTextChild( response_root, NULL, BAD_CAST "HResult", BAD_CAST "0" );
-    for ( i = 0; i < license_count; i++ )
-    {
-        if ( InterlockedCompareExchange( canceled, 0, 0 ) )
-        {
-            hr = E_ABORT;
-            goto done;
-        }
-        if ( GetTickCount64() >= deadline )
-        {
-            hr = HRESULT_FROM_WIN32( ERROR_TIMEOUT );
-            goto done;
-        }
-        hr = receipt_metadata( &licenses[i], kinds, market, language, response_root );
-        xodus_store_license_note( "store-entitled-metadata", hr );
-        if ( FAILED( hr ) ) goto done;
-    }
+    hr = receipt_metadata_rows( licenses, license_count, kinds, market, language, response_root, canceled, deadline );
+    if ( FAILED( hr ) ) goto done;
     proof_until = expiry;
     if ( expiry > ( UINT64 )time( NULL ) + 60 ) expiry = ( UINT64 )time( NULL ) + 60;
     snprintf( number, sizeof( number ), "%llu", ( unsigned long long )expiry );
@@ -689,6 +720,7 @@ static HRESULT entitled_fetch( const char *request, LONG *canceled, struct entit
 done:
     for ( i = 0; i < count; i++ )
         free( ids[i] );
+    free( certificate_cache.der );
     free( market );
     free( language );
     if ( doc ) xmlFreeDoc( doc );

@@ -2196,6 +2196,7 @@ TEST_F(XThreadingTests, VerifySerializedThreadPoolDispatch)
     {
         uint32_t Count = 0;
         uint32_t Work[total];
+        HANDLE Completed;
     };
 
     struct PerCallData
@@ -2204,8 +2205,11 @@ TEST_F(XThreadingTests, VerifySerializedThreadPoolDispatch)
         Data* D;
     };
 
+    AutoHandle completed = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+    ASSERT_NE(completed.Handle(), nullptr);
     Data data;
     data.Count = 0;
+    data.Completed = completed.Handle();
     ZeroMemory(data.Work, sizeof(data.Work));
 
     PerCallData callData[total];
@@ -2230,6 +2234,7 @@ TEST_F(XThreadingTests, VerifySerializedThreadPoolDispatch)
             pdata->D->Work[pdata->Index] = pdata->D->Work[pdata->D->Count - 1] + 5;
         }
         pdata->D->Count++;
+        if (pdata->D->Count == total) SetEvent(pdata->D->Completed);
     };
 
     for (uint32_t i = 0; i < total; i++)
@@ -2238,7 +2243,10 @@ TEST_F(XThreadingTests, VerifySerializedThreadPoolDispatch)
             XTaskQueueSubmitDelayedCallback(queue, XTaskQueuePort::Completion, 0, &(callData[i]), callback));
     }
 
-    Sleep(500);
+    // Scheduling latency is not the serialization contract. Wait for all
+    // callbacks, then drain before reading or destroying their stack context.
+    EXPECT_EQ(WaitForSingleObject(completed.Handle(), 5000), WAIT_OBJECT_0);
+    EXPECT_HRESULT_SUCCEEDED(XTaskQueueTerminate(queue, true, nullptr, nullptr));
 
     EXPECT_EQ(total, data.Count);
     uint32_t previous = 0;
