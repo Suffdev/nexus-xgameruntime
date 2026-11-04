@@ -77,33 +77,23 @@ static BOOL package_mount_relative( const char *text, BOOL destination, std::wst
     return out.size() < MAX_PATH;
 }
 
+/* The package root is host-supplied and must be a real directory. Components
+ * below it use the shared bounded no-reparse walk from Content.h. */
 static BOOL package_mount_directory( const WCHAR *root, const std::wstring &relative, std::wstring &out )
 {
-    out = root;
-    DWORD attributes = GetFileAttributesW( out.c_str() );
+    WCHAR path[MAX_PATH];
+    DWORD attributes = GetFileAttributesW( root );
     if ( attributes == INVALID_FILE_ATTRIBUTES || !( attributes & FILE_ATTRIBUTE_DIRECTORY ) ||
          ( attributes & FILE_ATTRIBUTE_REPARSE_POINT ) )
         return FALSE;
-    SIZE_T offset = 0;
-    while ( offset < relative.size() )
-    {
-        SIZE_T end = relative.find( L'\\', offset );
-        if ( end == std::wstring::npos )
-            end = relative.size();
-        out += L'\\';
-        out.append( relative, offset, end - offset );
-        if ( out.size() >= MAX_PATH )
-            return FALSE;
-        attributes = GetFileAttributesW( out.c_str() );
-        if ( attributes == INVALID_FILE_ATTRIBUTES || !( attributes & FILE_ATTRIBUTE_DIRECTORY ) ||
-             ( attributes & FILE_ATTRIBUTE_REPARSE_POINT ) )
-            return FALSE;
-        offset = end + 1;
-    }
+    if ( !content_directory( root, relative.c_str(), path ) )
+        return FALSE;
+    out = path;
     return TRUE;
 }
 
-static HRESULT package_mount_collect( const WCHAR *root, xmlNodePtr node, UINT depth, package_mount_plan &plan )
+static HRESULT package_mount_collect( const WCHAR *root, xmlNodePtr node, UINT depth, package_mount_plan &plan,
+                                      enum content_layout_coordinate coordinate )
 {
     if ( depth > 16 )
         return HRESULT_FROM_WIN32( ERROR_MORE_DATA );
@@ -122,10 +112,31 @@ static HRESULT package_mount_collect( const WCHAR *root, xmlNodePtr node, UINT d
                 return HRESULT_FROM_WIN32( ERROR_MORE_DATA );
             if ( exclude )
                 return E_NOTIMPL;
-            if ( !destination || !content_text( node, "SourcePath", source, sizeof( source ) ) ||
-                 !content_text( node, "Include", include, sizeof( include ) ) || !content_relative( include, TRUE ) ||
-                 !package_mount_relative( source, FALSE, source_relative ) ||
-                 !package_mount_relative( ( char * )destination.get(), TRUE, destination_relative ) )
+            if ( !content_text( node, "Include", include, sizeof( include ) ) ||
+                 !content_relative( include, TRUE ) )
+                return E_INVALIDARG;
+            if ( destination )
+            {
+                if ( !*destination.get() ||
+                     !package_mount_relative( ( char * )destination.get(), TRUE, destination_relative ) )
+                    return E_INVALIDARG;
+            }
+            else if ( content_text( node, "SourcePath", source, sizeof( source ) ) )
+            {
+                /* No destination was declared: the deployed tree is the declared
+                 * source location, matching package chunk readiness. */
+                if ( !package_mount_relative( source, TRUE, destination_relative ) ) return E_INVALIDARG;
+            }
+            else
+                return E_INVALIDARG;
+            if ( coordinate == CONTENT_LAYOUT_DESTINATION )
+            {
+                /* An already deployed tree is projected onto its own destination
+                 * paths; SourcePath is the build-machine coordinate then. */
+                source_relative = destination_relative;
+            }
+            else if ( !content_text( node, "SourcePath", source, sizeof( source ) ) ||
+                      !package_mount_relative( source, TRUE, source_relative ) )
                 return E_INVALIDARG;
             char *last = strrchr( include, '\\' ), *slash = strrchr( include, '/' );
             if ( !last || ( slash && slash > last ) )
@@ -191,7 +202,7 @@ static HRESULT package_mount_collect( const WCHAR *root, xmlNodePtr node, UINT d
             if ( !any )
                 return HRESULT_FROM_WIN32( ERROR_FILE_NOT_FOUND );
         }
-        HRESULT hr = package_mount_collect( root, node->children, depth + 1, plan );
+        HRESULT hr = package_mount_collect( root, node->children, depth + 1, plan, coordinate );
         if ( FAILED( hr ) )
             return hr;
     }
@@ -223,7 +234,11 @@ static HRESULT package_mount_read_plan( const content_package &package, package_
         return E_INVALIDARG;
     try
     {
-        HRESULT hr = package_mount_collect( package.path, root->children, 0, plan );
+        enum content_layout_coordinate coordinate;
+        UINT groups = 0;
+        if ( !content_layout_coordinate( package.path, root->children, &coordinate, &groups ) )
+            return E_INVALIDARG;
+        HRESULT hr = package_mount_collect( package.path, root->children, 0, plan, coordinate );
         return FAILED( hr ) ? hr : plan.groups && !plan.files.empty() ? S_OK : E_INVALIDARG;
     }
     catch ( const std::bad_alloc & )

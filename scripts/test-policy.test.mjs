@@ -56,6 +56,32 @@ test('installation selectors retain whole-layout validation and live file checks
     const probe=read('tests/Nexus/package-selection-probe.c');
     for(const label of ['selected-locked-refresh','deleted-refresh','replace-refresh','resize-refresh','invalid-refresh','concurrent-refresh','invalid-unselected-metadata-rejected'])assert.ok(probe.includes('"'+label+'"'));
 });
+test('content discovery prefers the deployed destination coordinate and validates every declaration',()=>{
+    const content=read('src/System/Package/Content.h'),mount=read('src/System/Package/Mount.h'),chunks=read('src/System/Package/Chunks.h');
+    assert.match(content,/A downloaded tree can be deployed at its declared destination or still hold/);
+    assert.match(content,/enum content_layout_coordinate[\s\S]*CONTENT_LAYOUT_SOURCE = 0[\s\S]*CONTENT_LAYOUT_DESTINATION = 1/);
+    const declared=content.indexOf('content_layout_declarations( node, 0, &declared )');
+    const destination=content.indexOf('CONTENT_LAYOUT_DESTINATION ) && visited');
+    const source=content.indexOf('CONTENT_LAYOUT_SOURCE ) && visited');
+    assert.ok(declared>0&&declared<destination&&destination<source);
+    assert.match(content,/content_package_relative/);
+    assert.match(content,/content_layout_coordinate\( package->path, root->children, &coordinate, &groups \) && groups/);
+    assert.ok(content.includes("if ( !*p || *p == '/' || *p == '\\\\' || strchr( p, ':' ) ) return FALSE;"));
+    assert.ok(content.includes("if ( text[length - 1] == '.' || text[length - 1] == ' ' ) return FALSE;"));
+    assert.ok(content.includes(`c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|'`));
+    assert.ok(mount.includes('if ( part == L".." )'));
+    assert.ok(mount.includes("part.back() == L'.' || part.back() == L' '"));
+    assert.ok(mount.includes('wcschr( L":*?\\"<>|", c )'));
+    assert.match(content,/else if \( xmlHasProp\( node, \( xmlChar \* \)"SourcePath" \)[\s\S]{0,400}content_layout_location\( node, "SourcePath"/);
+    assert.match(content,/\( attributes & FILE_ATTRIBUTE_REPARSE_POINT \)[\s\S]{0,40}return FALSE;/);
+    assert.match(mount,/content_layout_coordinate\( package\.path, root->children, &coordinate, &groups \)/);
+    assert.match(mount,/content_directory\( root, relative\.c_str\(\), path \)/);
+    assert.match(mount,/coordinate == CONTENT_LAYOUT_DESTINATION[\s\S]{0,400}source_relative = destination_relative/);
+    assert.match(mount,/else if \( content_text\( node, "SourcePath", source, sizeof\( source \) \) \)[\s\S]{0,400}package_mount_relative\( source, TRUE, destination_relative \)/);
+    assert.match(chunks,/SourcePath is a build-machine path when DestinationPath exists/);
+    for(const label of ['deployed-content-loaded','deployed-content-query','deployed-mount-plan','deployed-mount-payload','deployed-both-coordinates-destination-preferred','deployed-no-destination-root-payload-rejected','deployed-invalid-source-declaration-rejected','deployed-invalid-source-dotspace-rejected','deployed-invalid-destination-trailing-dot-rejected','deployed-invalid-include-prefix-rejected','deployed-include-prefix-dot-rejected','deployed-include-prefix-wildcard-rejected','deployed-reparse-directory-rejected'])
+        assert.ok(read('tests/Nexus/package-content.cpp').includes('"'+label+'"'));
+});
 test('incomplete hints reorder live checks only after validating all declarations',()=>{
     const source=read('src/System/Package/Chunks.h'),monitor=read('src/System/Package/Monitors.h');
     assert.ok(source.indexOf('chunks_inspect_files( snapshot )')>source.lastIndexOf('chunks_files( path, chunk_nodes[i]'));

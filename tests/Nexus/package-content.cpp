@@ -603,6 +603,174 @@ static void test_mount_projection()
     DeleteFileW( layout );
 }
 
+/* A tree extracted at its declared DestinationPath is what the launcher keeps
+ * for content that is already deployed; the runtime must enumerate and mount it
+ * without falling back to the build-machine SourcePath. */
+static void test_deployed_destination()
+{
+    WCHAR root[MAX_PATH], layout[MAX_PATH], file[MAX_PATH], nested[MAX_PATH], workspace[MAX_PATH], staging[MAX_PATH];
+    content_package package{};
+    package_mount_plan plan;
+    char identifier[33];
+    const char *deployed = "<Package><Chunk Id=\"1000\">"
+        "<FileGroup SourcePath=\"build\" Include=\"MicrosoftGame.config\" DestinationPath=\"\\\"/>"
+        "<FileGroup SourcePath=\"build\\Assets\" Include=\"*.png\" DestinationPath=\"\\Assets\"/>"
+        "</Chunk></Package>";
+    fixture( L"deployed", "Nexus.Deployed", "D0000000000A", "Nexus.Base", "B00000000001", 0x41, FALSE );
+    content_join( folder, L"deployed", root );
+    content_join( root, L"Assets", nested );
+    CHECK( "deployed-payload-directory", CreateDirectoryW( nested, NULL ) );
+    content_join( nested, L"logo.png", file );
+    write_text( file, "deployed payload" );
+    content_join( root, L"layout_00000041-1111-2222-3333-444444444444.xml", layout );
+    write_text( layout, deployed );
+    CHECK( "deployed-content-loaded", content_load( root, &package ) && package.content );
+    CHECK( "deployed-content-identifier", !strcmp( package.identifier, "00000041111122223333444444444444" ) );
+    CHECK( "deployed-content-query",
+           content_query_identifier( "D0000000000A", sizeof( identifier ), identifier ) == S_OK &&
+               !strcmp( identifier, "00000041111122223333444444444444" ) );
+    CHECK( "deployed-mount-plan", package_mount_read_plan( package, plan ) == S_OK && plan.groups == 2 &&
+                                      plan.files.size() == 2 && plan.destinations.count( L"Assets\\logo.png" ) );
+    content_join( folder, L"deployed-workspace", workspace );
+    CHECK( "deployed-mount-workspace",
+           CreateDirectoryW( workspace, NULL ) && SetEnvironmentVariableW( L"XODUS_MOUNT_ROOT", workspace ) );
+    mount_fixture_license license;
+    XPackageMountHandle mount = NULL;
+    CHECK( "deployed-mount-created",
+           package_mount_create( package, mount_fixture_right( license ), &mount ) == S_OK && mount );
+    if ( mount )
+    {
+        IXPackageImpl *api = GetPackageInterface();
+        SIZE_T size = 0;
+        char view_path[MAX_PATH * 4] = "";
+        WCHAR view[MAX_PATH] = L"";
+        BOOL path_ok = api->XPackageGetMountPathSize( mount, &size ) == S_OK && size > 1 &&
+            api->XPackageGetMountPath( mount, size, view_path ) == S_OK &&
+            MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, view_path, -1, view, MAX_PATH ) > 0;
+        CHECK( "deployed-mount-path", path_ok );
+        CHECK( "deployed-mount-payload",
+               path_ok && mount_fixture_bytes( std::wstring( view ) + L"\\Assets\\logo.png", "deployed payload" ) );
+        api->XPackageCloseMountHandle( mount );
+    }
+    CHECK( "deployed-mount-workspace-cleared", SetEnvironmentVariableW( L"XODUS_MOUNT_ROOT", NULL ) );
+    CHECK( "deployed-mount-workspace-empty", RemoveDirectoryW( workspace ) );
+    content_join( nested, L"logo.png", file );
+    CHECK( "deployed-payload-removed", DeleteFileW( file ) );
+    CHECK( "deployed-missing-payload-rejected", !content_load( root, &package ) );
+    write_text( file, "deployed payload" );
+    /* A complete build tree must not override the deployed payload. */
+    content_join( root, L"build", staging );
+    CHECK( "deployed-staging-directory", CreateDirectoryW( staging, NULL ) );
+    content_join( staging, L"MicrosoftGame.Config", file );
+    write_text( file, "<Game/>" );
+    content_join( staging, L"Assets", nested );
+    CHECK( "deployed-staging-payload-directory", CreateDirectoryW( nested, NULL ) );
+    content_join( nested, L"logo.png", file );
+    write_text( file, "staging payload" );
+    CHECK( "deployed-both-coordinates-destination-preferred", content_load( root, &package ) && package.content );
+    package_mount_plan preferred;
+    BOOL planned = package_mount_read_plan( package, preferred ) == S_OK && preferred.files.size() == 2;
+    auto deployed_entry = preferred.destinations.find( L"Assets\\logo.png" );
+    std::wstring deployed_source = std::wstring( root ) + L"\\Assets\\logo.png";
+    CHECK( "deployed-both-coordinates-mount-plan",
+           planned && deployed_entry != preferred.destinations.end() &&
+               preferred.files[deployed_entry->second].source == deployed_source );
+    /* Missing DestinationPath uses the declared SourcePath, never the root. */
+    write_text( layout, "<Package><Chunk><FileGroup SourcePath=\"Data\" Include=\"*.png\"/></Chunk></Package>" );
+    content_join( root, L"Data", nested );
+    CHECK( "deployed-no-destination-directory", CreateDirectoryW( nested, NULL ) );
+    content_join( nested, L"logo.png", file );
+    write_text( file, "source-only payload" );
+    CHECK( "deployed-no-destination-source-valid", content_load( root, &package ) && package.content );
+    package_mount_plan no_destination;
+    CHECK( "deployed-no-destination-mount-plan", package_mount_read_plan( package, no_destination ) == S_OK &&
+                                                    no_destination.files.size() == 1 &&
+                                                    no_destination.destinations.count( L"Data\\logo.png" ) );
+    CHECK( "deployed-no-destination-payload-removed", DeleteFileW( file ) );
+    content_join( root, L"logo.png", file );
+    write_text( file, "wrong root payload" );
+    CHECK( "deployed-no-destination-root-payload-rejected", !content_load( root, &package ) );
+    /* An invalid declared path must not hide behind the other coordinate. */
+    write_text( layout, "<Package><Chunk>"
+        "<FileGroup SourcePath=\"..\\outside\" Include=\"*.png\" DestinationPath=\"\\Assets\"/>"
+        "</Chunk></Package>" );
+    CHECK( "deployed-invalid-source-declaration-rejected", !content_load( root, &package ) );
+    write_text( layout, "<Package><Chunk>"
+        "<FileGroup SourcePath=\"build\\Assets\" Include=\"*.png\" DestinationPath=\"C:\\outside\"/>"
+        "</Chunk></Package>" );
+    CHECK( "deployed-invalid-destination-declaration-rejected", !content_load( root, &package ) );
+    write_text( layout, "<Package><Chunk>"
+        "<FileGroup SourcePath=\"build\\Assets\" Include=\"*.png\" DestinationPath=\"\\\\server\\share\"/>"
+        "</Chunk></Package>" );
+    CHECK( "deployed-invalid-unc-declaration-rejected", !content_load( root, &package ) );
+    write_text( layout, "<Package><Chunk>"
+        "<FileGroup SourcePath=\".. \" Include=\"*.png\" DestinationPath=\"\\Assets\"/>"
+        "</Chunk></Package>" );
+    CHECK( "deployed-invalid-source-dotspace-rejected", !content_load( root, &package ) );
+    write_text( layout, "<Package><Chunk>"
+        "<FileGroup SourcePath=\"build\\Assets\" Include=\"*.png\" DestinationPath=\"\\.. \"/>"
+        "</Chunk></Package>" );
+    CHECK( "deployed-invalid-destination-dotspace-rejected", !content_load( root, &package ) );
+    write_text( layout, "<Package><Chunk>"
+        "<FileGroup SourcePath=\"build\\Assets\" Include=\"*.png\" DestinationPath=\"\\Assets.\"/>"
+        "</Chunk></Package>" );
+    CHECK( "deployed-invalid-destination-trailing-dot-rejected", !content_load( root, &package ) );
+    write_text( layout, "<Package><Chunk><FileGroup SourcePath=\"Assets\" Include=\"Data.\\*.png\"/></Chunk></Package>" );
+    CHECK( "deployed-invalid-include-prefix-rejected", !content_load( root, &package ) );
+    write_text( layout, "<Package><Chunk><FileGroup SourcePath=\"Assets\" Include=\"As*ets\\*.png\"/></Chunk></Package>" );
+    CHECK( "deployed-invalid-include-wildcard-prefix-rejected", !content_load( root, &package ) );
+    write_text( layout, "<Package><Chunk><FileGroup SourcePath=\"Assets\" Include=\"Data|\\*.png\"/></Chunk></Package>" );
+    CHECK( "deployed-invalid-include-character-rejected", !content_load( root, &package ) );
+    {
+        char prefix[MAX_PATH];
+        const char *leaf;
+        CHECK( "deployed-include-prefix-valid",
+               content_include_parts( "Data\\*.png", prefix, sizeof( prefix ), &leaf ) &&
+                   !strcmp( prefix, "Data" ) && !strcmp( leaf, "*.png" ) );
+        CHECK( "deployed-include-prefix-dot-rejected",
+               !content_include_parts( "Data.\\*.png", prefix, sizeof( prefix ), &leaf ) );
+        CHECK( "deployed-include-prefix-space-rejected",
+               !content_include_parts( "Data \\*.png", prefix, sizeof( prefix ), &leaf ) );
+        CHECK( "deployed-include-prefix-wildcard-rejected",
+               !content_include_parts( "As*ets\\*.png", prefix, sizeof( prefix ), &leaf ) );
+        CHECK( "deployed-include-prefix-character-rejected",
+               !content_include_parts( "Data|\\*.png", prefix, sizeof( prefix ), &leaf ) );
+    }
+    {
+        char relative[MAX_PATH];
+        CHECK( "deployed-location-dotspace-rejected", !content_package_relative( ".. ", relative, sizeof( relative ) ) );
+        CHECK( "deployed-location-trailing-dot-rejected", !content_package_relative( "Assets.", relative, sizeof( relative ) ) );
+        CHECK( "deployed-location-normalized",
+               content_package_relative( "./Assets/", relative, sizeof( relative ) ) && !strcmp( relative, "Assets" ) );
+    }
+    /* Groups that only resolve under different coordinates reject the package. */
+    write_text( layout, "<Package><Chunk>"
+        "<FileGroup SourcePath=\".\" Include=\"MicrosoftGame.config\" DestinationPath=\"\\\"/>"
+        "<FileGroup SourcePath=\"OnlySource\" Include=\"*.png\" DestinationPath=\"\\MissingDest\"/>"
+        "<FileGroup SourcePath=\"build\\Extra\" Include=\"*.dat\" DestinationPath=\"\\Data\"/>"
+        "</Chunk></Package>" );
+    content_join( root, L"OnlySource", nested );
+    CHECK( "deployed-mixed-source-directory", CreateDirectoryW( nested, NULL ) );
+    content_join( nested, L"a.png", file );
+    write_text( file, "source only" );
+    content_join( root, L"Data", nested );
+    content_join( nested, L"b.dat", file );
+    write_text( file, "destination only" );
+    CHECK( "deployed-mixed-coordinates-rejected", !content_load( root, &package ) );
+    /* A layout cannot reach the payload through a reparse-point directory. */
+    write_text( layout, "<Package><Chunk><FileGroup SourcePath=\"Alias\" Include=\"*.png\"/></Chunk></Package>" );
+    content_join( root, L"Real", nested );
+    CHECK( "deployed-reparse-target", CreateDirectoryW( nested, NULL ) );
+    content_join( nested, L"logo.png", file );
+    write_text( file, "linked payload" );
+    content_join( root, L"Alias", staging );
+    CHECK( "deployed-reparse-link", CreateSymbolicLinkW( staging, nested,
+        SYMBOLIC_LINK_FLAG_DIRECTORY | SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE ) );
+    CHECK( "deployed-reparse-directory-rejected", !content_load( root, &package ) );
+    CHECK( "deployed-reparse-link-removed", RemoveDirectoryW( staging ) );
+    DeleteFileW( layout );
+}
+
 int main( int argc, char **argv )
 {
     WCHAR temporary[MAX_PATH];
@@ -619,6 +787,7 @@ int main( int argc, char **argv )
     actual_runtime( NULL );
     current_fixtures();
     test_mount_projection();
+    test_deployed_destination();
     printf( "CHECKS %u FAILURES %u\n", checks, failures );
     return failures ? 1 : 0;
 }
