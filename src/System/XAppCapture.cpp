@@ -30,7 +30,7 @@ HRESULT WINAPI XAppCaptureImpl::XAppCaptureTakeDiagnosticScreenshot( BOOLEAN gam
     return E_NOTIMPL;
 }
 
-HRESULT WINAPI XAppCaptureImpl::XAppCaptureRecordDiagnosticClip( time_t startTime, UINT32 durationInMs,
+HRESULT WINAPI XAppCaptureImpl::XAppCaptureRecordDiagnosticClip( INT64 startTime, UINT32 durationInMs,
                                                                  const char *filenamePrefix,
                                                                  XAppCaptureRecordClipResult *result )
 {

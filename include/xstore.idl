@@ -22,9 +22,8 @@ import "unknwn.idl";
 import "xasync.h";
 import "xuser.idl";
 
-cpp_quote("#if 0")
-typedef UINT64 time_t;
-cpp_quote("#endif")
+/* GDK time_t members use the Microsoft signed 64-bit ABI, independently
+ * of the MinGW CRT time_t selected by the toolchain. */
 
 cpp_quote("#ifdef __cplusplus")
 
@@ -114,7 +113,7 @@ struct XStoreAddonLicense
     char skuStoreId[18];
     char inAppOfferToken[64];
     BOOLEAN isActive;
-    time_t expirationDate;
+    INT64 expirationDate;
 };
 
 struct XStorePrice
@@ -127,14 +126,14 @@ struct XStorePrice
     char formattedPrice[16];
     char formattedRecurrencePrice[16];
     BOOLEAN isOnSale;
-    time_t saleEndDate;
+    INT64 saleEndDate;
 };
 
 struct XStoreAvailability
 {
     const char *availabilityId;
     XStorePrice price;
-    time_t endDate;
+    INT64 endDate;
 };
 
 struct XStoreCanAcquireLicenseResult
@@ -145,9 +144,9 @@ struct XStoreCanAcquireLicenseResult
 
 struct XStoreCollectionData
 {
-    time_t acquiredDate;
-    time_t startDate;
-    time_t endDate;
+    INT64 acquiredDate;
+    INT64 startDate;
+    INT64 endDate;
     BOOLEAN isTrial;
     UINT32 trialTimeRemainingInSeconds;
     UINT32 quantity;
@@ -169,7 +168,7 @@ struct XStoreGameLicense
     BOOLEAN isTrial;
     UINT32 trialTimeRemainingInSeconds;
     char trialUniqueId[64];
-    time_t expirationDate;
+    INT64 expirationDate;
 };
 
 struct XStoreImage

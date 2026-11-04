@@ -285,25 +285,35 @@ public:
     AsyncBlockInternalGuard(XAsyncBlock* asyncBlock) noexcept :
         m_internal(DoLock(asyncBlock))
     {
+        // DoLock returns the caller block locked for every valid pointer,
+        // including terminal and zeroed snapshots.
         m_locked = m_internal != nullptr;
 
-        if (!m_locked)
-        {
-            m_internal = reinterpret_cast<AsyncBlockInternal*>(asyncBlock->internal);
-        }
-
+        m_userInternal = m_internal;
         if (m_internal->signature == ASYNC_BLOCK_SIG && m_internal->state != nullptr)
         {
-            m_userInternal = reinterpret_cast<AsyncBlockInternal*>(m_internal->state->userAsyncBlock->internal);
-        }
-        else
-        {
-            m_userInternal = m_internal;
-        }
-
-        if (m_userInternal != m_internal)
-        {
-            SpinLock::Lock(m_userInternal->lock);
+            // A caller may zero or reuse its block for a newer call while this
+            // call is still pending. Only mirror status into the caller's block
+            // while it still belongs to this state; a block that now describes
+            // another call is left untouched instead of being completed or
+            // orphaned by the late completion of the older call.
+            auto* userInternal = reinterpret_cast<AsyncBlockInternal*>(m_internal->state->userAsyncBlock->internal);
+            // DoLock can fall back to the caller block itself while holding its
+            // lock; never acquire the same lock twice in that alias case.
+            if (userInternal != m_internal)
+            {
+                SpinLock::Lock(userInternal->lock);
+                // Recheck under the lock: the caller may have reused the block
+                // between the state handoff above and this acquisition.
+                if (userInternal->signature == ASYNC_BLOCK_SIG && userInternal->state == m_internal->state)
+                {
+                    m_userInternal = userInternal;
+                }
+                else
+                {
+                    userInternal->lock.clear();
+                }
+            }
         }
     }
 
@@ -402,45 +412,57 @@ private:
 
     static AsyncBlockInternal* DoLock(XAsyncBlock* asyncBlock)
     {
-        AsyncBlockInternal* lockedResult = reinterpret_cast<AsyncBlockInternal*>(asyncBlock->internal);
+        auto* caller = reinterpret_cast<AsyncBlockInternal*>(asyncBlock->internal);
+        assert(caller);
 
-        assert(lockedResult);
-
-        if (lockedResult->signature != ASYNC_BLOCK_SIG)
+        // The caller lock is held at the top of every iteration and is returned
+        // locked for every valid input pointer, including terminal and zeroed
+        // snapshots, so no caller can become active again between resolution and
+        // the guard reading it. Terminal completions keep their recorded
+        // identity; only an unknown snapshot is scrubbed so its union cannot be
+        // read as AsyncState. A caller that was reused during the handoff is
+        // revalidated under its own lock and retried.
+        SpinLock::Lock(caller->lock);
+        for (;;)
         {
-            if (lockedResult->signature != ASYNC_BLOCK_DONE_SIG && lockedResult->signature != ASYNC_BLOCK_RESULT_SIG)
-                lockedResult->state = nullptr;
-            return nullptr;
-        }
-
-        SpinLock::Lock(lockedResult->lock);
-        // Completion can replace state with the terminal identity while we wait.
-        if (lockedResult->signature != ASYNC_BLOCK_SIG)
-        {
-            lockedResult->lock.clear();
-            return nullptr;
-        }
-
-        if (lockedResult->state != nullptr && asyncBlock != &lockedResult->state->providerAsyncBlock)
-        {
-            AsyncStateRef state(lockedResult->state);
-            lockedResult->lock.clear();
-
-            AsyncBlockInternal* stateAsyncBlockInternal = reinterpret_cast<AsyncBlockInternal*>(state->providerAsyncBlock.internal);
-            SpinLock::Lock(stateAsyncBlockInternal->lock);
-
-            if (stateAsyncBlockInternal->signature != ASYNC_BLOCK_SIG || stateAsyncBlockInternal->state == nullptr)
+            if (caller->signature != ASYNC_BLOCK_SIG)
             {
-                stateAsyncBlockInternal->lock.clear();
-                SpinLock::Lock(lockedResult->lock);
+                if (caller->signature != ASYNC_BLOCK_DONE_SIG && caller->signature != ASYNC_BLOCK_RESULT_SIG)
+                    caller->state = nullptr;
+                return caller;
             }
-            else
-            {
-                lockedResult = stateAsyncBlockInternal;
-            }
-        }
 
-        return lockedResult;
+            AsyncState* state = caller->state;
+            if (state == nullptr || asyncBlock == &state->providerAsyncBlock)
+                return caller;
+
+            AsyncStateRef stateRef(state);
+            caller->lock.clear();
+
+            AsyncBlockInternal* provider = reinterpret_cast<AsyncBlockInternal*>(stateRef->providerAsyncBlock.internal);
+            SpinLock::Lock(provider->lock);
+            // Lock order is provider then caller, matching the guard destructor.
+            SpinLock::Lock(caller->lock);
+
+            if (caller->signature != ASYNC_BLOCK_SIG || caller->state != stateRef.Get())
+            {
+                // The caller now references a newer operation. Retry while
+                // keeping the caller lock for the next iteration.
+                provider->lock.clear();
+                continue;
+            }
+
+            if (provider->signature != ASYNC_BLOCK_SIG || provider->state != stateRef.Get())
+            {
+                // This call completed during the handoff. The caller still
+                // references it, so return the caller with its lock held.
+                provider->lock.clear();
+                return caller;
+            }
+
+            caller->lock.clear();
+            return provider;
+        }
     }
 };
 
@@ -653,16 +675,18 @@ static void CALLBACK WorkerCallback(
 
     if (canceled)
     {
-        XAsyncCancel(state->userAsyncBlock);
+        // Address the call through its own provider block: the caller's block
+        // may already belong to a newer call on the same address.
+        XAsyncCancel(&state->providerAsyncBlock);
         HRESULT callStatus;
         {
-            AsyncBlockInternalGuard internal{ state->userAsyncBlock };
+            AsyncBlockInternalGuard internal{ &state->providerAsyncBlock };
             callStatus = internal.GetStatus();
         }
 
         if (callStatus != E_ABORT)
         {
-            XAsyncComplete(state->userAsyncBlock, E_ABORT, 0);
+            XAsyncComplete(&state->providerAsyncBlock, E_ABORT, 0);
         }
     }
     else

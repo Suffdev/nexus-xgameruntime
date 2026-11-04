@@ -123,8 +123,10 @@ static HRESULT save_listing_complete( const char *response, UINT32 listed )
 }
 
 static HRESULT cloud_download( struct XGameSaveProvider *provider, const char *name, const char *display,
-                               const char *remote_time )
+                               const char *remote_time, const container_state *expected = NULL, BOOL expected_exists = FALSE )
 {
+    save_version_guard version( provider, name, expected, expected_exists );
+    if ( FAILED( version.status() ) ) return version.status();
     struct XGameSaveProvider incoming = { 0 };
     char source[2048], target[2048], recovery[2048], guid_text[64];
     WCHAR stage_wide[4096], source_wide[4096], target_wide[4096], recovery_wide[4096], guid_wide[40];
@@ -161,6 +163,9 @@ static HRESULT cloud_download( struct XGameSaveProvider *provider, const char *n
         hr = E_OUTOFMEMORY;
         goto done;
     }
+    {
+    save_cs_lock local( &provider->cs ); save_root_lock root( provider );
+    if ( FAILED( hr = root.status ) || FAILED( hr = version.check() ) ) goto done;
     attributes = GetFileAttributesW( target_wide );
     error = attributes == INVALID_FILE_ATTRIBUTES ? GetLastError() : ERROR_SUCCESS;
     exists = attributes != INVALID_FILE_ATTRIBUTES;
@@ -188,6 +193,7 @@ static HRESULT cloud_download( struct XGameSaveProvider *provider, const char *n
     }
     /* Keep the previous container for recovery. Leading-dot transaction trees
      * are excluded by both providers' local/cloud enumeration rules. */
+    }
 done:
     delete_directory( incoming.root );
     return hr;

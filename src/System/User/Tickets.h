@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: LGPL-2.1-or-later
 #pragma once
 static HRESULT get_rps_tickets( XUser *owner, BOOLEAN allowUi, char **userTicket, char **deviceTicket,
-                                char xbox_msa_id[17], char store_msa_id[17] )
+                                char xbox_msa_id[17], char store_msa_id[17],
+                                const std::atomic<bool> *cancel = nullptr )
 {
     /* The xodus platform's own MSA client id (the hosting app the service
      * signs the account in with). Titles without an MSAAppId in
@@ -39,11 +40,11 @@ static HRESULT get_rps_tickets( XUser *owner, BOOLEAN allowUi, char **userTicket
         return E_INVALIDARG;
     }
 
-    hr = owner->transport.Backend( XODUS_MSA_TOKEN_REQUEST, ( const char * )body, bodySize, &response, &responseSize );
+    hr = owner->transport.BackendCancellable( XODUS_MSA_TOKEN_REQUEST, ( const char * )body, bodySize, &response, &responseSize, cancel ? *cancel : owner->cancelled );
     xmlFree( body );
     if ( FAILED( hr ) )
     {
-        ERR( "xodus-service request failed, hr %#lx. Is xodus-service running?\n", hr );
+        if ( hr != E_ABORT ) ERR( "xodus-service request failed, hr %#lx. Is xodus-service running?\n", hr );
         return hr;
     }
 
@@ -87,3 +88,69 @@ static HRESULT get_rps_tickets( XUser *owner, BOOLEAN allowUi, char **userTicket
 
     return S_OK;
 }
+
+
+// Only a silent request may overlap public endpoint discovery. The child owns
+// its unpublished outputs and is always drained before its owner can unwind.
+class SilentUserTickets
+{
+    XUser *owner;
+    HANDLE thread = nullptr;
+    std::atomic<bool> cancelled{ false };
+    HRESULT result = E_PENDING;
+    char *user = nullptr, *device = nullptr;
+    char xbox[17]{}, store[17]{};
+    static DWORD WINAPI Run( void *value )
+    {
+        auto self = static_cast<SilentUserTickets *>( value );
+        auth_metadata( "init-tickets-begin", self->owner, E_PENDING, 0, FALSE, FALSE );
+        const auto com = CoInitializeEx( nullptr, COINIT_MULTITHREADED );
+        self->result = FAILED( com ) ? com : self->owner->cancelled ? E_ABORT :
+            get_rps_tickets( self->owner, FALSE, &self->user, &self->device, self->xbox, self->store, &self->cancelled );
+        if ( SUCCEEDED( com ) ) CoUninitialize();
+        auth_metadata( "init-tickets-end", self->owner, self->result, 0, FALSE, FALSE );
+        return 0;
+    }
+public:
+    explicit SilentUserTickets( XUser *owner ) : owner( owner ) {}
+    SilentUserTickets( const SilentUserTickets & ) = delete;
+    SilentUserTickets &operator=( const SilentUserTickets & ) = delete;
+    ~SilentUserTickets()
+    {
+        cancelled = true;
+        if ( thread )
+        {
+            WaitForSingleObject( thread, INFINITE );
+            CloseHandle( thread );
+            owner->Release();
+        }
+        free( user ); free( device );
+    }
+    bool Start() noexcept
+    {
+        if ( owner->cancelled ) return false;
+        owner->AddRef();
+        try { thread = owner->transport.StartSilentTicketThread( Run, this ); }
+        catch ( ... ) { thread = nullptr; }
+        if ( !thread ) owner->Release(); // Preserve the sequential fallback.
+        return thread != nullptr;
+    }
+    void Cancel() noexcept { cancelled = true; }
+    HRESULT Take( char **userTicket, char **deviceTicket, char xboxId[17], char storeId[17] ) noexcept
+    {
+        DWORD waited;
+        while ( ( waited = WaitForSingleObject( thread, 25 ) ) == WAIT_TIMEOUT )
+            if ( owner->cancelled ) cancelled = true;
+        if ( waited != WAIT_OBJECT_0 )
+        {
+            const auto error = GetLastError();
+            return error ? HRESULT_FROM_WIN32( error ) : E_UNEXPECTED;
+        }
+        if ( owner->cancelled ) return E_ABORT;
+        if ( FAILED( result ) ) return result;
+        *userTicket = user; user = nullptr;
+        *deviceTicket = device; device = nullptr;
+        memcpy( xboxId, xbox, sizeof( xbox ) ); memcpy( storeId, store, sizeof( store ) );
+        return result;
+    }
+};

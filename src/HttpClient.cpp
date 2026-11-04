@@ -19,33 +19,65 @@
 #include "private.h"
 #include "HttpClient.h"
 #include <winhttp.h>
+#include "HttpCancellation.h"
 
 static const WCHAR USER_AGENT[] = L"curl/1.0";
 
-static HRESULT http_request_once( const WCHAR *method, const WCHAR *url, char *data, const WCHAR *headers,
-                                  const WCHAR **accept, UCHAR **buffer, SIZE_T *bufferSize );
-
-HRESULT http_request( const WCHAR *method, const WCHAR *url, char *data, const WCHAR *headers, const WCHAR **accept,
-                      UCHAR **buffer, SIZE_T *bufferSize )
+static bool http_canceled( const std::atomic<bool> *cancel )
 {
+    return cancel && cancel->load( std::memory_order_acquire );
+}
+static HRESULT http_request_once( const WCHAR *method, const WCHAR *url, char *data, const WCHAR *headers,
+                                  const WCHAR **accept, UCHAR **buffer, SIZE_T *bufferSize,
+                                  const std::atomic<bool> *cancel );
+
+static HRESULT http_request_impl( const WCHAR *method, const WCHAR *url, char *data, const WCHAR *headers,
+                                  const WCHAR **accept, UCHAR **buffer, SIZE_T *bufferSize,
+                                  const std::atomic<bool> *cancel )
+{
+    if ( cancel )
+    {
+        if ( !buffer || !bufferSize ) return E_INVALIDARG;
+        *buffer = NULL; *bufferSize = 0;
+    }
     HRESULT hr = E_FAIL;
     for ( int attempt = 0; attempt < 3; attempt++ )
     {
+        if ( http_canceled( cancel ) ) return E_ABORT;
         if ( attempt )
         {
             WARN( "HTTP request failed with hr %#lx, retrying.\n", hr );
-            Sleep( 500 * attempt );
+            if ( !cancel ) Sleep( 500 * attempt );
+            else for ( DWORD remaining = 500 * attempt; remaining; )
+            {
+                if ( http_canceled( cancel ) ) return E_ABORT;
+                DWORD slice = remaining > 50 ? 50 : remaining;
+                Sleep( slice ); remaining -= slice;
+            }
         }
         *buffer = NULL;
         *bufferSize = 0;
-        if ( SUCCEEDED( hr = http_request_once( method, url, data, headers, accept, buffer, bufferSize ) ) ) break;
-        if ( hr == E_FAIL ) break;
+        hr = http_request_once( method, url, data, headers, accept, buffer, bufferSize, cancel );
+        if ( SUCCEEDED( hr ) || hr == E_FAIL || ( cancel && hr == E_ABORT ) ) break;
     }
     return hr;
 }
 
+HRESULT http_request( const WCHAR *method, const WCHAR *url, char *data, const WCHAR *headers, const WCHAR **accept,
+                      UCHAR **buffer, SIZE_T *bufferSize )
+{
+    return http_request_impl( method, url, data, headers, accept, buffer, bufferSize, nullptr );
+}
+HRESULT http_request_cancellable( const WCHAR *method, const WCHAR *url, char *data, const WCHAR *headers,
+                                  const WCHAR **accept, UCHAR **buffer, SIZE_T *bufferSize,
+                                  const std::atomic<bool> &cancel )
+{
+    return http_request_impl( method, url, data, headers, accept, buffer, bufferSize, &cancel );
+}
+
 static HRESULT http_request_once( const WCHAR *method, const WCHAR *url, char *data, const WCHAR *headers,
-                                  const WCHAR **accept, UCHAR **buffer, SIZE_T *bufferSize )
+                                  const WCHAR **accept, UCHAR **buffer, SIZE_T *bufferSize,
+                                  const std::atomic<bool> *cancel )
 {
     URL_COMPONENTS uc = {
         .dwStructSize = sizeof( URL_COMPONENTS ), .dwHostNameLength = MAXDWORD, .dwUrlPathLength = MAXDWORD };
@@ -54,7 +86,9 @@ static HRESULT http_request_once( const WCHAR *method, const WCHAR *url, char *d
     WCHAR *hostName = NULL;
     UCHAR *tmpBuffer = NULL;
     HRESULT hr = S_OK;
+    HttpCancellationMonitor cancellation;
 
+    if ( http_canceled( cancel ) ) { hr = E_ABORT; goto cleanup; }
     if ( !WinHttpCrackUrl( url, 0, 0, &uc ) ) goto error;
     if ( !( hostName = static_cast<std::remove_reference_t<decltype( hostName )>>(
                 calloc( uc.dwHostNameLength + 1, sizeof( WCHAR ) ) ) ) )
@@ -64,20 +98,28 @@ static HRESULT http_request_once( const WCHAR *method, const WCHAR *url, char *d
     }
     memcpy( hostName, uc.lpszHostName, uc.dwHostNameLength * sizeof( WCHAR ) );
 
+    if ( http_canceled( cancel ) ) { hr = E_ABORT; goto cleanup; }
     if ( !( session = WinHttpOpen( USER_AGENT, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
                                    WINHTTP_NO_PROXY_BYPASS, 0 ) ) )
         goto error;
+    if ( http_canceled( cancel ) ) { hr = E_ABORT; goto cleanup; }
     if ( !( connection = WinHttpConnect( session, hostName, INTERNET_DEFAULT_HTTPS_PORT, 0 ) ) ) goto error;
+    if ( http_canceled( cancel ) ) { hr = E_ABORT; goto cleanup; }
     if ( !( request = WinHttpOpenRequest( connection, method, uc.lpszUrlPath, NULL, WINHTTP_NO_REFERER, accept,
                                           WINHTTP_FLAG_SECURE ) ) )
         goto error;
+    if ( FAILED( hr = cancellation.start( request, cancel ) ) ) goto cleanup;
+    if ( http_canceled( cancel ) ) { hr = E_ABORT; goto cleanup; }
     if ( !WinHttpSendRequest( request, headers ? headers : WINHTTP_NO_ADDITIONAL_HEADERS, headers ? -1 : 0, data,
                               ( data ? strlen( data ) : 0 ), ( data ? strlen( data ) : 0 ), 0 ) )
         goto error;
+    if ( http_canceled( cancel ) ) { hr = E_ABORT; goto cleanup; }
     if ( !WinHttpReceiveResponse( request, NULL ) ) goto error;
+    if ( http_canceled( cancel ) ) { hr = E_ABORT; goto cleanup; }
     if ( !WinHttpQueryHeaders( request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
                                WINHTTP_HEADER_NAME_BY_INDEX, &status, &size, WINHTTP_NO_HEADER_INDEX ) )
         goto error;
+    if ( http_canceled( cancel ) ) { hr = E_ABORT; goto cleanup; }
     if ( status != 200 )
     {
         hr = E_FAIL;
@@ -90,7 +132,9 @@ static HRESULT http_request_once( const WCHAR *method, const WCHAR *url, char *d
     tmpBuffer = NULL;
     do
     {
+        if ( http_canceled( cancel ) ) { hr = E_ABORT; goto cleanup; }
         if ( !WinHttpQueryDataAvailable( request, &size ) ) goto error;
+        if ( http_canceled( cancel ) ) { hr = E_ABORT; goto cleanup; }
         if ( !size ) break;
         if ( !( tmpBuffer = static_cast<std::remove_reference_t<decltype( tmpBuffer )>>(
                     realloc( *buffer, *bufferSize + size ) ) ) )
@@ -100,7 +144,9 @@ static HRESULT http_request_once( const WCHAR *method, const WCHAR *url, char *d
         }
         *buffer = tmpBuffer;
 
+        if ( http_canceled( cancel ) ) { hr = E_ABORT; goto cleanup; }
         if ( !WinHttpReadData( request, *buffer + *bufferSize, size, &size ) ) goto error;
+        if ( http_canceled( cancel ) ) { hr = E_ABORT; goto cleanup; }
         *bufferSize += size;
     } while ( size );
     goto cleanup;
@@ -108,10 +154,12 @@ static HRESULT http_request_once( const WCHAR *method, const WCHAR *url, char *d
 error:
     hr = HRESULT_FROM_WIN32( GetLastError() );
 cleanup:
-    if ( connection ) WinHttpCloseHandle( connection );
+    cancellation.join();
     if ( request ) WinHttpCloseHandle( request );
+    if ( connection ) WinHttpCloseHandle( connection );
     if ( session ) WinHttpCloseHandle( session );
     if ( hostName ) free( hostName );
+    if ( http_canceled( cancel ) ) hr = E_ABORT;
     if ( SUCCEEDED( hr ) ) return hr;
     if ( *buffer ) free( *buffer );
     *bufferSize = 0;
@@ -200,7 +248,9 @@ cleanup:
         const BYTE *inp = data;                                                                                        \
         type *out = base64;                                                                                            \
                                                                                                                        \
-        if ( ( dataSize * 8 + 5 ) / 6 + ( pad ? ( 4 - ( dataSize % 4 ) ) % 4 : 0 ) > base64Size )                      \
+        const UINT64 required = pad ? ( ( UINT64( dataSize ) + 2 ) / 3 ) * 4                                  \
+                                    : ( UINT64( dataSize ) * 8 + 5 ) / 6;                                     \
+        if ( required > base64Size )                                                                                  \
             return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );                                                    \
                                                                                                                        \
         for ( UINT32 i = 0; i < dataSize / 3; i++ )                                                                    \

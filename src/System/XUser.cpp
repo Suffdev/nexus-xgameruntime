@@ -33,14 +33,6 @@
 #include <type_traits>
 #include <cmath>
 
-static WCHAR *WineGetDosFileName( const char *path )
-{
-    using Convert = WCHAR *( CDECL * )( const char * );
-    auto module = GetModuleHandleW( L"kernel32.dll" );
-    auto convert = module ? reinterpret_cast<Convert>( GetProcAddress( module, "wine_get_dos_file_name" ) ) : nullptr;
-    return convert ? convert( path ) : nullptr;
-}
-
 static const char *GetMsaAppId()
 {
     const auto *config = nexus::GetGameConfiguration();
@@ -234,151 +226,7 @@ ULONG WINAPI XUser::Release()
     return ref;
 }
 
-#define XODUS_XML_MAGIC 0x58445358
-#define XODUS_MSA_TOKEN_REQUEST 3
-
-static HRESULT xodus_socket_path( char *path, SIZE_T size )
-{
-    char unixPath[MAX_PATH];
-    WCHAR *dosPath;
-    DWORD len;
-
-    if ( !( len = GetEnvironmentVariableA( "XODUS_SOCKET", unixPath, sizeof( unixPath ) ) ) ||
-         len >= sizeof( unixPath ) )
-    {
-        if ( !( len = GetEnvironmentVariableA( "WINE_HOST_XDG_RUNTIME_DIR", unixPath, sizeof( unixPath ) ) ) ||
-             len >= sizeof( unixPath ) )
-            len = GetEnvironmentVariableA( "XDG_RUNTIME_DIR", unixPath, sizeof( unixPath ) );
-        if ( !len || len + strlen( "/xodus.sock" ) >= sizeof( unixPath ) )
-            return HRESULT_FROM_WIN32( ERROR_ENVVAR_NOT_FOUND );
-        strcat( unixPath, "/xodus.sock" );
-    }
-
-    if ( !( dosPath = WineGetDosFileName( unixPath ) ) ) return HRESULT_FROM_WIN32( ERROR_PATH_NOT_FOUND );
-    len = WideCharToMultiByte( CP_ACP, 0, dosPath, -1, path, size, NULL, NULL );
-    HeapFree( GetProcessHeap(), 0, dosPath );
-    return len ? S_OK : HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
-}
-
-static BOOL xodus_send( SOCKET s, const char *data, int size )
-{
-    int sent;
-
-    while ( size > 0 )
-    {
-        if ( ( sent = send( s, data, size, 0 ) ) <= 0 ) return FALSE;
-        data += sent;
-        size -= sent;
-    }
-    return TRUE;
-}
-
-static BOOL xodus_recv( SOCKET s, char *data, int size )
-{
-    int received;
-
-    while ( size > 0 )
-    {
-        if ( ( received = recv( s, data, size, 0 ) ) <= 0 ) return FALSE;
-        data += received;
-        size -= received;
-    }
-    return TRUE;
-}
-
-static HRESULT xodus_request( UINT16 type, const char *body, UINT16 size, char **response, UINT16 *responseSize )
-{
-    struct sockaddr_un addr = { .sun_family = AF_UNIX };
-    UINT32 magic = XODUS_XML_MAGIC;
-    struct sockaddr_in bridge = { 0 };
-    UINT16 responseType;
-    SOCKET s = INVALID_SOCKET;
-    char bridgePort[8], bridgeKey[65], *end;
-    char header[8];
-    DWORD portLen, keyLen;
-    unsigned long port;
-    BOOL useBridge;
-    WSADATA wsa;
-    HRESULT hr;
-
-    portLen = GetEnvironmentVariableA( "XODUS_BRIDGE_PORT", bridgePort, sizeof( bridgePort ) );
-    keyLen = GetEnvironmentVariableA( "XODUS_BRIDGE_KEY", bridgeKey, sizeof( bridgeKey ) );
-    useBridge = portLen || keyLen;
-    if ( useBridge )
-    {
-        if ( !portLen || portLen >= sizeof( bridgePort ) || keyLen != 64 ) return E_INVALIDARG;
-        port = strtoul( bridgePort, &end, 10 );
-        if ( *end || !port || port > 65535 ) return E_INVALIDARG;
-        bridge.sin_family = AF_INET;
-        bridge.sin_port = htons( ( USHORT )port );
-        bridge.sin_addr.s_addr = htonl( 0x7f000001 );
-    }
-    else if ( FAILED( hr = xodus_socket_path( addr.sun_path, sizeof( addr.sun_path ) ) ) )
-        return hr;
-    if ( WSAStartup( MAKEWORD( 2, 2 ), &wsa ) ) return E_FAIL;
-
-    memcpy( header, &magic, 4 );
-    memcpy( header + 4, &type, 2 );
-    memcpy( header + 6, &size, 2 );
-
-    if ( useBridge )
-    {
-        if ( ( s = socket( AF_INET, SOCK_STREAM, IPPROTO_TCP ) ) == INVALID_SOCKET ) goto error;
-        if ( type == 5 )
-        {
-            DWORD timeout = 95000;
-            if ( setsockopt( s, SOL_SOCKET, SO_RCVTIMEO, ( char * )&timeout, sizeof( timeout ) ) ||
-                 setsockopt( s, SOL_SOCKET, SO_SNDTIMEO, ( char * )&timeout, sizeof( timeout ) ) )
-                goto error;
-        }
-        if ( connect( s, ( struct sockaddr * )&bridge, sizeof( bridge ) ) ) goto error;
-        if ( !xodus_send( s, bridgeKey, 64 ) ) goto error;
-    }
-    else
-    {
-        if ( ( s = socket( AF_UNIX, SOCK_STREAM, 0 ) ) == INVALID_SOCKET ) goto error;
-        if ( type == 5 )
-        {
-            DWORD timeout = 95000;
-            if ( setsockopt( s, SOL_SOCKET, SO_RCVTIMEO, ( char * )&timeout, sizeof( timeout ) ) ||
-                 setsockopt( s, SOL_SOCKET, SO_SNDTIMEO, ( char * )&timeout, sizeof( timeout ) ) )
-                goto error;
-        }
-        if ( connect( s, ( struct sockaddr * )&addr, sizeof( addr ) ) ) goto error;
-    }
-    if ( !xodus_send( s, header, sizeof( header ) ) || !xodus_send( s, body, size ) ) goto error;
-    if ( !xodus_recv( s, header, sizeof( header ) ) ) goto error;
-
-    memcpy( &responseType, header + 4, 2 );
-    memcpy( responseSize, header + 6, 2 );
-    if ( memcmp( header, &magic, 4 ) || responseType != type + 1 || !*responseSize )
-    {
-        hr = E_UNEXPECTED;
-        goto done;
-    }
-    if ( !( *response =
-                static_cast<std::remove_reference_t<decltype( *response )>>( calloc( 1, *responseSize + 1 ) ) ) )
-    {
-        hr = E_OUTOFMEMORY;
-        goto done;
-    }
-    if ( !xodus_recv( s, *response, *responseSize ) )
-    {
-        free( *response );
-        *response = NULL;
-        goto error;
-    }
-    hr = S_OK;
-    goto done;
-
-error:
-    hr = HRESULT_FROM_WIN32( WSAGetLastError() );
-    if ( SUCCEEDED( hr ) ) hr = E_FAIL;
-done:
-    if ( s != INVALID_SOCKET ) closesocket( s );
-    WSACleanup();
-    return hr;
-}
+#include "User/BackendRequest.h"
 
 class DefaultUserTransport final : public UserTransport
 {
@@ -387,10 +235,21 @@ public:
     {
         return xodus_request( type, body, size, response, responseSize );
     }
+    HRESULT BackendCancellable( UINT16 type, const char *body, UINT16 size, char **response, UINT16 *responseSize,
+                                const std::atomic<bool> &cancel ) override
+    {
+        return xodus_request( type, body, size, response, responseSize, 95000, &cancel );
+    }
     HRESULT Http( const WCHAR *method, const WCHAR *url, char *body, const WCHAR *headers, const WCHAR **accept,
                   BYTE **response, SIZE_T *responseSize ) override
     {
         return http_request( method, url, body, headers, accept, response, responseSize );
+    }
+    HRESULT HttpCancellable( const WCHAR *method, const WCHAR *url, char *body, const WCHAR *headers,
+                             const WCHAR **accept, BYTE **response, SIZE_T *responseSize,
+                             const std::atomic<bool> &cancel ) override
+    {
+        return http_request_cancellable( method, url, body, headers, accept, response, responseSize, cancel );
     }
     HRESULT HttpRaw( const WCHAR *method, const WCHAR *url, const WCHAR *headers, const void *body, DWORD bodySize,
                      DWORD *status, BYTE **response, SIZE_T *responseSize ) override
@@ -470,7 +329,8 @@ void xodus_store_license_note( const char *phase, HRESULT hr )
     auth_metadata( phase, NULL, hr, 0, FALSE, FALSE );
 }
 
-HRESULT xodus_store_license_xml( const char *request, SIZE_T request_size, char **token )
+HRESULT xodus_store_license_xml( const char *request, SIZE_T request_size, char **token,
+                                LONG *canceled, ULONGLONG entitlement_deadline )
 {
     char *response = NULL, *code = NULL, *end;
     UINT16 response_size = 0;
@@ -478,12 +338,20 @@ HRESULT xodus_store_license_xml( const char *request, SIZE_T request_size, char 
     xmlNodePtr root;
     HRESULT hr;
     unsigned long value;
+    DWORD timeout = 95000;
 
     *token = NULL;
-    if ( request_size > 0xffff ) return E_INVALIDARG;
+    if ( request_size > 0xffff || ( !request && request_size ) ) return E_INVALIDARG;
+    if ( canceled && InterlockedCompareExchange( canceled, 0, 0 ) ) return E_ABORT;
+    if ( entitlement_deadline )
+    {
+        const auto now = GetTickCount64();
+        if ( now >= entitlement_deadline ) return HRESULT_FROM_WIN32( ERROR_TIMEOUT );
+        timeout = static_cast<DWORD>( std::min<ULONGLONG>( timeout, entitlement_deadline - now ) );
+    }
     /* Request 5 returns only a genuine Microsoft licensing token, request 6.
      * Older services cannot provide it and must fail, never fabricate success. */
-    if ( FAILED( hr = xodus_request( 5, request, request_size, &response, &response_size ) ) ) goto cleanup;
+    if ( FAILED( hr = xodus_request_with_shared_cancellation( 5, request, request_size, &response, &response_size, timeout, nullptr, canceled ) ) ) goto cleanup;
     if ( !( doc = xmlReadMemory( response, response_size, NULL, NULL, XML_PARSE_NONET ) ) )
     {
         hr = E_UNEXPECTED;
@@ -525,6 +393,12 @@ cleanup:
     return hr;
 }
 
+// Direct token queries retain their original IPC budget and behavior.
+HRESULT xodus_store_license_xml( const char *request, SIZE_T request_size, char **token )
+{
+    return xodus_store_license_xml( request, request_size, token, nullptr, 0 );
+}
+
 #include "User/Tickets.h"
 
 static HRESULT device_auth( XUserHandle user, const char *deviceTicket, char **deviceToken )
@@ -553,8 +427,8 @@ static HRESULT device_auth( XUserHandle user, const char *deviceTicket, char **d
                                               size - 1, body, signature ) ) )
         goto cleanup;
     if ( !MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, signature, 104, header + 11, 104 ) ) goto error;
-    if ( FAILED( hr = user->transport.Http( L"POST", L"https://device.auth.xboxlive.com/device/authenticate", body,
-                                            header, ACCEPT_JSON, &buffer, &size ) ) )
+    if ( FAILED( hr = user->transport.HttpCancellable( L"POST", L"https://device.auth.xboxlive.com/device/authenticate", body,
+                                                       header, ACCEPT_JSON, &buffer, &size, user->cancelled ) ) )
         goto cleanup;
     if ( FAILED( hr = parse_json( ( char * )buffer, size, &object ) ) ) goto cleanup;
     if ( FAILED( hr = get_json_string( object, L"Token", &token ) ) ) goto cleanup;
@@ -583,7 +457,7 @@ cleanup:
 
 static HRESULT xsts_authorize( XUserHandle user, const char *relyingParty, BOOL title, char **auth );
 static HRESULT xsts_authorize_privilege( XUserHandle user, const char *relyingParty, BOOL title, char **auth,
-                                         XUserPrivilege privilege, BOOLEAN *granted, bool presence = false );
+                                         XUserPrivilege privilege, BOOLEAN *granted, bool presence = false, UINT64 *expires = nullptr );
 static char *hstring_to_utf8( HSTRING string );
 static WCHAR *utf8_to_wide( const char *string );
 
@@ -613,8 +487,8 @@ static HRESULT sisu_auth( XUserHandle user, const char *userTicket, const char *
                                               signature ) ) )
         goto cleanup;
     if ( !MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, signature, 104, header + 11, 104 ) ) goto error;
-    if ( FAILED( hr = user->transport.Http( L"POST", L"https://sisu.xboxlive.com/authorize", body, header, ACCEPT_JSON,
-                                            &buffer, &size ) ) )
+    if ( FAILED( hr = user->transport.HttpCancellable( L"POST", L"https://sisu.xboxlive.com/authorize", body, header, ACCEPT_JSON,
+                                                       &buffer, &size, user->cancelled ) ) )
         goto cleanup;
 
     if ( FAILED( hr = parse_json( ( char * )buffer, size, &object ) ) ) goto cleanup;
@@ -942,14 +816,18 @@ HRESULT XUser::InitializeNetwork( XUserAddOptions options )
     WCHAR *auth = NULL;
     SIZE_T size, defaultSize = 0;
     HRESULT hr;
+    SilentUserTickets silentTickets( user );
+    bool overlappingTickets = false;
 
     /* The launcher already found Microsoft unreachable; fail as the network would. */
     if ( nexus::user::ForcedOffline() ) return HRESULT_FROM_WIN32( ERROR_WINHTTP_CANNOT_CONNECT );
+    if ( !GetMsaAppId() && GetFullTrust() && !GetLegacyFullTrust() ) return E_GAME_MISSING_GAME_CONFIG;
+    if ( !( options & XUserAddOptions::AddDefaultUserAllowingUI ) ) overlappingTickets = silentTickets.Start();
     auth_metadata( "init-default-begin", user, E_PENDING, 0, FALSE, FALSE );
-    hr = user->transport.Http( L"GET", L"https://title.mgt.xboxlive.com/titles/default/endpoints?type=1", NULL, NULL,
-                               ACCEPT_JSON, &defaultBuffer, &defaultSize );
+    hr = user->transport.HttpCancellable( L"GET", L"https://title.mgt.xboxlive.com/titles/default/endpoints?type=1", NULL, NULL,
+                                          ACCEPT_JSON, &defaultBuffer, &defaultSize, user->cancelled );
     auth_metadata( "init-default-end", user, hr, 0, FALSE, FALSE );
-    if ( FAILED( hr ) ) return hr;
+    if ( FAILED( hr ) ) goto cleanup;
     if ( cancelled )
     {
         hr = E_ABORT;
@@ -963,10 +841,11 @@ HRESULT XUser::InitializeNetwork( XUserAddOptions options )
         hr = E_ABORT;
         goto cleanup;
     }
-    auth_metadata( "init-tickets-begin", user, E_PENDING, 0, FALSE, FALSE );
-    hr = get_rps_tickets( user, options & XUserAddOptions::AddDefaultUserAllowingUI, &userTicket, &deviceTicket,
-                          impl->xbox_msa_id, impl->store_msa_id );
-    auth_metadata( "init-tickets-end", user, hr, 0, FALSE, FALSE );
+    if ( !overlappingTickets ) auth_metadata( "init-tickets-begin", user, E_PENDING, 0, FALSE, FALSE );
+    hr = overlappingTickets ? silentTickets.Take( &userTicket, &deviceTicket, impl->xbox_msa_id, impl->store_msa_id ) :
+        get_rps_tickets( user, options & XUserAddOptions::AddDefaultUserAllowingUI, &userTicket, &deviceTicket,
+                         impl->xbox_msa_id, impl->store_msa_id );
+    if ( !overlappingTickets ) auth_metadata( "init-tickets-end", user, hr, 0, FALSE, FALSE );
     if ( FAILED( hr ) ) goto cleanup;
     if ( cancelled )
     {
@@ -998,8 +877,8 @@ HRESULT XUser::InitializeNetwork( XUserAddOptions options )
         goto cleanup;
     }
     auth_metadata( "init-current-begin", user, E_PENDING, 0, FALSE, FALSE );
-    hr = user->transport.Http( L"GET", L"https://title.mgt.xboxlive.com/titles/current/endpoints", NULL, auth,
-                               ACCEPT_JSON, &currentBuffer, &size );
+    hr = user->transport.HttpCancellable( L"GET", L"https://title.mgt.xboxlive.com/titles/current/endpoints", NULL, auth,
+                                          ACCEPT_JSON, &currentBuffer, &size, user->cancelled );
     auth_metadata( "init-current-end", user, hr, 0, FALSE, FALSE );
     if ( FAILED( hr ) ) goto cleanup;
     if ( cancelled )
@@ -1018,6 +897,7 @@ HRESULT XUser::InitializeNetwork( XUserAddOptions options )
     impl->RememberOfflineIdentity( defaultBuffer, defaultSize, currentBuffer, size );
 
 cleanup:
+    if ( FAILED( hr ) || cancelled ) silentTickets.Cancel();
     if ( currentBuffer ) free( currentBuffer );
     if ( defaultBuffer ) free( defaultBuffer );
     if ( deviceTicket ) free( deviceTicket );
@@ -1029,6 +909,7 @@ cleanup:
 
 void XUser::ResetNetworkState() noexcept
 {
+    authorizationCache.Clear();
     free( userToken );
     userToken = nullptr;
     free( deviceToken );
@@ -1229,6 +1110,16 @@ struct UserNetworkInit
     XUserAddContext *context;
     IXThreadingImpl *threading;
 };
+// These results require the caller to correct its request/configuration or
+// release resources, or explicitly cancel the operation. Restarting the whole
+// handshake cannot repair them. Remote/transport/authentication failures retain
+// the existing bounded retry policy; no failure is cached across XUserAdd calls.
+static bool sign_in_retryable( HRESULT result ) noexcept
+{
+    return result != E_ABORT && result != E_INVALIDARG && result != E_OUTOFMEMORY &&
+           result != E_GAME_MISSING_GAME_CONFIG;
+}
+
 static DWORD WINAPI UserNetworkInitThread( void *arg )
 {
     auto init = static_cast<UserNetworkInit *>( arg );
@@ -1245,7 +1136,7 @@ static DWORD WINAPI UserNetworkInitThread( void *arg )
         auth_metadata( "init-attempt-begin", user, E_PENDING, 0, FALSE, FALSE );
         hr = user->InitializeNetwork( context->options );
         auth_metadata( "init-attempt-end", user, hr, 0, FALSE, FALSE );
-        if ( SUCCEEDED( hr ) || user->cancelled ) break;
+        if ( SUCCEEDED( hr ) || user->cancelled || !sign_in_retryable( hr ) ) break;
         /* An unreachable Microsoft on an offline-licensed launch is not a
          * start race: the cached identity takes over without the retry waits. */
         if ( nexus::user::IsConnectivityFailure( hr ) &&
@@ -1345,8 +1236,21 @@ HRESULT WINAPI XUser::GetEndpointInfo( const char *url, struct endpoint *info )
         const WCHAR *host = WindowsGetStringRawBuffer( impl->endpoints[i].host, &hostLen );
         const WCHAR *path = WindowsGetStringRawBuffer( impl->endpoints[i].path, &pathLen );
         if ( uc.dwSchemeLength != protocolLen || wcsnicmp( uc.lpszScheme, protocol, protocolLen ) ) continue;
-        if ( impl->endpoints[i].path && ( uc.dwUrlPathLength < pathLen || wcsncmp( uc.lpszUrlPath, path, pathLen ) ) )
-            continue;
+        if ( impl->endpoints[i].path )
+        {
+            const WCHAR *urlPath = uc.lpszUrlPath;
+            UINT32 urlPathLen = uc.dwUrlPathLength;
+            /* Service metadata accepts paths relative to the URL root ("login")
+             * as well as absolute paths ("/login"). WinHTTP includes the root
+             * slash in its parsed path. Keep all remaining bytes and the
+             * existing case-sensitive prefix semantics unchanged. */
+            if ( pathLen && path[0] != '/' && urlPathLen && urlPath[0] == '/' )
+            {
+                ++urlPath;
+                --urlPathLen;
+            }
+            if ( urlPathLen < pathLen || wcsncmp( urlPath, path, pathLen ) ) continue;
+        }
         if ( impl->endpoints[i].wildcard )
         {
             if ( !match && match_wildcard( host, hostLen, uc.lpszHostName, uc.dwHostNameLength ) )
@@ -1368,25 +1272,38 @@ error:
     return HRESULT_FROM_WIN32( GetLastError() );
 }
 
-HRESULT WINAPI XUser::GetAuthorization( const WCHAR *relyingParty, WCHAR **auth )
+HRESULT WINAPI XUser::GetAuthorization( const WCHAR *relyingParty, WCHAR **auth, bool forceRefresh )
 {
-    auto *impl = this;
-    char *relyingPartyA, *authA = NULL;
-    SIZE_T size;
-    HRESULT hr;
-
-    if ( FAILED( hr = user_wait_init( impl ) ) ) return hr;
-
-    if ( !( size = WideCharToMultiByte( CP_UTF8, WC_ERR_INVALID_CHARS, relyingParty, -1, NULL, 0, NULL, NULL ) ) )
-        return HRESULT_FROM_WIN32( GetLastError() );
-    if ( !( relyingPartyA = static_cast<std::remove_reference_t<decltype( relyingPartyA )>>( calloc( 1, size ) ) ) )
-        return E_OUTOFMEMORY;
-    WideCharToMultiByte( CP_UTF8, WC_ERR_INVALID_CHARS, relyingParty, -1, relyingPartyA, size, NULL, NULL );
-    if ( SUCCEEDED( hr = xsts_authorize( impl, relyingPartyA, TRUE, &authA ) ) && !( *auth = utf8_to_wide( authA ) ) )
-        hr = E_OUTOFMEMORY;
-    free( relyingPartyA );
-    free( authA );
-    return hr;
+    if ( !auth ) return E_POINTER;
+    *auth = nullptr;
+    if ( !relyingParty ) return E_INVALIDARG;
+    HRESULT hr = user_wait_init( this );
+    if ( FAILED( hr ) ) return hr;
+    if ( cancelled ) return E_ABORT;
+    if ( offline ) return HRESULT_FROM_WIN32( ERROR_WINHTTP_CANNOT_CONNECT );
+    try
+    {
+        const int size = WideCharToMultiByte( CP_UTF8, WC_ERR_INVALID_CHARS, relyingParty, -1, nullptr, 0, nullptr, nullptr );
+        if ( !size ) return HRESULT_FROM_WIN32( GetLastError() );
+        if ( size > 65536 ) return E_INVALIDARG;
+        std::string audience( size, '\0' ), token;
+        if ( !WideCharToMultiByte( CP_UTF8, WC_ERR_INVALID_CHARS, relyingParty, -1, audience.data(), size, nullptr, nullptr ) )
+            return HRESULT_FROM_WIN32( GetLastError() );
+        audience.resize( size - 1 );
+        hr = authorizationCache.Get( audience.c_str(), forceRefresh, cancelled,
+            [&]( std::string &value, UINT64 &expires ) {
+                char *response = nullptr;
+                HRESULT result = xsts_authorize_privilege( this, audience.c_str(), TRUE, &response,
+                    static_cast<XUserPrivilege>( 0 ), nullptr, false, &expires );
+                std::unique_ptr<char, decltype( &free )> owned( response, free );
+                if ( SUCCEEDED( result ) ) value = response;
+                return result;
+            }, token );
+        if ( SUCCEEDED( hr ) && !( *auth = utf8_to_wide( token.c_str() ) ) ) return E_OUTOFMEMORY;
+        return hr;
+    }
+    catch ( const std::bad_alloc & ) { return E_OUTOFMEMORY; }
+    catch ( ... ) { return E_FAIL; }
 }
 
 HRESULT WINAPI XUser::GetSignature( UINT32 version, const char *method, const char *url, const char *auth,
@@ -1782,6 +1699,7 @@ static HRESULT WINAPI gamer_picture_phase( XAsyncOp op, const XAsyncProviderData
         break;
 
     case XAsyncOp::DoWork:
+        if ( InterlockedCompareExchange( &context->canceled, 0, 0 ) ) { hr = E_ABORT; goto cleanup; }
         switch ( context->pictureSize )
         {
         case XUserGamerPictureSize::Small:
@@ -1802,6 +1720,7 @@ static HRESULT WINAPI gamer_picture_phase( XAsyncOp op, const XAsyncProviderData
         }
 
         if ( FAILED( hr = ( context->user )->GetAuthorization( L"http://xboxlive.com", &auth ) ) ) goto cleanup;
+        if ( InterlockedCompareExchange( &context->canceled, 0, 0 ) ) { hr = E_ABORT; goto cleanup; }
         /* This internal call needs the same proof-of-possession signature
          * as title requests, and the profile service's v2 contract. Never
          * forward the Xbox credential or signature to the image CDN. */
@@ -1849,9 +1768,11 @@ static HRESULT WINAPI gamer_picture_phase( XAsyncOp op, const XAsyncProviderData
             wcscat( headers, signatureW );
             wcscat( headers, L"\r\n" );
         }
+        if ( InterlockedCompareExchange( &context->canceled, 0, 0 ) ) { hr = E_ABORT; goto cleanup; }
         if ( FAILED( hr = context->user->transport.Http( L"GET", profileUrlW, NULL, headers, ACCEPT_JSON, &buffer,
                                                          &size ) ) )
             goto cleanup;
+        if ( InterlockedCompareExchange( &context->canceled, 0, 0 ) ) { hr = E_ABORT; goto cleanup; }
         if ( FAILED( hr = parse_json( ( char * )buffer, size, &object ) ) ) goto cleanup;
         if ( FAILED( hr = get_json_array( object, L"profileUsers", &profiles ) ) ) goto cleanup;
         if ( FAILED( hr = ( profiles )->GetObjectAt( 0, &profile ) ) ) goto cleanup;
@@ -1869,9 +1790,11 @@ static HRESULT WINAPI gamer_picture_phase( XAsyncOp op, const XAsyncProviderData
         wcscpy( url, valueBuffer );
         wcscat( url, suffix );
         if ( !wcschr( valueBuffer, '?' ) ) url[wcslen( valueBuffer )] = '?';
+        if ( InterlockedCompareExchange( &context->canceled, 0, 0 ) ) { hr = E_ABORT; goto cleanup; }
         hr = context->user->transport.Http( L"GET", url, NULL, NULL, accept, &context->buffer, &context->bufferSize );
 
     cleanup:
+        if ( InterlockedCompareExchange( &context->canceled, 0, 0 ) ) hr = E_ABORT;
         ( xthreading )->XAsyncComplete( data->async, hr, SUCCEEDED( hr ) ? context->bufferSize : 0 );
         if ( profiles ) ( profiles )->Release();
         if ( settings ) ( settings )->Release();
@@ -2220,7 +2143,9 @@ static HRESULT WINAPI token_signature_phase( XAsyncOp op, const XAsyncProviderDa
         }
         if ( info.tokenType &&
              FAILED( hr = ( context->user )
-                              ->GetAuthorization( WindowsGetStringRawBuffer( info.relyingParty, NULL ), &auth ) ) )
+                              ->GetAuthorization( WindowsGetStringRawBuffer( info.relyingParty, NULL ), &auth,
+                                  ( static_cast<UINT32>( context->options ) &
+                                    static_cast<UINT32>( XUserGetTokenAndSignatureOptions::ForceRefresh ) ) != 0 ) ) )
             goto complete;
 
         if ( context->isUtf16 )
@@ -2998,6 +2923,8 @@ HRESULT xuser_signed_request( XUserHandle user, const char *method, const char *
                                                           bufferSize ) ) &&
                  *status < 500 )
                 break;
+            if ( hr == E_ABORT || hr == E_INVALIDARG || hr == E_OUTOFMEMORY )
+                break;
             if ( SUCCEEDED( hr ) )
             {
                 free( *buffer );
@@ -3020,11 +2947,11 @@ static HRESULT xsts_authorize( XUserHandle user, const char *relyingParty, BOOL 
 }
 
 static HRESULT xsts_authorize_privilege( XUserHandle user, const char *relyingParty, BOOL title, char **auth,
-                                         XUserPrivilege privilege, BOOLEAN *granted, bool presence )
+                                         XUserPrivilege privilege, BOOLEAN *granted, bool presence, UINT64 *expires )
 {
     static const char url[] = "https://xsts.auth.xboxlive.com/xsts/authorize";
     IJsonObject *object = NULL, *claims = NULL, *identity = NULL;
-    HSTRING token = NULL, uhs = NULL, xid = NULL, prv = NULL;
+    HSTRING token = NULL, uhs = NULL, xid = NULL, prv = NULL, notAfter = NULL;
     char *body = NULL, *tokenA = NULL, *uhsA = NULL;
     IJsonArray *xui = NULL;
     BYTE *buffer = NULL;
@@ -3032,6 +2959,7 @@ static HRESULT xsts_authorize_privilege( XUserHandle user, const char *relyingPa
     HRESULT hr, comInit = E_FAIL;
     DWORD status = 0;
     BOOL requested_title = title;
+    if ( expires ) *expires = 0;
 
     auth_metadata( "xsts-begin", user, E_PENDING, 0, requested_title, FALSE );
     if ( granted ) *granted = FALSE;
@@ -3123,6 +3051,13 @@ static HRESULT xsts_authorize_privilege( XUserHandle user, const char *relyingPa
         goto cleanup;
     }
     snprintf( *auth, size, "XBL3.0 x=%s;%s", uhsA, tokenA );
+    if ( expires && SUCCEEDED( get_json_string( object, L"NotAfter", &notAfter ) ) )
+    {
+        UINT32 length = 0;
+        const WCHAR *text = WindowsGetStringRawBuffer( notAfter, &length );
+        *expires = nexus::user::AuthorizationExpiry( std::wstring_view( text, length ) );
+    }
+
 
 cleanup:
     if ( identity ) ( identity )->Release();
@@ -3133,6 +3068,7 @@ cleanup:
     if ( uhs ) WindowsDeleteString( uhs );
     if ( xid ) WindowsDeleteString( xid );
     if ( prv ) WindowsDeleteString( prv );
+    if ( notAfter ) WindowsDeleteString( notAfter );
     free( tokenA );
     free( uhsA );
     free( buffer );

@@ -1,15 +1,21 @@
 /* Account-free tests of the exact runtime helpers and actual XAsync provider.
  * Synthetic RSA keys stay in this process. No production trust override exists.
- * The license bridge below always fails and cannot contact an account service. */
+ * The license bridge below always fails except for locally signed fixture receipts; no mode contacts an account service. */
 #define INITGUID
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <string>
+#include <vector>
+#include <type_traits>
+#include <limits>
+#include <stddef.h>
 #include <libxml/parser.h>
 #include <libxml/tree.h>
 #include "../../src/private.h"
 #include <xstore.h>
+#include <wincrypt.h>
+#include <bcrypt.h>
 #include <xpackage.h>
 
 const char *storeId = "B00000000001";
@@ -25,20 +31,59 @@ UINT64 xuser_get_xuid( XUserHandle user )
 {
     return 1;
 }
-void xodus_store_license_note( const char *phase, HRESULT hr ) {}
+static bool certificate_mode, certificate_stage_only;
+static HCRYPTPROV certificate_provider;
+static char certificate_id[41];
+static std::string certificate_document, certificate_nonce;
+static std::vector<std::string> certificate_nonces;
+static unsigned certificate_requests, certificate_verifications, certificate_signatures, certificate_batches;
+static bool certificate_expired, certificate_stop_after_reply, certificate_advance_clock;
+static LONG *certificate_cancel_target;
+static char *token( HCRYPTPROV provider, const char *cert_id, int variant, const char *nonce = "synthetic-nonce" );
+static bool metadata_mode, metadata_oversize, metadata_match_product = true, metadata_advance_clock;
+static ULONGLONG metadata_ticks;
+static LONG *metadata_cancel_after_row;
+static std::string metadata_body, public_body;
+static SIZE_T public_cursor;
+static DWORD metadata_status = 200;
+void xodus_store_license_note( const char *phase, HRESULT hr )
+{
+    if ( certificate_mode && certificate_advance_clock && !strcmp( phase, "store-entitled-receipt" ) ) metadata_ticks = 200000;
+    if ( metadata_mode && !strcmp( phase, "store-entitled-metadata" ) )
+    {
+        if ( metadata_cancel_after_row ) InterlockedExchange( metadata_cancel_after_row, 1 );
+        if ( metadata_advance_clock ) metadata_ticks = 100000;
+    }
+}
+static ULONGLONG FixturePublicTick()
+{
+    return metadata_mode ? metadata_ticks : GetTickCount64();
+}
 HRESULT xodus_store_license_body( const char **ids, SIZE_T count, const char *nonce, char **out )
 {
+    if ( certificate_mode ) { certificate_nonce = nonce; certificate_nonces.emplace_back( nonce ); }
     *out = strdup( "synthetic" );
     return *out ? S_OK : E_OUTOFMEMORY;
 }
 HRESULT xodus_store_license_xml( const char *request, SIZE_T size, char **out )
 {
     *out = NULL;
+    if ( certificate_mode )
+    {
+        ++certificate_batches;
+        *out = token( certificate_provider, certificate_id, 0, certificate_nonce.c_str() );
+        if ( certificate_stop_after_reply && certificate_batches == 2 && certificate_cancel_target ) InterlockedExchange( certificate_cancel_target, 1 );
+        return *out ? S_OK : E_OUTOFMEMORY;
+    }
     InterlockedIncrement( &bridge_active );
     SetEvent( bridge_started );
     WaitForSingleObject( bridge_gate, bridge_timeout );
     InterlockedDecrement( &bridge_active );
     return E_FAIL;
+}
+HRESULT xodus_store_license_xml(const char *request, SIZE_T size, char **out, LONG *, ULONGLONG)
+{
+    return xodus_store_license_xml(request, size, out);
 }
 static const char *GetStoreProductId()
 {
@@ -55,21 +100,73 @@ static HINTERNET WINAPI FixturePublicOpenRequest( HINTERNET connection, LPCWSTR 
     public_flags = flags;
     public_path[0] = 0;
     if ( path && wcslen( path ) < ARRAY_SIZE( public_path ) ) wcscpy( public_path, path );
+    public_cursor = 0; public_body = metadata_body;
+    if ( certificate_mode && path && wcsstr( path, L"/v8.0/licenseToken/fullCertificate/" ) )
+    {
+        ++certificate_requests; public_body = certificate_document;
+    }
+    if ( metadata_mode && metadata_match_product && path && wcsstr( path, L"bigIds=B00000000002&" ) )
+    {
+        const auto pos = public_body.find( "B00000000001" );
+        if ( pos != std::string::npos ) public_body.replace( pos, 12, "B00000000002" );
+    }
     return WinHttpOpenRequest( connection, verb, path, version, referrer, accept, flags );
 }
 static BOOL WINAPI FixturePublicSendRequest( HINTERNET request, LPCWSTR headers, DWORD headers_size,
                                             void *body, DWORD body_size, DWORD total_size, DWORD_PTR context )
 {
     ++public_sends;
+    if ( metadata_mode ) return TRUE;
     SetLastError( ERROR_CANCELLED );
     return FALSE;
 }
+static BOOL WINAPI FixturePublicReceive( HINTERNET, void * ) { return metadata_mode; }
+static BOOL WINAPI FixturePublicHeaders( HINTERNET, DWORD, LPCWSTR, void *buffer, DWORD *size, DWORD * )
+{
+    if ( !metadata_mode || !buffer || !size || *size < sizeof( DWORD ) ) return FALSE;
+    *static_cast<DWORD *>( buffer ) = metadata_status; *size = sizeof( DWORD ); return TRUE;
+}
+static BOOL WINAPI FixturePublicAvailable( HINTERNET, DWORD *available )
+{
+    *available = metadata_oversize ? 4 * 1024 * 1024 + 1 : static_cast<DWORD>( public_body.size() - public_cursor );
+    return metadata_mode;
+}
+static BOOL WINAPI FixturePublicRead( HINTERNET, void *buffer, DWORD size, DWORD *read )
+{
+    *read = std::min<SIZE_T>( size, public_body.size() - public_cursor );
+    memcpy( buffer, public_body.data() + public_cursor, *read ); public_cursor += *read; return metadata_mode;
+}
+static LONG WINAPI FixtureCertificateTime( LPFILETIME when, PCERT_INFO info )
+{
+    if ( certificate_mode ) { ++certificate_verifications; if ( certificate_expired ) return 1; }
+    return CertVerifyTimeValidity( when, info );
+}
+static NTSTATUS WINAPI FixtureCertificateSignature( BCRYPT_KEY_HANDLE key, void *padding, PUCHAR hash, ULONG hash_size,
+                                                     PUCHAR signature, ULONG signature_size, ULONG flags )
+{
+    if ( certificate_mode ) ++certificate_signatures;
+    return BCryptVerifySignature( key, padding, hash, hash_size, signature, signature_size, flags );
+}
+#define BCryptVerifySignature FixtureCertificateSignature
+#define CertVerifyTimeValidity FixtureCertificateTime
+#define GetTickCount64 FixturePublicTick
+#define WinHttpReceiveResponse FixturePublicReceive
+#define WinHttpQueryHeaders FixturePublicHeaders
+#define WinHttpQueryDataAvailable FixturePublicAvailable
+#define WinHttpReadData FixturePublicRead
 #define QueryApiImpl FixtureQueryApiImpl
 #define WinHttpOpenRequest FixturePublicOpenRequest
 #define WinHttpSendRequest FixturePublicSendRequest
 #include "../../src/System/Store/Entitled.h"
 #undef WinHttpOpenRequest
 #undef WinHttpSendRequest
+#undef WinHttpReceiveResponse
+#undef WinHttpQueryHeaders
+#undef WinHttpQueryDataAvailable
+#undef WinHttpReadData
+#undef GetTickCount64
+#undef CertVerifyTimeValidity
+#undef BCryptVerifySignature
 /* Only this account-free executable has a synthetic installed-package index. */
 HRESULT xpackage_query_content_store( const char *identifier, SIZE_T size, char *store )
 {
@@ -95,6 +192,82 @@ static unsigned checks, failures, callbacks, enumerated;
             printf( "FAIL %s line=%d\n", name, __LINE__ );                                                             \
         }                                                                                                              \
     } while ( 0 )
+
+template<typename T> constexpr bool store_timestamp_abi = sizeof( T ) == 8 && std::is_signed_v<T>;
+static_assert( store_timestamp_abi<decltype( XStoreAddonLicense{}.expirationDate )> );
+static_assert( store_timestamp_abi<decltype( XStorePrice{}.saleEndDate )> );
+static_assert( store_timestamp_abi<decltype( XStoreAvailability{}.endDate )> );
+static_assert( store_timestamp_abi<decltype( XStoreCollectionData{}.acquiredDate )> );
+static_assert( store_timestamp_abi<decltype( XStoreCollectionData{}.startDate )> );
+static_assert( store_timestamp_abi<decltype( XStoreCollectionData{}.endDate )> );
+static_assert( store_timestamp_abi<decltype( XStoreGameLicense{}.expirationDate )> );
+// Microsoft default packing and signed __time64_t, not the compiler's CRTtime_t.
+static_assert( sizeof( XStoreAddonLicense ) == 96 && offsetof( XStoreAddonLicense, expirationDate ) == 88 );
+static_assert( sizeof( XStoreGameLicense ) == 104 && offsetof( XStoreGameLicense, expirationDate ) == 96 );
+static_assert( sizeof( XStorePrice ) == ( sizeof( void * ) == 8 ? 88 : 80 ) );
+static_assert( offsetof( XStorePrice, saleEndDate ) == ( sizeof( void * ) == 8 ? 80 : 72 ) );
+static_assert( sizeof( XStoreAvailability ) == ( sizeof( void * ) == 8 ? 104 : 96 ) );
+static_assert( sizeof( XStoreCollectionData ) == ( sizeof( void * ) == 8 ? 56 : 48 ) );
+static_assert( offsetof( XStoreCollectionData, endDate ) == 16 && offsetof( XStoreCollectionData, isTrial ) == 24 );
+static_assert( sizeof( XStoreSku ) == ( sizeof( void * ) == 8 ? 272 : 208 ) );
+static_assert( offsetof( XStoreSku, collectionData ) == ( sizeof( void * ) == 8 ? 128 : 104 ) );
+static_assert( sizeof( XStoreProduct ) == ( sizeof( void * ) == 8 ? 208 : 152 ) );
+static_assert( offsetof( XStoreProduct, price ) == ( sizeof( void * ) == 8 ? 56 : 32 ) );
+static void test_store_time_abi()
+{
+    const INT64 future = 253402300799LL;
+    XStoreAddonLicense addon{}; XStorePrice price{}; XStoreAvailability available{};
+    XStoreCollectionData collection{}; XStoreGameLicense game{};
+    addon.expirationDate = price.saleEndDate = available.endDate = collection.acquiredDate =
+        collection.startDate = collection.endDate = game.expirationDate = future;
+    CHECK( "store-abi-future-time-roundtrip", addon.expirationDate == future && price.saleEndDate == future &&
+           available.endDate == future && collection.acquiredDate == future && collection.startDate == future &&
+           collection.endDate == future && game.expirationDate == future );
+    collection.endDate = INT64_MAX;
+    CHECK( "store-abi-signed-time-max", collection.endDate == INT64_MAX );
+    collection.endDate = INT64_MIN;
+    CHECK( "store-abi-signed-time-min", collection.endDate == INT64_MIN && collection.endDate < 0 );
+    struct Guarded { UINT64 before; XStoreCollectionData value; UINT64 after; } guarded{};
+    guarded.before = 0x123456789abcdef0ULL; guarded.after = 0xfedcba9876543210ULL;
+    guarded.value.acquiredDate = future; guarded.value.startDate = future - 1; guarded.value.endDate = future - 2;
+    guarded.value.quantity = 9; guarded.value.isTrial = TRUE;
+    CHECK( "store-abi-timestamp-field-isolation", guarded.before == 0x123456789abcdef0ULL && guarded.after == 0xfedcba9876543210ULL &&
+           guarded.value.acquiredDate == future && guarded.value.startDate == future - 1 && guarded.value.endDate == future - 2 &&
+           guarded.value.quantity == 9 && guarded.value.isTrial );
+    printf( "STORE_TIME_ABI crt=%u field=%u collection=%u end_offset=%u future=%llu\n", static_cast<unsigned>( sizeof( time_t ) ),
+            static_cast<unsigned>( sizeof( collection.endDate ) ), static_cast<unsigned>( sizeof( collection ) ),
+            static_cast<unsigned>( offsetof( XStoreCollectionData, endDate ) ), static_cast<unsigned long long>( future ) );
+}
+
+static void test_store_time_consumers()
+{
+    IJsonObject *object = nullptr;
+    const char *json = R"({"Conditions":{"StartDate":"1753-01-01T00:00:00.0000000Z","EndDate":"9999-12-31T23:59:59Z"},"Actions":["Purchase"],"OrderManagementData":{"Price":{"ListPrice":10,"MSRP":20,"CurrencyCode":"USD"}},"Future":"9999-12-31T23:59:59Z","Past":"1753-01-01T00:00:00.0000000Z","Bad":"not-a-date","Overflow":"999999999999-12-31T23:59:59Z"})";
+    CHECK( "store-time-consumer-json", receipt_json( reinterpret_cast<const BYTE *>( json ), strlen( json ), &object ) == S_OK );
+    if ( object )
+    {
+        INT64 end = 0;
+        CHECK( "store-time-catalog-future-unclamped", catalog_date( object, L"Future", &end ) == S_OK && end == 253402300799LL );
+        CHECK( "store-time-catalog-unbounded-start", catalog_date( object, L"Past", &end ) == S_OK && end == 0 );
+        CHECK( "store-time-catalog-malformed-refused", FAILED( catalog_date( object, L"Bad", &end ) ) );
+        CHECK( "store-time-catalog-overflow-refused", FAILED( catalog_date( object, L"Overflow", &end ) ) );
+        BOOL include = FALSE, purchase = FALSE;
+        CHECK( "store-time-availability-future", catalog_availability( object, nullptr, 0, &include, &purchase, &end ) == S_OK &&
+               include && purchase && end == 253402300799LL );
+        XStorePrice price{};
+        CHECK( "store-time-sale-future", catalog_price( object, end, &price ) == S_OK && price.isOnSale && price.saleEndDate == end );
+        free( const_cast<char *>( price.currencyCode ) ); object->Release();
+    }
+    XStoreSku sku{}; sku.skuId = "AB12"; sku.isInUserCollection = TRUE; sku.collectionData.endDate = 253402300799LL;
+    XStoreProduct product{}; product.storeId = storeId; product.productKind = XStoreProductKind::Game;
+    product.isInUserCollection = TRUE; product.skusCount = 1; product.skus = &sku;
+    entitled_snapshot snapshot{}; snapshot.count = 1; snapshot.products = &product; snapshot.proof_until = 253402300789ULL;
+    XStoreGameLicense result{};
+    CHECK( "store-time-game-proof-future", game_license_from_snapshot( &snapshot, storeId, &result ) == S_OK &&
+           result.isActive && result.expirationDate == 253402300789LL );
+    sku.collectionData.endDate = -1;
+    CHECK( "store-time-negative-expiry-denied", game_license_from_snapshot( &snapshot, storeId, &result ) == E_ACCESSDENIED && !result.isActive );
+}
 
 static char *encode( const BYTE *bytes, DWORD size, BOOL url )
 {
@@ -124,7 +297,7 @@ static char *encode( const BYTE *bytes, DWORD size, BOOL url )
     return text;
 }
 
-static char *token( HCRYPTPROV provider, const char *cert_id, int variant )
+static char *token( HCRYPTPROV provider, const char *cert_id, int variant, const char *nonce )
 {
     const char *header = variant == 1 ? "{\"alg\":\"HS256\"}" : "{\"alg\":\"RS256\"}";
     char claim[2048], payload[4096], *h = NULL, *p = NULL, *c = NULL, *s = NULL, *input = NULL, *jwt = NULL;
@@ -133,11 +306,16 @@ static char *token( HCRYPTPROV provider, const char *cert_id, int variant )
     HCRYPTHASH hash = 0;
     UINT64 now = time( NULL );
     snprintf( claim, sizeof( claim ),
-              "{\"tokenVersion\":1,\"certificateId\":\"%s\",\"customDeveloperString\":\"synthetic-nonce\","
+              "{\"tokenVersion\":1,\"certificateId\":\"%s\",\"customDeveloperString\":\"%s\","
               "\"licensableProducts\":[{\"productId\":\"B00000000001\",\"skuId\":\"0010\",\"endDate\":\"9999-12-31T23:"
               "59:59Z\"}]}",
-              cert_id );
-    c = encode( ( BYTE * )claim, strlen( claim ), FALSE );
+              cert_id, nonce );
+    std::string rows = claim;
+    if ( variant == 5 )
+        rows.insert( rows.size() - 2,
+            ",{\"productId\":\"B00000000002\",\"skuId\":\"0010\",\"endDate\":\"9999-12-31T23:59:59Z\"},"
+            "{\"productId\":\"B00000000001\",\"skuId\":\"0020\",\"endDate\":\"9999-12-31T23:59:59Z\"}" );
+    c = encode( ( BYTE * )rows.data(), rows.size(), FALSE );
     if ( !c ) goto done;
     snprintf( payload, sizeof( payload ),
               "{\"iss\":\"LicensingFD\",\"aud\":\"%s\",\"nbf\":%llu,\"exp\":%llu,\"LicenseTokenClaim\":\"%s\"}",
@@ -173,6 +351,116 @@ done:
     free( input );
     return jwt;
 }
+
+static std::string certificate_request( unsigned count )
+{
+    std::string request = "<Request><ParentProductId>B00000000001</ParentProductId><Market>US</Market><Language>en-US</Language><ProductKinds>31</ProductKinds>";
+    for ( unsigned i = 2; i <= count; ++i ) { char row[64]; snprintf( row, sizeof( row ), "<ProductId>B%011u</ProductId>", i ); request += row; }
+    return request + "</Request>";
+}
+static std::string certificate_json( PCCERT_CONTEXT cert )
+{
+    char *base64 = encode( cert->pbCertEncoded, cert->cbCertEncoded, FALSE );
+    CHECK( "certificate-operation-encoded", base64 != nullptr );
+    if ( !base64 ) return {};
+    std::string result = std::string( "{\"certificate\":\"" ) + base64 + "\"}"; free( base64 ); return result;
+}
+static HRESULT certificate_operation( unsigned count, LONG *canceled = nullptr )
+{
+    certificate_requests = certificate_verifications = certificate_signatures = certificate_batches = 0; certificate_nonces.clear(); metadata_ticks = 0;
+    LONG local = 0; entitled_snapshot *snapshot = nullptr;
+    const auto hr = entitled_fetch( certificate_request( count ).c_str(), canceled ? canceled : &local, &snapshot );
+    if ( SUCCEEDED( hr ) ) CHECK( "certificate-operation-success", snapshot && snapshot->count == 1 );
+    else CHECK( "certificate-operation-no-failed-output", snapshot == nullptr );
+    if ( snapshot ) entitled_snapshot_release( snapshot ); return hr;
+}
+static HRESULT certificate_cached_load( receipt_certificate_cache *cache, const char *issued = "fresh-nonce",
+                                         const char *expected = "fresh-nonce", int variant = 0, bool tamper = false )
+{
+    char *jwt = token( certificate_provider, certificate_id, variant, issued );
+    CHECK( "certificate-cache-signed-input", jwt != nullptr );
+    if ( !jwt ) return E_OUTOFMEMORY;
+    if ( tamper ) { char *signature = strchr( strchr( jwt, '.' ) + 1, '.' ) + 1; signature[0] = signature[0] == 'A' ? 'B' : 'A'; }
+    IJsonObject *claim = nullptr; UINT64 expiry = 0;
+    const auto hr = receipt_load( jwt, expected, &claim, &expiry, cache );
+    CHECK( "certificate-cache-claim-follows-verification", SUCCEEDED( hr ) ? claim != nullptr : claim == nullptr );
+    if ( claim ) claim->Release(); free( jwt ); return hr;
+}
+static void test_certificate_operation( HCRYPTPROV provider, const char *id, PCCERT_CONTEXT cert )
+{
+    certificate_provider = provider; strcpy( certificate_id, id );
+    const auto document = certificate_json( cert ); if ( document.empty() ) return;
+    certificate_document = document;
+    metadata_body = R"({"Products":[{"ProductId":"B00000000001","ProductType":"Durable","LocalizedProperties":[{"ProductTitle":"Synthetic","Language":"en-US"}],"DisplaySkuAvailabilities":[{"Sku":{"SkuId":"0010","Properties":{"IsTrial":false}}}]}]})";
+    metadata_mode = certificate_mode = true;
+    CHECK( "certificate-operation-two-batch-result", certificate_operation( 65 ) == S_OK );
+    CHECK( "certificate-operation-two-fresh-receipts", certificate_batches == 2 && certificate_nonces.size() == 2 && certificate_nonces[0] != certificate_nonces[1] );
+    CHECK( "certificate-operation-two-validations", certificate_verifications == 2 && certificate_signatures == 2 );
+    CHECK( "certificate-operation-one-public-get", certificate_requests == 1 );
+    printf( "CERTIFICATE_MEASURE batches=%u certificate_gets=%u verified=%u signatures=%u\n", certificate_batches, certificate_requests, certificate_verifications, certificate_signatures );
+    CHECK( "certificate-operation-separated-no-retention", certificate_operation( 65 ) == S_OK && certificate_requests == 1 && certificate_verifications == 2 );
+    CHECK( "certificate-operation-five-batches-one-get", certificate_operation( 257 ) == S_OK && certificate_batches == 5 && certificate_requests == 1 && certificate_verifications == 5 && certificate_signatures == 5 );
+    LONG canceled = 1;
+    CHECK( "certificate-operation-precancel-no-work", certificate_operation( 65, &canceled ) == E_ABORT && !certificate_batches && !certificate_requests );
+    canceled = 0; certificate_stop_after_reply = true; certificate_cancel_target = &canceled;
+    CHECK( "certificate-operation-observed-cancel-before-cache-hit", certificate_operation( 65, &canceled ) == E_ABORT && certificate_batches == 2 && certificate_requests == 1 && certificate_verifications == 1 );
+    certificate_stop_after_reply = false; certificate_cancel_target = nullptr;
+    certificate_advance_clock = true;
+    CHECK( "certificate-operation-deadline-before-next-hit", certificate_operation( 65 ) == HRESULT_FROM_WIN32( ERROR_TIMEOUT ) && certificate_batches == 1 && certificate_requests == 1 && certificate_verifications == 1 );
+    certificate_advance_clock = false; metadata_ticks = 0;
+
+    receipt_certificate_cache cache{}; certificate_requests = certificate_verifications = certificate_signatures = 0;
+    CHECK( "certificate-cache-first-success", certificate_cached_load( &cache ) == S_OK && cache.der && certificate_requests == 1 );
+    CHECK( "certificate-cache-fresh-nonce-reverified", certificate_cached_load( &cache, "other-nonce", "other-nonce" ) == S_OK && certificate_requests == 1 && certificate_verifications == 2 && certificate_signatures == 2 );
+    CHECK( "certificate-cache-tampered-signature-denied", FAILED( certificate_cached_load( &cache, "fresh-nonce", "fresh-nonce", 0, true ) ) && certificate_requests == 1 );
+    CHECK( "certificate-cache-wrong-nonce-denied", FAILED( certificate_cached_load( &cache, "issued", "different" ) ) && certificate_requests == 1 );
+    CHECK( "certificate-cache-expired-jwt-denied", FAILED( certificate_cached_load( &cache, "fresh-nonce", "fresh-nonce", 3 ) ) && certificate_requests == 1 );
+    CHECK( "certificate-cache-future-jwt-denied", FAILED( certificate_cached_load( &cache, "fresh-nonce", "fresh-nonce", 4 ) ) && certificate_requests == 1 );
+    CHECK( "certificate-cache-wrong-algorithm-denied", FAILED( certificate_cached_load( &cache, "fresh-nonce", "fresh-nonce", 1 ) ) && certificate_requests == 1 );
+    certificate_expired = true;
+    CHECK( "certificate-cache-expired-certificate-denied", FAILED( certificate_cached_load( &cache ) ) && certificate_requests == 1 );
+    certificate_expired = false; free( cache.der );
+    for ( unsigned mode = 0; mode < 4; ++mode )
+    {
+        receipt_certificate_cache fresh{}; certificate_requests = 0;
+        if ( mode == 1 ) certificate_document = "{}";
+        if ( mode == 2 ) certificate_document = std::string( 64001, 'x' );
+        if ( mode == 3 ) metadata_status = 400;
+        CHECK( "certificate-cache-failure-not-admitted", FAILED( certificate_cached_load( &fresh, "fresh-nonce", "fresh-nonce", 0, mode == 0 ) ) && !fresh.der && certificate_requests == 1 );
+        certificate_document = document; metadata_status = 200;
+        CHECK( "certificate-cache-failure-not-negative-cached", certificate_cached_load( &fresh ) == S_OK && fresh.der && certificate_requests == 2 );
+        free( fresh.der );
+    }
+    certificate_requests = 0; certificate_id[0] = 'G'; receipt_certificate_cache invalid{};
+    CHECK( "certificate-cache-malformed-id-no-request", FAILED( certificate_cached_load( &invalid ) ) && !invalid.der && !certificate_requests );
+    strcpy( certificate_id, id );
+
+    CERT_NAME_BLOB name{}; CRYPT_ALGORITHM_IDENTIFIER algorithm{ szOID_RSA_SHA256RSA, {0} };
+    SYSTEMTIME start{2020,1,0,1}, end{2099,1,0,1}; PCCERT_CONTEXT rotated = nullptr;
+    CHECK( "certificate-rotation-name-size", CertStrToNameW( X509_ASN_ENCODING, L"CN=Nexus synthetic rotated certificate", CERT_X500_NAME_STR, nullptr, nullptr, &name.cbData, nullptr ) );
+    name.pbData = static_cast<BYTE *>( malloc( name.cbData ) );
+    if ( name.pbData && CertStrToNameW( X509_ASN_ENCODING, L"CN=Nexus synthetic rotated certificate", CERT_X500_NAME_STR, nullptr, name.pbData, &name.cbData, nullptr ) )
+        rotated = CertCreateSelfSignCertificate( provider, &name, CERT_CREATE_SELFSIGN_NO_KEY_INFO, nullptr, &algorithm, &start, &end, nullptr );
+    CHECK( "certificate-rotation-context", rotated != nullptr );
+    if ( rotated )
+    {
+        BYTE digest[20]; DWORD size = sizeof( digest ); char rotated_id[41]{};
+        CHECK( "certificate-rotation-thumbprint", CryptHashCertificate( 0, CALG_SHA1, 0, rotated->pbCertEncoded, rotated->cbCertEncoded, digest, &size ) );
+        for ( unsigned i = 0; i < 20; ++i ) sprintf( rotated_id + i * 2, "%02X", digest[i] );
+        CHECK( "certificate-rotation-distinct-id", strcmp( rotated_id, id ) != 0 );
+        receipt_certificate_cache rotation{}; certificate_requests = 0;
+        CHECK( "certificate-cache-rotation-a", certificate_cached_load( &rotation ) == S_OK && certificate_requests == 1 );
+        strcpy( certificate_id, rotated_id ); certificate_document = certificate_json( rotated );
+        CHECK( "certificate-cache-rotation-b-refetch", certificate_cached_load( &rotation ) == S_OK && certificate_requests == 2 && !strcmp( rotation.id, rotated_id ) );
+        strcpy( certificate_id, id ); certificate_document = document;
+        CHECK( "certificate-cache-one-slot-a-b-a", certificate_cached_load( &rotation ) == S_OK && certificate_requests == 3 && !strcmp( rotation.id, id ) );
+        free( rotation.der ); CertFreeCertificateContext( rotated );
+    }
+    free( name.pbData );
+    metadata_mode = certificate_mode = false; certificate_provider = 0; certificate_document.clear(); certificate_nonce.clear(); certificate_nonces.clear();
+}
+
+static void test_metadata_reuse( IJsonObject *claim );
 
 static void test_receipts( void )
 {
@@ -218,6 +506,8 @@ static void test_receipts( void )
            CryptHashCertificate( 0, CALG_SHA1, 0, cert->pbCertEncoded, cert->cbCertEncoded, digest, &size ) );
     for ( i = 0; i < 20; i++ )
         sprintf( cert_id + i * 2, "%02X", digest[i] );
+    test_certificate_operation( provider, cert_id, cert );
+    if ( certificate_stage_only ) goto done;
     for ( i = 0; i < 5; i++ )
     {
         jwt = token( provider, cert_id, i );
@@ -296,6 +586,11 @@ static void test_receipts( void )
                    !claim );
         free( jwt );
     }
+    jwt = token( provider, cert_id, 5 );
+    CHECK( "metadata-stage-signed-token", jwt && receipt_verify( jwt, "synthetic-nonce", cert_id,
+           cert->pbCertEncoded, cert->cbCertEncoded, &claim, &expiry ) == S_OK );
+    if ( claim ) { test_metadata_reuse( claim ); claim->Release(); claim = nullptr; }
+    free( jwt );
     expired = "{\"tokenVersion\":1,\"licensableProducts\":[{\"productId\":\"B00000000001\",\"skuId\":\"0010\","
               "\"endDate\":\"2020-01-01T00:00:00Z\"}]}";
     CHECK( "inventory-json", receipt_json( ( BYTE * )expired, strlen( expired ), &claim ) == S_OK );
@@ -320,6 +615,72 @@ done:
     CryptReleaseContext( provider, 0 );
 }
 
+static void test_metadata_reuse( IJsonObject *claim )
+{
+    const char *ids[] = { "B00000000001", "B00000000002" };
+    receipt_license verified[ENTITLED_MAX_PRODUCTS]{}; UINT32 count = 0; UINT64 expiry = UINT64_MAX;
+    CHECK( "metadata-stage-verified-inventory", receipt_inventory( claim, ids, 2, verified, &count, &expiry ) == S_OK && count == 3 );
+    if ( count != 3 ) return;
+    const std::string valid = R"({"Products":[{"ProductId":"B00000000001","ProductType":"Durable","LocalizedProperties":[{"ProductTitle":"Synthetic","Language":"en-US"}],"DisplaySkuAvailabilities":[{"Sku":{"SkuId":"0010","Properties":{"IsTrial":false}}},{"Sku":{"SkuId":"0020","Properties":{"IsTrial":true}}}]}]})";
+    metadata_mode = true; metadata_body = valid;
+    receipt_license same[] = { verified[0], verified[2] };
+    auto run = [&]( receipt_license *licenses, UINT32 size, const char *market = "US" ) {
+        metadata_ticks = 0; public_requests = public_sends = 0;
+        auto doc = xmlNewDoc( BAD_CAST "1.0" ); auto root = xmlNewNode( nullptr, BAD_CAST "Response" ); xmlDocSetRootElement( doc, root );
+        LONG canceled = 0;
+        const auto hr = receipt_metadata_rows( licenses, size, 31, market, "en-US", root, &canceled, 50000 );
+        if ( SUCCEEDED( hr ) )
+        {
+            char until[32]; snprintf( until, sizeof( until ), "%llu", static_cast<unsigned long long>( time( nullptr ) + 60 ) );
+            xmlNewTextChild( root, nullptr, BAD_CAST "HResult", BAD_CAST "0" );
+            xmlNewTextChild( root, nullptr, BAD_CAST "ValidUntil", BAD_CAST until );
+            xmlChar *bytes = nullptr; int length = 0; xmlDocDumpMemory( doc, &bytes, &length );
+            entitled_snapshot *snapshot = nullptr;
+            CHECK( "metadata-reuse-output-parse", bytes && entitled_parse( reinterpret_cast<char *>( bytes ), length, &snapshot ) == S_OK );
+            if ( snapshot )
+            {
+                CHECK( "metadata-reuse-product-order", snapshot->count == ( size == 3 ? 2u : 1u ) &&
+                       !strcmp( snapshot->products[0].storeId, licenses[0].id ) );
+                if ( size >= 2 )
+                    CHECK( "metadata-reuse-sku-order-trial-expiry", snapshot->products[0].skusCount == 2 &&
+                           !strcmp( snapshot->products[0].skus[0].skuId, "0010" ) &&
+                           !strcmp( snapshot->products[0].skus[1].skuId, "0020" ) &&
+                           !snapshot->products[0].skus[0].isTrial && snapshot->products[0].skus[1].isTrial &&
+                           snapshot->products[0].skus[0].collectionData.endDate == licenses[0].expiry );
+                entitled_snapshot_release( snapshot );
+            }
+            if ( bytes ) xmlFree( bytes );
+        }
+        xmlFreeDoc( doc ); return hr;
+    };
+    CHECK( "same-product-two-verified-skus", run( same, 2 ) == S_OK );
+    printf( "METADATA_MEASURE same_product_skus=2 get_requests=%u\n", public_requests );
+    CHECK( "same-product-single-public-get", public_requests == 1 && public_sends == 1 );
+    CHECK( "nonadjacent-products-evict", run( verified, 3 ) == S_OK && public_requests == 3 );
+    CHECK( "separate-operation-fetches", run( same, 2 ) == S_OK && public_requests == 1 );
+    CHECK( "separate-market-fetches", run( same, 2, "CZ" ) == S_OK && public_requests == 1 && wcsstr( public_path, L"market=CZ&" ) );
+    metadata_body = "{}"; CHECK( "metadata-reuse-malformed", FAILED( run( same, 2 ) ) && public_requests == 1 );
+    metadata_body = valid; metadata_match_product = false;
+    CHECK( "metadata-reuse-mismatched-product", FAILED( run( &verified[1], 1 ) ) && public_requests == 1 );
+    metadata_match_product = true;
+    auto missing = same[1]; strcpy( missing.sku, "0030" ); receipt_license absent[] = { same[0], missing };
+    CHECK( "metadata-reuse-missing-sku", FAILED( run( absent, 2 ) ) );
+    metadata_body.replace( metadata_body.find( "true" ), 4, "null" );
+    CHECK( "metadata-reuse-malformed-trial", FAILED( run( same, 2 ) ) ); metadata_body = valid;
+    metadata_oversize = true; CHECK( "metadata-reuse-body-limit", FAILED( run( same, 2 ) ) && public_requests == 1 ); metadata_oversize = false;
+    metadata_status = 400; CHECK( "metadata-reuse-http-failure", FAILED( run( same, 2 ) ) && public_requests == 1 ); metadata_status = 200;
+    for ( bool timeout : { false, true } )
+    {
+        metadata_ticks = 0; public_requests = public_sends = 0; LONG canceled = 0;
+        auto doc = xmlNewDoc( BAD_CAST "1.0" ); auto root = xmlNewNode( nullptr, BAD_CAST "Response" ); xmlDocSetRootElement( doc, root );
+        metadata_cancel_after_row = timeout ? nullptr : &canceled; metadata_advance_clock = timeout;
+        const auto hr = receipt_metadata_rows( same, 2, 31, "US", "en-US", root, &canceled, 50000 );
+        CHECK( "metadata-reuse-between-row-stop", hr == ( timeout ? HRESULT_FROM_WIN32( ERROR_TIMEOUT ) : E_ABORT ) && public_requests == 1 );
+        metadata_cancel_after_row = nullptr; metadata_advance_clock = false; xmlFreeDoc( doc );
+    }
+    metadata_mode = false; metadata_body.clear(); public_body.clear();
+}
+
 static struct entitled_snapshot *test_metadata( void )
 {
     const char *json = "{\"Products\":[{\"ProductId\":\"B00000000001\",\"ProductType\":\"Durable\",\"Properties\":{"
@@ -338,14 +699,15 @@ static struct entitled_snapshot *test_metadata( void )
     struct entitled_snapshot *snapshot = NULL;
     xmlDocSetRootElement( doc, root );
     public_requests = public_sends = 0;
-    CHECK( "public-catalog-no-network-grant", FAILED( receipt_metadata( &license, 31, "US", "en-US", root ) ) );
+    LONG metadata_canceled = 0;
+    CHECK( "public-catalog-no-network-grant", FAILED( receipt_metadata_rows( &license, 1, 31, "US", "en-US", root, &metadata_canceled, GetTickCount64() + 5000 ) ) );
     CHECK( "public-catalog-request-captured", public_requests == 1 && public_sends == 1 );
     CHECK( "public-catalog-path-exact",
            !wcscmp( public_path, L"/v7.0/products?bigIds=B00000000001&market=US&languages=en-US" ) );
     CHECK( "public-catalog-remains-https", public_flags == WINHTTP_FLAG_SECURE );
     public_requests = public_sends = 0;
     CHECK( "public-catalog-language-no-network-grant",
-           FAILED( receipt_metadata( &license, 31, "CZ", "zh-Hans-CN", root ) ) );
+           FAILED( receipt_metadata_rows( &license, 1, 31, "CZ", "zh-Hans-CN", root, &metadata_canceled, GetTickCount64() + 5000 ) ) );
     CHECK( "public-catalog-language-request-captured", public_requests == 1 && public_sends == 1 );
     CHECK( "public-catalog-language-path-exact",
            !wcscmp( public_path, L"/v7.0/products?bigIds=B00000000001&market=CZ&languages=zh-Hans-CN" ) );
@@ -1939,14 +2301,33 @@ static void test_public_catalog()
     entitled_store_close( store );
 }
 
-int main( void )
+int main( int argc, char **argv )
 {
+    test_store_time_abi();
+    if ( argc == 2 && !strcmp( argv[1], "--store-time-abi" ) )
+    {
+        const auto status = RoInitialize( RO_INIT_MULTITHREADED );
+        CHECK( "store-time-mode-winrt", SUCCEEDED( status ) );
+        if ( SUCCEEDED( status ) ) { test_store_time_consumers(); RoUninitialize(); }
+        printf( "CHECKS %u FAILURES %u\n", checks, failures );
+        return failures ? 1 : 0;
+    }
+    if ( argc == 2 && !strcmp( argv[1], "--certificate-stage" ) ) certificate_stage_only = true;
+    if ( argc == 2 && ( !strcmp( argv[1], "--metadata-stage" ) || certificate_stage_only ) )
+    {
+        const auto hr = RoInitialize( RO_INIT_MULTITHREADED );
+        CHECK( "metadata-stage-winrt", SUCCEEDED( hr ) );
+        if ( SUCCEEDED( hr ) ) { test_receipts(); RoUninitialize(); }
+        printf( "CHECKS %u FAILURES %u\n", checks, failures );
+        return failures ? 1 : 0;
+    }
     HMODULE dll = LoadLibraryA( "xgameruntime.dll" );
     if ( !dll ||
          !( runtime_query = reinterpret_cast<decltype( runtime_query )>( GetProcAddress( dll, "QueryApiImpl" ) ) ) )
         return 2;
     HRESULT hr = RoInitialize( RO_INIT_MULTITHREADED );
     CHECK( "winrt", SUCCEEDED( hr ) );
+    if ( SUCCEEDED( hr ) ) test_store_time_consumers();
     IXStoreImpl6 *store_api = NULL;
     XStoreContextHandle store = NULL;
     CHECK( "runtime-store-abi",

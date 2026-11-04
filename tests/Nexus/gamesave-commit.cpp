@@ -95,6 +95,92 @@ static void older_commit_keeps_newer_local_revision( BOOL files )
     CHECK( "newer-local-upload-announced", remote.announced == 1 );
     close_provider( a );
 }
+static void unreadable_index_preserves_local_progress( BOOL files, BOOL listed )
+{
+    printf( "CASE unreadable local index files=%d listed=%d\n", files, listed );
+    memset( &remote, 0, sizeof( remote ) );
+    if ( listed )
+    {
+        auto source = device( files, "read-error-source" );
+        seed( source, "cloud-old", TRUE );
+        CHECK( "read-error-prime-cloud", cloud_sync( source ) == S_OK );
+        close_provider( source );
+    }
+    auto p = device( files, "read-error-local" );
+    seed( p, "local-new", TRUE );
+    char dir[2048], index[2056];
+    WCHAR wide[4096];
+    container_dir( p, "Save", dir, sizeof( dir ) );
+    snprintf( index, sizeof( index ), "%s\\index", dir );
+    CHECK( "read-error-wide-path", save_wide_path( index, wide ) );
+    // Allow renaming: the read failure itself must prevent cloud replacement.
+    HANDLE lock = CreateFileW( wide, GENERIC_READ, FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL );
+    CHECK( "read-error-lock", lock != INVALID_HANDLE_VALUE );
+    const unsigned uploads = remote.metadata_puts, downloads = p->downloaded;
+    CHECK( "read-error-sync-reported", cloud_sync( p ) == HRESULT_FROM_WIN32( ERROR_SHARING_VIOLATION ) );
+    CHECK( "read-error-no-cloud-write", remote.metadata_puts == uploads );
+    CHECK( "read-error-no-download", p->downloaded == downloads );
+    struct XGameSaveContainer container = { p, const_cast<char *>( "Save" ) };
+    struct XGameSaveUpdate update = {};
+    update.container = &container;
+    // Even an empty update must not reset the revision or lose the blob list.
+    CHECK( "read-error-update-reported", submit_update( &update ) == HRESULT_FROM_WIN32( ERROR_SHARING_VIOLATION ) );
+    CloseHandle( lock );
+    read_progress( p, "local-new", TRUE );
+    struct container_state state;
+    CHECK( "read-error-index-retained", load_state( p, "Save", &state ) == S_OK );
+    CHECK( "read-error-original-revision", state.revision == 1 && state.count == 1 );
+    free_state( &state );
+    close_provider( p );
+}
+
+static void first_local_update_still_works( void )
+{
+    auto p = device( FALSE, "new-local-container" );
+    p->cloud = FALSE;
+    struct XGameSaveContainer container = { p, const_cast<char *>( "Save" ) };
+    struct XGameSaveUpdate update = {};
+    update.container = &container;
+    CHECK( "new-container-update", submit_update( &update ) == S_OK );
+    struct container_state state;
+    CHECK( "new-container-load", load_state( p, "Save", &state ) == S_OK );
+    CHECK( "new-container-dirty-revision", state.dirty && state.revision == 1 );
+    free_state( &state );
+    close_provider( p );
+}
+
+static void failed_delete_retains_index( void )
+{
+    auto p = device( FALSE, "delete-locked-blob" );
+    p->cloud = FALSE;
+    seed( p, "retained", FALSE );
+    char path[2048];
+    WCHAR wide[4096];
+    CHECK( "delete-path", blob_path( p, "Save", "progress", path, sizeof( path ) ) && save_wide_path( path, wide ) );
+    HANDLE lock = CreateFileW( wide, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL );
+    CHECK( "delete-lock", lock != INVALID_HANDLE_VALUE );
+    struct XGameSaveContainer container = { p, const_cast<char *>( "Save" ) };
+    struct update_op op = { const_cast<char *>( "progress" ), nullptr, 0, TRUE };
+    struct XGameSaveUpdate update = {};
+    update.container = &container;
+    update.count = 1;
+    update.ops = &op;
+    CHECK( "delete-failure-reported", FAILED( submit_update( &update ) ) );
+    CloseHandle( lock );
+    read_progress( p, "retained", FALSE );
+    struct container_state state;
+    CHECK( "delete-failure-load", load_state( p, "Save", &state ) == S_OK );
+    CHECK( "delete-failure-index-unchanged", state.count == 1 && state.revision == 1 );
+    free_state( &state );
+    CHECK( "delete-retry", submit_update( &update ) == S_OK );
+    CHECK( "delete-retry-file-absent", GetFileAttributesW( wide ) == INVALID_FILE_ATTRIBUTES );
+    CHECK( "delete-retry-load", load_state( p, "Save", &state ) == S_OK );
+    CHECK( "delete-retry-index", !state.count && state.dirty && state.revision == 2 );
+    free_state( &state );
+    CHECK( "delete-already-missing", submit_update( &update ) == S_OK );
+    close_provider( p );
+}
+
 int main( void )
 {
     InitializeLogging();
@@ -114,7 +200,11 @@ int main( void )
         committed_upload_then_release_failure( files, FALSE );
         committed_upload_then_release_failure( files, TRUE );
         older_commit_keeps_newer_local_revision( files );
+        unreadable_index_preserves_local_progress( files, FALSE );
+        unreadable_index_preserves_local_progress( files, TRUE );
     }
+    first_local_update_still_works();
+    failed_delete_retains_index();
     printf( "CHECKS %u FAILURES %u\n", checks, failures );
     return failures ? 1 : 0;
 }

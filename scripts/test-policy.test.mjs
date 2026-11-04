@@ -129,8 +129,9 @@ test('XML parser inputs are pinned and checked without fallback or external enti
     const lock=JSON.parse(read('cmake/xml2.lock.json'));
     assert.equal(lock.commit,'7fc704ef49c50e9702c9983a5250d5738697bb04');
     assert.ok(Object.keys(lock.files).length>70);
-    assert.match(read('cmake/Xml2.cmake'),/file\(SHA256/);
-    assert.match(read('cmake/Xml2.cmake'),/FATAL_ERROR "Pinned XML source mismatch/);
+    assert.match(read('cmake/Xml2.cmake'),/include.*Xml2Source\.cmake/);
+    assert.match(read('cmake/Xml2Source.cmake'),/file\(SHA256/);
+    assert.match(read('cmake/Xml2Source.cmake'),/FATAL_ERROR "Pinned XML source mismatch/);
     assert.match(read('src/Runtime/Xml.cpp'),/XML_PARSE_NONET/);
     assert.match(read('src/Runtime/Xml.cpp'),/XML_PARSER_LOADDTD, 0/);
     assert.match(read('src/Runtime/Xml.cpp'),/XML_PARSER_SUBST_ENTITIES, 0/);
@@ -196,13 +197,39 @@ test('file saves retain all ABI assertions and load their actual C++ helper DLL'
         assert.match(read(file),/XUSER_\|NEXUS_\|XGAMERUNTIME_/);
 });
 
+test('base64 capacity contracts run in the native authentication gate',()=>{
+    assert.match(read('tests/CMakeLists.txt'),/target_sources\(test_nexus_user PRIVATE Nexus\/test_base64.cpp\)/);
+    for(const name of ['StandardEncodingRespectsCapacity','UrlEncodingRespectsCapacity','WideEncodingRespectsCapacity']) {
+        assert.ok(read('tests/Nexus/test_base64.cpp').includes(name));
+        assert.ok(read('scripts/test-authentication.mjs').includes(name));
+    }
+    assert.match(read('scripts/test-authentication.mjs'),/if\(!base64Passed\)proof.passed=false/);
+});
+
+test('backend framing has a shared total deadline and mandatory stalled transport coverage',()=>{
+    const source=read('src/System/User/BackendRequest.h');
+    assert.match(read('src/System/XUser.cpp'),/#include "User\/BackendRequest.h"/);
+    assert.match(source,/DWORD timeoutMilliseconds = 95000/);
+    assert.match(source,/backend_deadline deadline\( timeoutMilliseconds, cancellation, sharedCancellation \)/);
+    assert.doesNotMatch(source,/type == 5|SO_RCVTIMEO|SO_SNDTIMEO/);
+    assert.match(read('scripts/test-component.mjs'),/\['nexus_backend-request', 356\]/);
+    const fixture=read('tests/Nexus/backend-request.cpp');
+    for(const label of ['whole-request-deadline','partial-response-not-published','complete-fragmented-response',
+        'protocol-error-not-success','connection-error-preserved','send-backpressure-honors-deadline',
+        'wire-request-preserved','unix-protocol-branch-covered'])
+        assert.ok(fixture.includes('"'+label+'"'),label);
+});
+
 test('save commit recovery retains dirty revisions and tests cold relaunch conflicts',()=>{
     const fixture=read('tests/Nexus/gamesave-commit.cpp');
     assert.match(fixture,/#include "gamesave-transfer.cpp"/);
     for(const label of ['commit-release-error-visible','commit-relaunch-can-sync','commit-real-conflict-preserved','commit-real-conflict-no-write','newer-local-not-acknowledged','acknowledged-remote-base-durable','newer-local-relaunch-upload'])
         assert.ok(fixture.includes('"'+label+'"'),label);
-    assert.match(read('tests/CMakeLists.txt'),/foreach\(probe sync transfer commit\)/);
-    assert.match(read('scripts/test-component.mjs'),/\['nexus_gamesave-commit', 107\]/);
+    assert.match(read('tests/CMakeLists.txt'),/foreach\(probe sync transfer commit atomic index fencing\)/);
+    assert.match(read('scripts/test-component.mjs'),/\['nexus_gamesave-commit', 183\]/);
+    for(const label of ['read-error-sync-reported','read-error-update-reported','read-error-original-revision',
+        'delete-failure-reported','delete-failure-index-unchanged','delete-retry-index'])
+        assert.ok(fixture.includes('"'+label+'"'));
 });
 
 test('save result APIs never inspect opaque async storage or share operation identities',()=>{
@@ -286,7 +313,7 @@ test('current game licenses require proof-bound genuine SKU and support safe can
     assert.doesNotMatch(source,/4102444800|0010|isActive\s*=\s*TRUE[\s\S]*return E_NOTIMPL/);
     assert.match(read('src/System/Store/Entitled.h').replace(/\s+/g,''),/InterlockedCompareExchange\(&context->terminal,1,0\)/);
     assert.match(read('tests/Nexus/store-entitlements.cpp').replace(/\s+/g,''),/VirtualFree\(block,0,MEM_RELEASE\)/);
-    assert.match(read('scripts/test-store.mjs'),/\['store-entitlements',1116\]/);
+    assert.match(read('scripts/test-store.mjs'),/\['store-entitlements',1237\]/);
     assert.match(read('scripts/test-store.mjs'),/realAccounts:false,realCloud:false,fullRuntime:false/);
 });
 
@@ -407,9 +434,21 @@ test('desktop streaming lifecycle never advertises remote streaming support or w
     const features=read('src/System/XGameRuntimeFeature.cpp');
     assert.doesNotMatch(features,/case XGameRuntimeFeature::XGameStreaming:/);
     assert.match(read('tests/Nexus/test_optional_providers.cpp'),/ConcurrentInitializationAndTeardownNeverInventClients/);
-    assert.match(read('scripts/test-component.mjs'),/Number\(match\[1\]\) < 76/);
+    assert.match(read('scripts/test-component.mjs'),/Number\(match\[1\]\) < 83/);
 });
 
+test('async reused-block regressions require both exact test names and the raised unit floor',()=>{
+    const source=read('tests/Nexus/test_async_results.cpp');
+    const runner=read('scripts/test-component.mjs');
+    for(const name of ['ReusedBlockLateCompletionLeavesANewerCallPending','ReusedBlockHandoffRaceCancelsOnlyTheOldCall']){
+        assert.match(source,new RegExp(name));
+        assert.ok(runner.includes(name),'native unit gate must require '+name);
+        assert.ok(runner.includes('Missing passed async reused-block regression'),'native unit gate must require a passed [OK] result');
+    }
+    assert.match(runner,/Number\(match\[1\]\) < 83/);
+    assert.doesNotMatch(runner,/Number\(match\[1\]\) < 78/);
+    assert.doesNotMatch(runner,/Number\(match\[1\]\) < 76/);
+});
 test('WinRT-dependent privilege validation has a separate matching-engine gate',()=>{
     assert.match(read('scripts/test-user-contracts.mjs'),/PINNED_WINE_EXECUTABLE/);
     assert.match(read('scripts/test-user-contracts.mjs'),/user-privilege',1162/);
@@ -439,4 +478,117 @@ test('save conflicts retain explicit choices, backups and native regression cove
     assert.match(read('scripts/test-component.mjs'),new RegExp("\\['nexus_gamesave-sync', "+entry.conflictNativeChecks+"\\]"));
     assert.match(source,/run_conflicts\( FALSE \)/);assert.match(source,/run_conflicts\( TRUE \)/);
     assert.doesNotMatch(read('src/xgameruntime.def'),/SaveConflict|ResolveConflict/);
+});
+
+
+test('local save transactions require fault, crash and concurrent reader coverage',()=>{
+    const fixture=read('tests/Nexus/gamesave-atomic.cpp');
+    assert.match(read('scripts/test-component.mjs'),/\['nexus_gamesave-atomic', 598\]/);
+    assert.match(fixture,/#include "gamesave-transfer.cpp"/);
+    for(const label of ['failed-write-rolls-back-delete','locked-second-fails-whole-update',
+        'failed-rollback-not-empty-save','cleanup-retains-discoverable-identity','killed-at-injected-boundary',
+        'restart-sync-recovers-first','concurrent-readers-never-see-mixed-revisions','concurrent-no-lost-updates',
+        'allocation-error-visible','root-lock-allocation-failure-is-not-success',
+        'remote-lock-allocation-failure-is-not-success','readonly-original-attribute-retained','no-hardlinks-copy-fallback',
+        'missing-index-does-not-reinitialize','missing-index-enumeration-reports-error',
+        'missing-index-read-is-not-successful-empty','new-container-abort-leaves-no-visible-state'])
+        assert.ok(fixture.includes('"'+label+'"'),label);
+});
+
+
+test('invalid local indexes have mandatory native data-preservation coverage',()=>{
+    assert.match(read('scripts/test-component.mjs'),/\['nexus_gamesave-index', 1316\]/);
+    const fixture=read('tests/Nexus/gamesave-index.cpp');
+    for(const label of ['invalid-index-load-fails-closed','invalid-index-enumeration-reports-error','invalid-index-read-fails-closed','invalid-index-update-does-not-bless-state','invalid-index-update-preserves-index','invalid-index-sync-fails-closed','invalid-index-no-remote-write','invalid-index-no-download','invalid-index-sync-preserves-progress','legacy-valid-index-readable','legacy-read-does-not-rewrite'])
+        assert.ok(fixture.includes('"'+label+'"'),label);
+});
+
+
+test('remote save fencing requires synthetic ABA, crash and concurrent local-write coverage',()=>{
+    assert.match(read('scripts/test-component.mjs'),/\['nexus_gamesave-fencing', 251\]/);
+    const fixture=read('tests/Nexus/gamesave-fencing.cpp');
+    for(const label of ['fence-dirty-ABA-same-revision-time-size','fence-stale-snapshot-never-starts-metadata-put',
+        'fence-delete-not-resurrected-remotely','fence-local-submit-does-not-wait-on-network',
+        'fence-sync-snapshot-survives-baseline-only-advance','fence-stale-receive-rejected',
+        'fence-cross-process-gate-timeout','fence-cross-process-abandonment-recovers',
+        'fence-created-root-same-canonical-identity','fence-create-does-not-bypass-existing-lock',
+        'fence-rejected-reacquire-clears-stale-flag','fence-dialog-does-not-hold-data-or-remote-gate',
+        'fence-stale-conflict-choice-rejected','fence-generation-durable-not-per-read',
+        'fence-files-zero-readd-dirty-new-revision','fence-files-overflow-keeps-old-bytes'])
+        assert.ok(fixture.includes('"'+label+'"'),label);
+});
+
+
+test('MSA caller cancellation requires actual production socket and lifetime coverage',()=>{
+    assert.match(read('scripts/test-component.mjs'),/\['nexus_backend-cancellation', 211\]/);
+    assert.match(read('tests/CMakeLists.txt'),/target_link_libraries\(nexus_backend-cancellation PRIVATE ws2_32\)/);
+    const fixture=read('tests/Nexus/backend-cancellation.cpp');
+    for(const label of ['cancel-worker-exits-without-server-release','cancel-peer-sees-eof-before-release',
+        'cancel-result-is-abort','cancel-publishes-no-output','precancel-no-connection',
+        'independent-call-still-pending-after-other-cleanup','post-cancel-valid-output',
+        'complete-race-only-full-success-or-empty-abort','sliced-deadline-keeps-one-total-budget'])
+        assert.ok(fixture.includes('"'+label+'"'),label);
+    for(const name of ['CooperativeTicketCancellationStopsWorkerBeforePeerRelease',
+        'LegacyBackendFallbackWaitsForOwnerThenDiscardsCanceledResponse',
+        'CancelSignInCompletesBeforeBlockedTransportReturns','CancelledBlockCanBeReusedWhileTransportIsStillBlocked']){
+        assert.ok(read('tests/Nexus/test_user.cpp').includes('TEST( NexusAuthentication, '+name+' )'));
+        assert.ok(read('scripts/test-authentication.mjs').includes("'"+name+"'"));
+    }
+    assert.match(read('scripts/test-authentication.mjs'),/if\(!cancellationPassed\)proof.passed=false/);
+});
+
+
+test('sign-in HTTP cancellation retains synchronous ownership and stops later work',()=>{
+    assert.match(read('scripts/test-component.mjs'),/\['nexus_http-cancellation', 137\]/);
+    const fixture=read('tests/Nexus/http-cancellation.cpp');
+    for(const label of ['http-worker-retained-until-native-return','http-cancel-does-not-close-inflight-owner-handles',
+        'http-no-retry-after-observed-cancel','http-canceled-output-empty','http-no-body-read-after-canceled-query',
+        'http-no-query-after-canceled-read','http-complete-response-discarded-before-publication',
+        'http-owned-handle-close-once','http-handle-body-tls-invariants','http-precancel-no-handles',
+        'http-independent-still-owned-after-other-cleanup','http-post-cancel-request-valid',
+        'http-legacy-ignores-unpassed-token'])assert.ok(fixture.includes('"'+label+'"'),label);
+    const name='SignInHttpCancellationRetainsHeldCallAndStopsEveryLaterPhase';
+    assert.ok(read('tests/Nexus/test_user.cpp').includes('TEST( NexusAuthentication, '+name+' )'));
+    assert.ok(read('scripts/test-authentication.mjs').includes("'"+name+"'"));
+    assert.equal([...read('src/System/XUser.cpp').matchAll(/user->transport\.HttpCancellable\(/g)].length,4);
+});
+
+test('native authentication gate requires production cold-path and terminal-retry regressions',()=>{
+    for(const name of ['SuccessfulColdHandshakeAndWarmAuthorizationRemainSeparate','TerminalLocalErrorsDoNotRepeatTheHandshakeOrRetryWait'])
+        assert.ok(read('scripts/test-authentication.mjs').includes("'"+name+"'"));
+    assert.ok(read('scripts/test-authentication.mjs').includes('if(!criticalPathPassed)proof.passed=false;'));
+});
+
+test('native authentication gate requires silent overlap ownership and readiness contracts',()=>{
+    for(const name of ['SilentStartsIndependentPhasesButPublishesOnlyAfterBoth', 'AllowingUiKeepsOrderedDiscoveryBeforeTickets', 'DefaultFailureCancelsChildAndRetainsItsOwnError', 'ParentCancellationWhileWaitingTicketsDrainsChild', 'LateLegacyReplyIsJoinedAndNeverPublishedAfterDefaultFailure', 'TicketFailureWaitsForDefaultValidationWithoutPublishingIdentity', 'ThreadStartupFailurePreservesSequentialHandshakeAndReadiness', 'CurrentMetadataStillGatesCompletionThenGamertagNeedsNoRequest', 'CancellationBetweenAdmissionAndChildRunStartsNoBackendRequest'])
+        assert.ok(read('scripts/test-authentication.mjs').includes("'"+name+"'"));
+    assert.ok(read('scripts/test-authentication.mjs').includes('if(!silentOverlapPassed)proof.passed=false;'));
+});
+
+test('native authentication gate rejects a canceled picture that starts downstream work',()=>{
+    for(const name of ['HeldProfileReplyCannotStartImageAfterCancellation','HeldAuthorizationAndImageCancellationRemainRequestLocal'])
+        assert.ok(read('scripts/test-authentication.mjs').includes("'"+name+"'"));
+    assert.ok(read('scripts/test-authentication.mjs').includes('if(!pictureCancellationPassed)proof.passed=false;'));
+});
+
+test('Store native gate requires bounded within-operation metadata reuse coverage',()=>{
+    assert.ok(read('scripts/test-store.mjs').includes('METADATA_MEASURE same_product_skus=2 get_requests=1'));
+    for(const name of ['same-product-single-public-get','nonadjacent-products-evict','separate-operation-fetches','separate-market-fetches','metadata-reuse-missing-sku','metadata-reuse-malformed-trial','metadata-reuse-body-limit','metadata-reuse-http-failure','metadata-reuse-between-row-stop','metadata-reuse-sku-order-trial-expiry'])
+        assert.ok(read('tests/Nexus/store-entitlements.cpp').includes('"'+name+'"'));
+
+});
+
+test('Store ABI timestamps are signed 64-bit independently of CRT time_t',()=>{
+    const idl=read('include/xstore.idl');
+    assert.equal([...idl.matchAll(/\bINT64\s+(?:expirationDate|saleEndDate|endDate|acquiredDate|startDate)\s*;/g)].length,7);
+    assert.doesNotMatch(idl,/^\s*time_t\s+/m);
+    for(const name of ['store-abi-future-time-roundtrip','store-abi-signed-time-max','store-abi-signed-time-min','store-abi-timestamp-field-isolation'])
+        assert.ok(read('tests/Nexus/store-entitlements.cpp').includes('"'+name+'"'));
+});
+
+
+test('Store gate requires operation-local certificate reuse with fresh verification controls',()=>{
+    assert.ok(read('scripts/test-store.mjs').includes('CERTIFICATE_MEASURE batches=2 certificate_gets=1 verified=2 signatures=2'));
+    for(const name of ['certificate-operation-one-public-get','certificate-operation-two-validations','certificate-operation-separated-no-retention','certificate-operation-five-batches-one-get','certificate-operation-observed-cancel-before-cache-hit','certificate-operation-deadline-before-next-hit','certificate-cache-tampered-signature-denied','certificate-cache-wrong-nonce-denied','certificate-cache-expired-jwt-denied','certificate-cache-expired-certificate-denied','certificate-cache-failure-not-admitted','certificate-cache-failure-not-negative-cached','certificate-cache-one-slot-a-b-a'])
+        assert.ok(read('tests/Nexus/store-entitlements.cpp').includes('"'+name+'"'));
 });

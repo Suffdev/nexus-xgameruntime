@@ -37,9 +37,9 @@ static HRESULT game_license_from_snapshot( const entitled_snapshot *snapshot, co
             }
         }
     }
-    if ( !selected ) return E_ACCESSDENIED;
+    if ( !selected || until > static_cast<UINT64>( INT64_MAX ) ) return E_ACCESSDENIED;
     snprintf( out->skuStoreId, sizeof( out->skuStoreId ), "%s/%s", parent, selected->skuId );
     out->isActive = TRUE;
-    out->expirationDate = static_cast<time_t>( until );
+    out->expirationDate = static_cast<INT64>( until );
     return S_OK;
 }

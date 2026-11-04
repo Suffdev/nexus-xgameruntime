@@ -1,4 +1,4 @@
-foreach(probe IN ITEMS auth-rejection-metadata token-endpoint store-public-fetch)
+foreach(probe IN ITEMS auth-rejection-metadata token-endpoint store-public-fetch backend-request backend-cancellation http-cancellation http-cancellation-monitor)
     add_executable(nexus_${probe} Nexus/${probe}.cpp)
     add_dependencies(nexus_${probe} xgameruntime-idl)
     target_include_directories(nexus_${probe} PRIVATE "${IDL_BINARY_DIR}" "${PROJECT_SOURCE_DIR}/include")
@@ -8,6 +8,8 @@ foreach(probe IN ITEMS auth-rejection-metadata token-endpoint store-public-fetch
     set_target_properties(nexus_${probe} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 endforeach()
 target_link_libraries(nexus_store-public-fetch PRIVATE winhttp)
+target_link_libraries(nexus_backend-request PRIVATE ws2_32)
+target_link_libraries(nexus_backend-cancellation PRIVATE ws2_32)
 
 configure_file(Nexus/MicrosoftGame.config "${CMAKE_BINARY_DIR}/bin/MicrosoftGame.config" COPYONLY)
 
@@ -35,6 +37,7 @@ add_executable(test_xgameruntime
         Nexus/test_system.cpp
         Nexus/test_com_ownership.cpp
         Nexus/test_optional_providers.cpp
+        Nexus/time-abi.cpp
         Nexus/test_connectivity.cpp
         Nexus/test_offline_identity.cpp
         Nexus/test_shutdown.cpp
@@ -79,6 +82,7 @@ target_link_options(test_nexus_save PRIVATE -static -static-libgcc -static-libst
 set_target_properties(test_nexus_save PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
 add_executable(test_nexus_user Nexus/test_user.cpp)
+target_sources(test_nexus_user PRIVATE Nexus/test_base64.cpp)
 target_link_libraries(test_nexus_user PRIVATE xgameruntime-impl GTest::gtest_main)
 target_compile_features(test_nexus_user PRIVATE cxx_std_23)
 target_link_options(test_nexus_user PRIVATE -static -static-libgcc -static-libstdc++)
@@ -143,7 +147,7 @@ if(NEXUS_MIGRATION_PROBES)
     endforeach()
 endif()
 
-foreach(probe sync transfer commit)
+foreach(probe sync transfer commit atomic index fencing)
     add_executable(nexus_gamesave-${probe} Nexus/gamesave-${probe}.cpp)
     target_link_libraries(nexus_gamesave-${probe} PRIVATE xgameruntime-impl)
     target_compile_features(nexus_gamesave-${probe} PRIVATE cxx_std_23)
@@ -184,7 +188,7 @@ if(NEXUS_MIGRATION_PROBES)
     endforeach()
 endif()
 
-foreach(probe store-entitlements package-content)
+foreach(probe store-entitlements package-content store-context-cancellation receipt-ipc)
     add_executable(nexus_${probe} Nexus/${probe}.cpp)
     add_dependencies(nexus_${probe} xgameruntime-idl)
     target_include_directories(nexus_${probe} PRIVATE "${IDL_BINARY_DIR}" "${PROJECT_SOURCE_DIR}/include")
@@ -194,6 +198,13 @@ foreach(probe store-entitlements package-content)
     set_target_properties(nexus_${probe} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 endforeach()
 target_link_libraries(nexus_package-content PRIVATE xgameruntime-impl)
+# Compile the real licensing helper against a fixture-only monotonic clock.
+# Its normal production object is never compiled with this forced include.
+target_sources(nexus_receipt-ipc PRIVATE "${PROJECT_SOURCE_DIR}/src/System/XUser.cpp")
+target_link_libraries(nexus_receipt-ipc PRIVATE xgameruntime-impl)
+target_compile_options(nexus_receipt-ipc PRIVATE -ffunction-sections -fdata-sections
+    -include "${CMAKE_CURRENT_SOURCE_DIR}/Nexus/receipt-ipc-clock.h")
+target_link_options(nexus_receipt-ipc PRIVATE -Wl,--gc-sections)
 
 add_executable(nexus_package-installed Nexus/package-installed.cpp)
 add_dependencies(nexus_package-installed xgameruntime-idl)
@@ -268,3 +279,46 @@ target_compile_features(nexus_gamesave-conflict-ui PRIVATE cxx_std_23)
 target_link_options(nexus_gamesave-conflict-ui PRIVATE -static -static-libgcc -static-libstdc++)
 set_target_properties(nexus_gamesave-conflict-ui PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 endif()
+
+# This target compiles the actual queue with fixture-only API interposition.
+# Production library objects never include the shim.
+add_executable(nexus_taskqueue-composite-waiters
+    Nexus/taskqueue-composite-waiters.cpp
+    "${PROJECT_SOURCE_DIR}/src/System/Threading/XTaskQueue.cpp")
+add_dependencies(nexus_taskqueue-composite-waiters xgameruntime-idl)
+target_include_directories(nexus_taskqueue-composite-waiters PRIVATE
+    "${PROJECT_SOURCE_DIR}" "${IDL_BINARY_DIR}" "${PROJECT_SOURCE_DIR}/include")
+target_compile_definitions(nexus_taskqueue-composite-waiters PRIVATE LIBXML_STATIC)
+target_compile_options(nexus_taskqueue-composite-waiters PRIVATE
+    -include "${CMAKE_CURRENT_SOURCE_DIR}/Nexus/taskqueue-composite-waiters-shim.h")
+target_compile_features(nexus_taskqueue-composite-waiters PRIVATE cxx_std_23)
+target_link_libraries(nexus_taskqueue-composite-waiters PRIVATE
+    xgameruntime-impl nexus-xml2 xgameruntime-common shell32 bcrypt crypt32 advapi32
+    runtimeobject ole32 winhttp wininet ws2_32 iphlpapi)
+target_link_options(nexus_taskqueue-composite-waiters PRIVATE -static -static-libgcc -static-libstdc++)
+set_target_properties(nexus_taskqueue-composite-waiters PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
+add_executable(nexus_taskqueue-unwind-wait
+    Nexus/taskqueue-unwind-wait.cpp
+    "${PROJECT_SOURCE_DIR}/src/System/Threading/XTaskQueue.cpp")
+add_dependencies(nexus_taskqueue-unwind-wait xgameruntime-idl)
+target_include_directories(nexus_taskqueue-unwind-wait PRIVATE
+    "${PROJECT_SOURCE_DIR}" "${IDL_BINARY_DIR}" "${PROJECT_SOURCE_DIR}/include")
+target_compile_definitions(nexus_taskqueue-unwind-wait PRIVATE LIBXML_STATIC)
+target_compile_features(nexus_taskqueue-unwind-wait PRIVATE cxx_std_23)
+target_link_libraries(nexus_taskqueue-unwind-wait PRIVATE
+    xgameruntime-impl nexus-xml2 xgameruntime-common shell32 bcrypt crypt32 advapi32
+    runtimeobject ole32 winhttp wininet ws2_32 iphlpapi)
+target_link_options(nexus_taskqueue-unwind-wait PRIVATE -static -static-libgcc -static-libstdc++)
+set_target_properties(nexus_taskqueue-unwind-wait PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
+# Explicit native Wine/XGR contract probe; not part of the portable shim gate.
+add_executable(nexus_http-native-cancellation Nexus/http-native-cancellation.cpp)
+add_dependencies(nexus_http-native-cancellation xgameruntime-idl)
+target_include_directories(nexus_http-native-cancellation PRIVATE "${IDL_BINARY_DIR}" "${PROJECT_SOURCE_DIR}/include")
+target_link_libraries(nexus_http-native-cancellation PRIVATE xgameruntime-common winhttp ws2_32 runtimeobject ole32)
+target_compile_features(nexus_http-native-cancellation PRIVATE cxx_std_23)
+target_link_options(nexus_http-native-cancellation PRIVATE -static -static-libgcc -static-libstdc++)
+set_target_properties(nexus_http-native-cancellation PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")

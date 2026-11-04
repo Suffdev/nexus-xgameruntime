@@ -14,3 +14,18 @@ test('source-only pushes and pull requests keep source checks and skip component
     for(const title of ['', 'ordinary pull request','[source-only] integrate source'])
       assert.equal(!message.includes('[source-only]')&&!title.includes('[source-only]'),!message.startsWith('[source-only]')&&!title.startsWith('[source-only]'));
 });
+test('shared waiter regression remains mandatory and its shim is fixture-only',()=>{
+  const cmake=fs.readFileSync(path.join(root,'tests/CMakeLists.txt'),'utf8');
+  const runner=fs.readFileSync(path.join(root,'scripts/test-component.mjs'),'utf8');
+  assert.match(cmake,/add_executable\(nexus_taskqueue-composite-waiters\s+Nexus\/taskqueue-composite-waiters\.cpp/);
+  assert.match(cmake,/target_compile_options\(nexus_taskqueue-composite-waiters PRIVATE\s+-include/);
+  assert.ok(runner.includes("['nexus_taskqueue-composite-waiters', 96]"));
+  assert.ok(!fs.readFileSync(path.join(root,'src/CMakeLists.txt'),'utf8').includes('taskqueue-composite-waiters-shim'));
+});
+
+test('actual queue unwind regression remains a required native component',()=>{
+  const cmake=fs.readFileSync(path.join(root,'tests/CMakeLists.txt'),'utf8');
+  const runner=fs.readFileSync(path.join(root,'scripts/test-component.mjs'),'utf8');
+  assert.match(cmake,/add_executable\(nexus_taskqueue-unwind-wait\s+Nexus\/taskqueue-unwind-wait\.cpp/);
+  assert.ok(runner.includes("['nexus_taskqueue-unwind-wait', 17]"));
+});

@@ -35,7 +35,7 @@ static HRESULT conflict_equal( XGameSaveProvider *a, XGameSaveProvider *b, const
     HRESULT hr = load_state( a, name, &left );
     if ( SUCCEEDED( hr ) ) hr = load_state( b, name, &right );
     if ( SUCCEEDED( hr ) && ( left.count != right.count || left.time != right.time ||
-         left.revision != right.revision || left.dirty != right.dirty || strcmp( left.remote, right.remote ) ||
+         left.revision != right.revision || strcmp( left.incarnation, right.incarnation ) || left.dirty != right.dirty || strcmp( left.remote, right.remote ) ||
          strcmp( left.display ? left.display : "", right.display ? right.display : "" ) ) )
         hr = E_GS_CONTAINER_NOT_IN_SYNC;
     for ( UINT32 i = 0; SUCCEEDED( hr ) && i < left.count; i++ )
@@ -130,7 +130,7 @@ static HRESULT conflict_install( XGameSaveProvider *provider, XGameSaveProvider 
 }
 
 static HRESULT resolve_cloud_conflict( XGameSaveProvider *provider, container_state *state,
-                                       const char *display, const char *remote_time )
+                                       const char *display, const char *remote_time, save_remote_lock &gate )
 {
     if ( !GetSaveTransport( provider ).CanResolveConflicts() ) return E_GS_CONTAINER_NOT_IN_SYNC;
     if ( !remote_time || !*remote_time || strlen( remote_time ) >= sizeof( state->remote ) )
@@ -160,8 +160,11 @@ static HRESULT resolve_cloud_conflict( XGameSaveProvider *provider, container_st
     cloud.auth = current.auth = provider->auth;
     strcpy( cloud.base, provider->base ); strcpy( current.base, provider->base );
 
-    EnterCriticalSection( &provider->cs );
-    hr = conflict_copy( provider, &local, state->name );
+    {
+    save_cs_lock local_lock( &provider->cs ); save_root_lock root_lock( provider );
+    hr = root_lock.status;
+    if ( SUCCEEDED( hr ) ) hr = current_save_version( provider, state );
+    if ( SUCCEEDED( hr ) ) hr = conflict_copy( provider, &local, state->name );
     if ( SUCCEEDED( hr ) ) hr = conflict_equal( provider, &local, state->name );
     if ( SUCCEEDED( hr ) )
     {
@@ -170,7 +173,7 @@ static HRESULT resolve_cloud_conflict( XGameSaveProvider *provider, container_st
         if ( SUCCEEDED( hr ) ) { free_state( state ); *state = captured; }
         else free_state( &captured );
     }
-    LeaveCriticalSection( &provider->cs );
+    }
     if ( SUCCEEDED( hr ) ) hr = cloud_download_into( &cloud, state->name, display, remote_time );
     if ( SUCCEEDED( hr ) ) hr = conflict_remote_time( provider, state->name, remote_time );
     if ( SUCCEEDED( hr ) ) hr = load_state( &cloud, state->name, &remote_state );
@@ -194,7 +197,9 @@ static HRESULT resolve_cloud_conflict( XGameSaveProvider *provider, container_st
               L"Both versions are backed up in:\n%ls\n\nIf either version changes while this dialog is open, your choice will not be applied.",
               label_w, time_w, ( unsigned long long )state_total_size( state ), remote_w,
               ( unsigned long long )state_total_size( &remote_state ), path_w );
+    gate.release();
     choice = GetSaveTransport( provider ).ResolveConflict( text );
+    if ( FAILED( hr = gate.acquire() ) ) { free_state( &remote_state ); return hr; }
     if ( choice != SaveConflictChoice::Local && choice != SaveConflictChoice::Cloud )
     { hr = E_GS_CONTAINER_NOT_IN_SYNC; goto done; }
     /* Reacquire, then re-read the listing AND all bytes. A same-second cloud
@@ -205,18 +210,18 @@ static HRESULT resolve_cloud_conflict( XGameSaveProvider *provider, container_st
     hr = conflict_remote_time( provider, state->name, remote_time );
     if ( SUCCEEDED( hr ) ) hr = cloud_download_into( &current, state->name, display, remote_time );
     if ( SUCCEEDED( hr ) ) hr = conflict_equal( &cloud, &current, state->name );
-    EnterCriticalSection( &provider->cs );
-    if ( SUCCEEDED( hr ) ) hr = conflict_equal( provider, &local, state->name );
-    if ( SUCCEEDED( hr ) )
     {
-        if ( choice == SaveConflictChoice::Local ) hr = force_upload( provider, state );
-        else
+        save_cs_lock local_lock( &provider->cs ); save_root_lock root_lock( provider );
+        if ( SUCCEEDED( hr ) ) hr = root_lock.status;
+        if ( SUCCEEDED( hr ) ) hr = conflict_equal( provider, &local, state->name );
+        if ( SUCCEEDED( hr ) && choice == SaveConflictChoice::Cloud )
         {
             hr = conflict_install( provider, &cloud, state->name, root );
             if ( SUCCEEDED( hr ) ) provider->downloaded++;
         }
     }
-    LeaveCriticalSection( &provider->cs );
+    if ( SUCCEEDED( hr ) && choice == SaveConflictChoice::Local ) hr = force_upload( provider, state );
+
 done:
     free_state( &remote_state );
     provider->session_lock = FALSE;
@@ -226,8 +231,15 @@ done:
         if ( SUCCEEDED( hr ) && FAILED( released ) && choice == SaveConflictChoice::Local )
         {
             // The remote commit is known, but final notification must retry.
-            state->dirty = TRUE;
-            HRESULT persisted = save_state( provider, state );
+            save_cs_lock local_lock( &provider->cs ); save_root_lock root_lock( provider );
+            container_state live{};
+            HRESULT persisted = root_lock.status;
+            if ( SUCCEEDED( persisted ) ) persisted = load_state( provider, state->name, &live );
+            if ( SUCCEEDED( persisted ) && ( live.revision != state->revision ||
+                 strcmp( live.incarnation, state->incarnation ) || strcmp( live.remote, state->remote ) ) )
+                persisted = E_GS_CONTAINER_NOT_IN_SYNC;
+            if ( SUCCEEDED( persisted ) ) { live.dirty = TRUE; persisted = save_state( provider, &live ); }
+            free_state( &live );
             hr = FAILED( persisted ) ? persisted : released;
         }
         else if ( SUCCEEDED( hr ) ) hr = released;
