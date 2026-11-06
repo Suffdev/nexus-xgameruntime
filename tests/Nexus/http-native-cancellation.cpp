@@ -64,11 +64,17 @@ static DWORD WINAPI serve(void *context)
     }
     else
     {
-        while(!strstr(buffer,"\r\n\r\n"))
+        /* A blocking Winsock recv may return a full buffer that already holds
+         * the request head followed by the beginning of a large body. Scan the
+         * accumulated bytes before treating a full buffer as a head overflow. */
+        for(;;)
         {
+            if(strstr(buffer,"\r\n\r\n"))break;
+            if(used>=sizeof(buffer)-1){closesocket(client);return 2;}
             int count=recv(client,buffer+used,sizeof(buffer)-used-1,0);
-            if(count<=0||used+count>=sizeof(buffer)-1){closesocket(client);return 2;}
+            if(count<=0){closesocket(client);return 2;}
             used+=count;
+            buffer[used]=0;
         }
         f.protocolObserved=true;
         if(f.mode==Mode::Body)
@@ -95,6 +101,9 @@ static DWORD WINAPI request(void *context)
 int main()
 {
     setvbuf(stdout,nullptr,_IONBF,0);
+    /* The retried-request WARN path is used when a peer fails; without this the
+     * shared logging critical section is uninitialized and the worker blocks. */
+    InitializeLogging();
     WSADATA data; CHECK(!WSAStartup(MAKEWORD(2,2),&data));
     auto module=LoadLibraryW(L"winhttp.dll");
     CHECK(module && GetProcAddress(module,"__wine_winhttp_cancel_request_v1"));
