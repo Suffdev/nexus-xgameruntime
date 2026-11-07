@@ -772,6 +772,62 @@ static struct entitled_snapshot *test_metadata( void )
     return snapshot;
 }
 
+/* DisplayCatalog can still label a add-on as GameAddOn. The XStore kind has
+ * no GameAddOn value, so it must project to Durable exactly; unknown types keep
+ * failing closed and never create a row. */
+static void test_gameaddon_kind( void )
+{
+    const char *json = "{\"Products\":[{\"ProductId\":\"B00000000001\",\"ProductType\":\"GameAddOn\","
+        "\"Properties\":{\"InAppOfferToken\":\"Synthetic add-on\"},"
+        "\"LocalizedProperties\":[{\"ProductTitle\":\"Synthetic add-on\",\"Language\":\"en-US\"}],"
+        "\"DisplaySkuAvailabilities\":[{\"Sku\":{\"SkuId\":\"0010\",\"Properties\":{\"IsTrial\":false}}}]}]}";
+    const char *unknown = "{\"Products\":[{\"ProductId\":\"B00000000001\",\"ProductType\":\"FutureAddOn\","
+        "\"Properties\":{\"InAppOfferToken\":\"Synthetic add-on\"},"
+        "\"LocalizedProperties\":[{\"ProductTitle\":\"Synthetic add-on\",\"Language\":\"en-US\"}],"
+        "\"DisplaySkuAvailabilities\":[{\"Sku\":{\"SkuId\":\"0010\",\"Properties\":{\"IsTrial\":false,\"Packages\":[{}]}}}]}]}";
+    struct receipt_license license = { "B00000000001", "0010", 0 };
+    struct entitled_snapshot *snapshot = NULL;
+    xmlDocPtr doc;
+    xmlNodePtr root;
+    xmlChar *bytes;
+    int size;
+    license.expiry = time( NULL ) + 3600;
+    CHECK( "catalog-kind-gameaddon", catalog_kind( "GameAddOn" ) == 2 );
+    doc = xmlNewDoc( BAD_CAST "1.0" );
+    root = xmlNewNode( NULL, BAD_CAST "Response" );
+    xmlDocSetRootElement( doc, root );
+    CHECK( "gameaddon-metadata-row",
+           receipt_metadata_parse( &license, 31, ( BYTE * )json, strlen( json ), root ) == S_OK );
+    {
+        char until[32];
+        xmlNewTextChild( root, NULL, BAD_CAST "HResult", BAD_CAST "0" );
+        snprintf( until, sizeof( until ), "%llu", ( unsigned long long )time( NULL ) + 60 );
+        xmlNewTextChild( root, NULL, BAD_CAST "ValidUntil", BAD_CAST until );
+    }
+    xmlDocDumpMemory( doc, &bytes, &size );
+    CHECK( "gameaddon-entitled",
+           entitled_parse( ( char * )bytes, size, &snapshot ) == S_OK && snapshot && snapshot->count == 1 );
+    if ( snapshot )
+    {
+        CHECK( "gameaddon-product-row", snapshot->count == 1 && snapshot->products );
+        if ( snapshot->count == 1 && snapshot->products )
+        {
+            CHECK( "gameaddon-durable-kind", snapshot->products[0].productKind == XStoreProductKind::Durable );
+            CHECK( "gameaddon-no-digital-download", !snapshot->products[0].hasDigitalDownload );
+        }
+        entitled_snapshot_release( snapshot );
+        snapshot = NULL;
+    }
+    xmlFree( bytes );
+    xmlFreeDoc( doc );
+    doc = xmlNewDoc( BAD_CAST "1.0" );
+    root = xmlNewNode( NULL, BAD_CAST "Response" );
+    xmlDocSetRootElement( doc, root );
+    CHECK( "unknown-addon-type-fails-closed",
+           receipt_metadata_parse( &license, 31, ( BYTE * )unknown, strlen( unknown ), root ) == E_NOTIMPL );
+    xmlFreeDoc( doc );
+}
+
 static BOOLEAN CALLBACK enumerate( const XStoreProduct *product, void *context )
 {
     enumerated++;
@@ -2303,6 +2359,17 @@ static void test_public_catalog()
 
 int main( int argc, char **argv )
 {
+    if ( argc == 2 && !strcmp( argv[1], "--dlc-inputs-only" ) )
+    {
+        HMODULE dll = LoadLibraryA( "xgameruntime.dll" );
+        CHECK( "dlc-inputs-dll", dll != NULL );
+        HRESULT init = RoInitialize( RO_INIT_MULTITHREADED );
+        CHECK( "dlc-inputs-winrt", SUCCEEDED( init ) );
+        test_gameaddon_kind();
+        if ( SUCCEEDED( init ) ) RoUninitialize();
+        printf( "CHECKS %u FAILURES %u\n", checks, failures );
+        return failures ? 1 : 0;
+    }
     test_store_time_abi();
     if ( argc == 2 && !strcmp( argv[1], "--store-time-abi" ) )
     {
@@ -2452,6 +2519,7 @@ int main( int argc, char **argv )
     test_related_hints();
     test_receipts();
     test_async( test_metadata() );
+    test_gameaddon_kind();
     test_package_licenses();
     test_package_result_context();
     test_durable_acquisition();

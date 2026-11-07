@@ -458,6 +458,10 @@ static HRESULT receipt_metadata_parse( struct receipt_license *license, UINT32 k
         kind = 8;
     else if ( !strcmp( type, "UnmanagedConsumable" ) )
         kind = 16;
+    /* Exact canonical DisplayCatalog add-on type projects to Durable. Unknown
+     * or malformed types stay fail-closed and never become a product row. */
+    else if ( !strcmp( type, "GameAddOn" ) )
+        kind = 2;
     if ( !kind )
     {
         hr = E_NOTIMPL;
