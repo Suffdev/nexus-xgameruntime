@@ -92,6 +92,102 @@ static BOOL package_mount_directory( const WCHAR *root, const std::wstring &rela
     return TRUE;
 }
 
+/* Exclude follows the launcher/layout rule: a relative component pattern with
+ * wildcards allowed per component, compared against the Include prefix and the
+ * matched leaf name. It never names a host path, so no filesystem walk occurs. */
+static BOOL package_mount_same_char( WCHAR a, WCHAR b )
+{
+    return CompareStringOrdinal( &a, 1, &b, 1, TRUE ) == CSTR_EQUAL;
+}
+
+static BOOL package_mount_pattern( const std::wstring &pattern, const std::wstring &value )
+{
+    SIZE_T p = 0, v = 0, star = std::wstring::npos, retry = 0;
+    while ( v < value.size() )
+    {
+        if ( p < pattern.size() &&
+             ( pattern[p] == L'?' || package_mount_same_char( pattern[p], value[v] ) ) )
+        {
+            ++p;
+            ++v;
+        }
+        else if ( p < pattern.size() && pattern[p] == L'*' )
+        {
+            star = p++;
+            retry = v;
+        }
+        else if ( star != std::wstring::npos )
+        {
+            p = star + 1;
+            v = ++retry;
+        }
+        else
+            return FALSE;
+    }
+    while ( p < pattern.size() && pattern[p] == L'*' )
+        ++p;
+    return p == pattern.size();
+}
+
+static BOOL package_mount_exclude_parts( const char *text, std::vector<std::wstring> &parts )
+{
+    WCHAR wide[MAX_PATH];
+    const WCHAR *p;
+    if ( !text || !*text || strlen( text ) >= MAX_PATH )
+        return FALSE;
+    if ( !MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, wide, MAX_PATH ) )
+        return FALSE;
+    if ( ( wide[0] == L'\\' || wide[0] == L'/' ) && ( wide[1] == L'\\' || wide[1] == L'/' ) )
+        return FALSE;
+    for ( p = wide; *p; ++p )
+        if ( *p < 32 || *p == L':' )
+            return FALSE;
+    p = wide;
+    while ( *p == L'\\' || *p == L'/' )
+        ++p;
+    while ( *p )
+    {
+        const WCHAR *end = p;
+        std::wstring part;
+        while ( *end && *end != L'\\' && *end != L'/' )
+            ++end;
+        part.assign( p, end );
+        if ( !part.empty() && part != L"." )
+        {
+            if ( part == L".." )
+                return FALSE;
+            parts.push_back( std::move( part ) );
+        }
+        p = *end ? end + 1 : end;
+    }
+    /* "." or a single root separator normalizes to no components, exactly like
+     * the launcher layoutParts result. That means no exclusions, not an error. */
+    return TRUE;
+}
+
+static BOOL package_mount_excluded( const std::vector<std::wstring> &parts, const std::wstring &directory,
+                                    const WCHAR *name )
+{
+    std::vector<std::wstring> relative;
+    SIZE_T i = 0;
+    while ( i < directory.size() )
+    {
+        SIZE_T end = directory.find( L'\\', i );
+        if ( end == std::wstring::npos )
+            end = directory.size();
+        if ( end > i )
+            relative.emplace_back( directory, i, end - i );
+        i = end + 1;
+    }
+    relative.emplace_back( name );
+    if ( parts.size() != relative.size() )
+        return FALSE;
+    for ( i = 0; i < parts.size(); ++i )
+        if ( !package_mount_pattern( parts[i], relative[i] ) )
+            return FALSE;
+    return TRUE;
+}
+
 static HRESULT package_mount_collect( const WCHAR *root, xmlNodePtr node, UINT depth, package_mount_plan &plan,
                                       enum content_layout_coordinate coordinate )
 {
@@ -107,11 +203,15 @@ static HRESULT package_mount_collect( const WCHAR *root, xmlNodePtr node, UINT d
             std::unique_ptr<xmlChar, xmlFreeFunc> destination( xmlGetProp( node, BAD_CAST "DestinationPath" ),
                                                                xmlFree );
             std::unique_ptr<xmlChar, xmlFreeFunc> exclude( xmlGetProp( node, BAD_CAST "Exclude" ), xmlFree );
+            std::vector<std::wstring> exclude_parts;
             std::wstring source_relative, destination_relative, include_directory, directory;
             if ( ++plan.groups > 256 )
                 return HRESULT_FROM_WIN32( ERROR_MORE_DATA );
-            if ( exclude )
-                return E_NOTIMPL;
+            /* A producer may emit the optional attribute with an empty value.
+             * The launcher treats absent or empty Exclude as no exclusions. */
+            if ( exclude && *exclude.get() &&
+                 !package_mount_exclude_parts( ( const char * )exclude.get(), exclude_parts ) )
+                return E_INVALIDARG;
             if ( !content_text( node, "Include", include, sizeof( include ) ) ||
                  !content_relative( include, TRUE ) )
                 return E_INVALIDARG;
@@ -172,6 +272,9 @@ static HRESULT package_mount_collect( const WCHAR *root, xmlNodePtr node, UINT d
                     continue;
                 if ( found.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT )
                     return E_ACCESSDENIED;
+                if ( !exclude_parts.empty() &&
+                     package_mount_excluded( exclude_parts, include_directory, found.cFileName ) )
+                    continue;
                 std::wstring target = destination_relative;
                 if ( !target.empty() )
                     target += L'\\';

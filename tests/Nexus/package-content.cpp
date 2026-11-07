@@ -603,6 +603,101 @@ static void test_mount_projection()
     DeleteFileW( layout );
 }
 
+/* FileGroup Exclude is a component pattern relative to the Include prefix.
+ * Included files are projected; excluded files are never copied. Malformed or
+ * escaping patterns reject the layout instead of silently including them. */
+static void test_mount_exclude()
+{
+    configure( main_config );
+    fixture( L"mount-exclude", "Nexus.Exclude", "D0000000000B", "Nexus.Base", "B00000000001", 0x51, FALSE );
+    WCHAR root[MAX_PATH], src[MAX_PATH], content[MAX_PATH], layout[MAX_PATH], file[MAX_PATH], workspace[MAX_PATH];
+    content_join( folder, L"mount-exclude", root );
+    content_join( root, L"SRC", src );
+    CHECK( "exclude-source-directory", CreateDirectoryW( src, NULL ) );
+    content_join( src, L"alpha.dat", file ); write_text( file, "alpha" );
+    content_join( src, L"beta.dat", file ); write_text( file, "beta" );
+    content_join( src, L"Content", content );
+    CHECK( "exclude-content-directory", CreateDirectoryW( content, NULL ) );
+    content_join( content, L"keep.pak", file ); write_text( file, "keep" );
+    content_join( content, L"skip_one.pak", file ); write_text( file, "skip" );
+    content_join( root, L"layout_00000051-1111-2222-3333-444444444444.xml", layout );
+    const char *excluded = "<Package><Chunk Id=\"1000\">"
+        "<FileGroup SourcePath=\"SRC\" Include=\"*.dat\" Exclude=\"beta.dat\" DestinationPath=\"\\Data\"/>"
+        "<FileGroup SourcePath=\"SRC\" Include=\"Content/*.pak\" Exclude=\"Content/skip_*.pak\" DestinationPath=\"\\Data\"/>"
+        "</Chunk></Package>";
+    write_text( layout, excluded );
+    content_package package{};
+    CHECK( "exclude-content-loaded", content_load( root, &package ) && package.content );
+    package_mount_plan plan;
+    CHECK( "exclude-plan-listed", package_mount_read_plan( package, plan ) == S_OK && plan.groups == 2 &&
+        plan.files.size() == 2 );
+    CHECK( "exclude-included-files", plan.destinations.count( L"Data\\alpha.dat" ) &&
+        plan.destinations.count( L"Data\\keep.pak" ) );
+    CHECK( "exclude-excluded-files", !plan.destinations.count( L"Data\\beta.dat" ) &&
+        !plan.destinations.count( L"Data\\skip_one.pak" ) );
+    content_join( folder, L"mount-exclude-workspace", workspace );
+    CHECK( "exclude-workspace", CreateDirectoryW( workspace, NULL ) &&
+        SetEnvironmentVariableW( L"XODUS_MOUNT_ROOT", workspace ) );
+    mount_fixture_license license;
+    XPackageMountHandle mount = NULL;
+    CHECK( "exclude-mount-created", package_mount_create( package, mount_fixture_right( license ), &mount ) == S_OK && mount );
+    if ( mount )
+    {
+        IXPackageImpl *api = GetPackageInterface();
+        SIZE_T size = 0;
+        char view_path[MAX_PATH * 4] = "";
+        WCHAR view[MAX_PATH] = L"";
+        BOOL path_ok = api->XPackageGetMountPathSize( mount, &size ) == S_OK && size > 1 &&
+            api->XPackageGetMountPath( mount, size, view_path ) == S_OK &&
+            MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, view_path, -1, view, MAX_PATH ) > 0;
+        CHECK( "exclude-mount-path", path_ok );
+        CHECK( "exclude-mount-included", path_ok &&
+            mount_fixture_bytes( std::wstring( view ) + L"\\Data\\alpha.dat", "alpha" ) &&
+            mount_fixture_bytes( std::wstring( view ) + L"\\Data\\keep.pak", "keep" ) );
+        CHECK( "exclude-mount-excluded-absent", path_ok &&
+            GetFileAttributesW( ( std::wstring( view ) + L"\\Data\\beta.dat" ).c_str() ) == INVALID_FILE_ATTRIBUTES &&
+            GetFileAttributesW( ( std::wstring( view ) + L"\\Data\\skip_one.pak" ).c_str() ) == INVALID_FILE_ATTRIBUTES );
+        api->XPackageCloseMountHandle( mount );
+    }
+    CHECK( "exclude-workspace-cleared", SetEnvironmentVariableW( L"XODUS_MOUNT_ROOT", NULL ) );
+    CHECK( "exclude-workspace-empty", RemoveDirectoryW( workspace ) );
+    /* The optional attribute can be emitted with an empty value; that means
+     * no exclusions, exactly like an absent attribute. */
+    write_text( layout, "<Package><Chunk><FileGroup SourcePath=\"SRC\" Include=\"*.dat\" Exclude=\"\" DestinationPath=\"\\Data\"/>"
+        "<FileGroup SourcePath=\"SRC\" Include=\"Content/*.pak\" Exclude=\"\" DestinationPath=\"\\Data\"/></Chunk></Package>" );
+    package_mount_plan empty_exclude;
+    CHECK( "exclude-empty-accepted", package_mount_read_plan( package, empty_exclude ) == S_OK &&
+        empty_exclude.files.size() == 4 );
+    CHECK( "exclude-empty-keeps-all", empty_exclude.destinations.count( L"Data\\alpha.dat" ) &&
+        empty_exclude.destinations.count( L"Data\\beta.dat" ) &&
+        empty_exclude.destinations.count( L"Data\\keep.pak" ) &&
+        empty_exclude.destinations.count( L"Data\\skip_one.pak" ) );
+    for ( const char *normalized : { ".", "/" } )
+    {
+        char layout_text[256];
+        snprintf( layout_text, sizeof( layout_text ),
+            "<Package><Chunk><FileGroup SourcePath=\"SRC\" Include=\"*.dat\" Exclude=\"%s\" DestinationPath=\"\\Data\"/></Chunk></Package>",
+            normalized );
+        write_text( layout, layout_text );
+        package_mount_plan normalized_plan;
+        CHECK( "exclude-normalized-empty-accepted", package_mount_read_plan( package, normalized_plan ) == S_OK &&
+            normalized_plan.files.size() == 2 );
+        CHECK( "exclude-normalized-empty-keeps-all", normalized_plan.destinations.count( L"Data\\alpha.dat" ) &&
+            normalized_plan.destinations.count( L"Data\\beta.dat" ) );
+    }
+    const char *bad[] = {
+        "<Package><Chunk><FileGroup SourcePath=\"SRC\" Include=\"*.dat\" Exclude=\"../escape\" DestinationPath=\"\\Data\"/></Chunk></Package>",
+        "<Package><Chunk><FileGroup SourcePath=\"SRC\" Include=\"*.dat\" Exclude=\"\\\\server\\share\" DestinationPath=\"\\Data\"/></Chunk></Package>",
+        "<Package><Chunk><FileGroup SourcePath=\"SRC\" Include=\"*.dat\" Exclude=\"C:outside\" DestinationPath=\"\\Data\"/></Chunk></Package>",
+    };
+    for ( const char *bad_layout : bad )
+    {
+        write_text( layout, bad_layout );
+        CHECK( "exclude-invalid-pattern-rejected", package_mount_read_plan( package, plan ) == E_INVALIDARG );
+    }
+    DeleteFileW( layout );
+}
+
 /* A tree extracted at its declared DestinationPath is what the launcher keeps
  * for content that is already deployed; the runtime must enumerate and mount it
  * without falling back to the build-machine SourcePath. */
@@ -783,10 +878,17 @@ int main( int argc, char **argv )
     GetTempPathW( MAX_PATH, temporary );
     swprintf( folder, MAX_PATH, L"%lsnexus-content-%lu-%lu", temporary, GetCurrentProcessId(), GetTickCount() );
     CHECK( "fixture-directory", CreateDirectoryW( folder, NULL ) );
+    if ( argc == 2 && !strcmp( argv[1], "--dlc-inputs-only" ) )
+    {
+        test_mount_exclude();
+        printf( "CHECKS %u FAILURES %u\n", checks, failures );
+        return failures ? 1 : 0;
+    }
     helpers();
     actual_runtime( NULL );
     current_fixtures();
     test_mount_projection();
+    test_mount_exclude();
     test_deployed_destination();
     printf( "CHECKS %u FAILURES %u\n", checks, failures );
     return failures ? 1 : 0;
