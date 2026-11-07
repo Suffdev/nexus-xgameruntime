@@ -31,6 +31,7 @@ static const char *GetStoreProductId();
 #include "Store/Entitled.h"
 #include "Store/Catalog.h"
 #include "Store/PackageLicense.h"
+#include "Store/CanAcquireLicense.h"
 #include "Store/AddonLicense.h"
 #include "Store/StoreContext.h"
 #include "Store/StoreContextLicense.h"
@@ -172,29 +173,25 @@ void WINAPI XStoreImpl::XStoreCloseLicenseHandle( XStoreLicenseHandle storeLicen
 HRESULT WINAPI XStoreImpl::XStoreCanAcquireLicenseForStoreIdAsync( const XStoreContextHandle storeContextHandle,
                                                                    const char *storeProductId, XAsyncBlock *async )
 {
-    ( void )0;
-    return E_NOTIMPL;
+    return can_acquire_begin( storeContextHandle, storeProductId, async, &can_acquire_store_identity );
 }
 
 HRESULT WINAPI XStoreImpl::XStoreCanAcquireLicenseForStoreIdResult(
     XAsyncBlock *async, XStoreCanAcquireLicenseResult *storeCanAcquireLicense )
 {
-    ( void )0;
-    return E_NOTIMPL;
+    return can_acquire_result( async, storeCanAcquireLicense, &can_acquire_store_identity );
 }
 
 HRESULT WINAPI XStoreImpl::XStoreCanAcquireLicenseForPackageAsync( const XStoreContextHandle storeContextHandle,
                                                                    const char *packageIdentifier, XAsyncBlock *async )
 {
-    ( void )0;
-    return E_NOTIMPL;
+    return can_acquire_package_begin( storeContextHandle, packageIdentifier, async );
 }
 
 HRESULT WINAPI XStoreImpl::XStoreCanAcquireLicenseForPackageResult(
     XAsyncBlock *async, XStoreCanAcquireLicenseResult *storeCanAcquireLicense )
 {
-    ( void )0;
-    return E_NOTIMPL;
+    return can_acquire_result( async, storeCanAcquireLicense, &can_acquire_package_identity );
 }
 
 HRESULT WINAPI XStoreImpl::XStoreQueryGameLicenseAsync( const XStoreContextHandle store, XAsyncBlock *async )

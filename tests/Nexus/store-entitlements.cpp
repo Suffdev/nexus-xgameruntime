@@ -31,7 +31,7 @@ UINT64 xuser_get_xuid( XUserHandle user )
 {
     return 1;
 }
-static bool certificate_mode, certificate_stage_only;
+static bool certificate_mode, certificate_stage_only, certificate_tamper;
 static HCRYPTPROV certificate_provider;
 static char certificate_id[41];
 static std::string certificate_document, certificate_nonce;
@@ -72,6 +72,11 @@ HRESULT xodus_store_license_xml( const char *request, SIZE_T size, char **out )
     {
         ++certificate_batches;
         *out = token( certificate_provider, certificate_id, 0, certificate_nonce.c_str() );
+        if ( *out && certificate_tamper )
+        {
+            char *signature = strrchr( *out, '.' ) + 1;
+            signature[0] = signature[0] == 'A' ? 'B' : 'A';
+        }
         if ( certificate_stop_after_reply && certificate_batches == 2 && certificate_cancel_target ) InterlockedExchange( certificate_cancel_target, 1 );
         return *out ? S_OK : E_OUTOFMEMORY;
     }
@@ -178,6 +183,7 @@ HRESULT xpackage_query_content_store( const char *identifier, SIZE_T size, char 
 }
 #include "../../src/System/Store/Catalog.h"
 #include "../../src/System/Store/PackageLicense.h"
+#include "../../src/System/Store/CanAcquireLicense.h"
 #include "../../src/System/Store/AddonLicense.h"
 #include "../../src/System/Store/StoreLicenseProjection.h"
 
@@ -1286,6 +1292,470 @@ done:
     ( threads )->Release();
 }
 
+/* CanAcquire is a positive-only preview: a verified signed row for the exact
+ * product and a supported kind is Licensable; missing or unsupported evidence
+ * stays an error, never a fabricated NotLicensableToUser/status 2. */
+static void can_acquire_dispatch( IXThreadingImpl *threads, XTaskQueueHandle queue, XAsyncBlock *block )
+{
+    ULONGLONG start = GetTickCount64();
+    do
+    {
+        ( threads )->XTaskQueueDispatch( queue, XTaskQueuePort::Completion, 0 );
+        Sleep( 1 );
+    } while ( ( threads )->XAsyncGetStatus( block, FALSE ) == E_PENDING && GetTickCount64() - start < 3000 );
+}
+
+static void test_can_acquire_helpers( void )
+{
+    XStoreSku sku = {};
+    XStoreProduct product = {};
+    struct entitled_snapshot snapshot = {};
+    XStoreCanAcquireLicenseResult result = {};
+    UINT64 until = 0;
+    UINT32 kind;
+    sku.skuId = "0010";
+    sku.isInUserCollection = TRUE;
+    sku.collectionData.endDate = time( NULL ) + 3600;
+    product.storeId = "B00000000001";
+    product.productKind = XStoreProductKind::Durable;
+    product.isInUserCollection = TRUE;
+    product.skus = &sku;
+    product.skusCount = 1;
+    snapshot.count = 1;
+    snapshot.products = &product;
+    snapshot.proof_until = time( NULL ) + 60;
+    result.status = XStoreCanLicenseStatus::LicenseActionNotApplicableToProduct;
+    CHECK( "can-acquire-durable-package-free",
+           can_acquire_from_snapshot( &snapshot, product.storeId, &result, &until ) == S_OK &&
+               result.status == XStoreCanLicenseStatus::Licensable && !strcmp( result.licensableSku, "0010" ) &&
+               until == snapshot.proof_until );
+    product.hasDigitalDownload = TRUE;
+    result = {};
+    result.status = XStoreCanLicenseStatus::LicenseActionNotApplicableToProduct;
+    CHECK( "can-acquire-durable-package-bits",
+           can_acquire_from_snapshot( &snapshot, product.storeId, &result, &until ) == S_OK &&
+               result.status == XStoreCanLicenseStatus::Licensable );
+    product.productKind = XStoreProductKind::Game;
+    result = {};
+    result.status = XStoreCanLicenseStatus::LicenseActionNotApplicableToProduct;
+    CHECK( "can-acquire-game",
+           can_acquire_from_snapshot( &snapshot, product.storeId, &result, &until ) == S_OK &&
+               result.status == XStoreCanLicenseStatus::Licensable );
+    product.productKind = XStoreProductKind::Durable;
+    product.isInUserCollection = FALSE;
+    result = {};
+    result.status = XStoreCanLicenseStatus::LicenseActionNotApplicableToProduct;
+    CHECK( "can-acquire-product-not-collection-unknown",
+           can_acquire_from_snapshot( &snapshot, product.storeId, &result, &until ) == E_NOTIMPL &&
+               result.status == XStoreCanLicenseStatus::LicenseActionNotApplicableToProduct );
+    product.isInUserCollection = TRUE;
+    sku.isTrial = TRUE;
+    result = {};
+    result.status = XStoreCanLicenseStatus::LicenseActionNotApplicableToProduct;
+    CHECK( "can-acquire-trial-unknown",
+           can_acquire_from_snapshot( &snapshot, product.storeId, &result, &until ) == E_NOTIMPL &&
+               result.status == XStoreCanLicenseStatus::LicenseActionNotApplicableToProduct );
+    sku.isTrial = FALSE;
+    product.skus = NULL;
+    result = {};
+    CHECK( "can-acquire-null-skus-denied",
+           can_acquire_from_snapshot( &snapshot, product.storeId, &result, &until ) == E_UNEXPECTED );
+    product.skus = &sku;
+    for ( kind = 0; kind < 3; ++kind )
+    {
+        product.productKind = kind == 0   ? XStoreProductKind::Consumable
+                              : kind == 1 ? XStoreProductKind::Pass
+                                          : XStoreProductKind::UnmanagedConsumable;
+        result = {};
+        result.status = XStoreCanLicenseStatus::LicenseActionNotApplicableToProduct;
+        CHECK( "can-acquire-unsupported-kind-unknown",
+               can_acquire_from_snapshot( &snapshot, product.storeId, &result, &until ) == E_NOTIMPL &&
+                   result.status == XStoreCanLicenseStatus::LicenseActionNotApplicableToProduct );
+    }
+    product.productKind = XStoreProductKind::Durable;
+    result = {};
+    CHECK( "can-acquire-absent-unknown",
+           can_acquire_from_snapshot( &snapshot, "B00000000002", &result, &until ) == E_NOTIMPL );
+    result = {};
+    CHECK( "can-acquire-no-proof-denied",
+           ( snapshot.proof_until = 0, can_acquire_from_snapshot( &snapshot, product.storeId, &result, &until ) ==
+                                            E_ACCESSDENIED ) );
+    snapshot.proof_until = time( NULL ) + 60;
+    sku.isInUserCollection = FALSE;
+    result = {};
+    CHECK( "can-acquire-not-collection-unknown",
+           can_acquire_from_snapshot( &snapshot, product.storeId, &result, &until ) == E_NOTIMPL );
+    sku.isInUserCollection = TRUE;
+    sku.collectionData.endDate = time( NULL );
+    result = {};
+    CHECK( "can-acquire-expired-unknown",
+           can_acquire_from_snapshot( &snapshot, product.storeId, &result, &until ) == E_NOTIMPL );
+    sku.skuId = "BAD";
+    sku.collectionData.endDate = time( NULL ) + 3600;
+    result = {};
+    CHECK( "can-acquire-malformed-sku-denied",
+           can_acquire_from_snapshot( &snapshot, product.storeId, &result, &until ) == E_UNEXPECTED );
+    sku.skuId = "0010";
+    CHECK( "can-acquire-null-output", can_acquire_from_snapshot( &snapshot, product.storeId, NULL, &until ) ==
+                                          E_INVALIDARG );
+    {
+        XStoreContextHandle store = NULL;
+        struct can_acquire_async context = {};
+        XAsyncProviderData data = {};
+        XStoreCanAcquireLicenseResult out = {};
+        UINT64 xuid;
+        CHECK( "can-acquire-result-context", entitled_store_create( NULL, &store ) == S_OK );
+        context.store = store;
+        CHECK( "can-acquire-result-serial", entitled_store_identity( store, &xuid, &context.store_serial ) == S_OK );
+        context.until = time( NULL ) + 60;
+        context.result.status = XStoreCanLicenseStatus::Licensable;
+        strcpy( context.result.licensableSku, "0010" );
+        data.context = &context;
+        data.buffer = &out;
+        data.bufferSize = sizeof( out );
+        CHECK( "can-acquire-result-copy",
+               can_acquire_provider( XAsyncOp::GetResult, &data ) == S_OK &&
+                   out.status == XStoreCanLicenseStatus::Licensable && !strcmp( out.licensableSku, "0010" ) );
+        data.bufferSize = sizeof( out ) - 1;
+        CHECK( "can-acquire-result-small-buffer",
+               can_acquire_provider( XAsyncOp::GetResult, &data ) == E_INVALIDARG );
+        data.bufferSize = sizeof( out );
+        context.store_serial++;
+        CHECK( "can-acquire-result-wrong-serial",
+               can_acquire_provider( XAsyncOp::GetResult, &data ) == E_INVALIDARG );
+        context.store_serial--;
+        context.until = time( NULL ) - 1;
+        CHECK( "can-acquire-result-expired",
+               can_acquire_provider( XAsyncOp::GetResult, &data ) == E_ACCESSDENIED );
+        context.until = time( NULL ) + 60;
+        entitled_store_close( store );
+        CHECK( "can-acquire-result-closed",
+               can_acquire_provider( XAsyncOp::GetResult, &data ) == E_INVALIDARG );
+        {
+            XAsyncBlock fresh = {};
+            XStoreCanAcquireLicenseResult prefilled = {};
+            prefilled.status = XStoreCanLicenseStatus::Licensable;
+            strcpy( prefilled.licensableSku, "0010" );
+            CHECK( "can-acquire-result-default-block",
+                   can_acquire_result( &fresh, &prefilled, &can_acquire_store_identity ) != S_OK );
+            CHECK( "can-acquire-result-default-cleared",
+                   prefilled.status != XStoreCanLicenseStatus::Licensable && !prefilled.licensableSku[0] );
+        }
+    }
+}
+
+/* Synthetic read-only fetch for the async state machine. No signed receipt,
+ * no account and no network: it exercises positive, unknown and unsupported
+ * result mapping without the public metadata path. */
+static unsigned can_acquire_fetch_mode;
+
+static struct entitled_snapshot *can_acquire_fixture_snapshot( XStoreProductKind kind )
+{
+    struct entitled_snapshot *snapshot =
+        static_cast<std::remove_reference_t<decltype( snapshot )>>( calloc( 1, sizeof( *snapshot ) ) );
+    XStoreProduct *product;
+    XStoreSku *sku;
+    if ( !snapshot ) return NULL;
+    snapshot->refs = 1;
+    snapshot->proof_until = time( NULL ) + 60;
+    snapshot->count = 1;
+    snapshot->products =
+        static_cast<std::remove_reference_t<decltype( snapshot->products )>>( calloc( 1, sizeof( *snapshot->products ) ) );
+    if ( !snapshot->products )
+    {
+        free( snapshot );
+        return NULL;
+    }
+    product = &snapshot->products[0];
+    product->storeId = strdup( "B00000000001" );
+    product->title = strdup( "Synthetic" );
+    product->description = strdup( "" );
+    product->language = strdup( "en-US" );
+    product->inAppOfferToken = strdup( "synthetic-offer" );
+    product->price.currencyCode = strdup( "" );
+    product->productKind = kind;
+    product->isInUserCollection = TRUE;
+    product->hasDigitalDownload = kind == XStoreProductKind::Durable;
+    product->skusCount = 1;
+    product->skus = static_cast<std::remove_reference_t<decltype( product->skus )>>( calloc( 1, sizeof( *product->skus ) ) );
+    sku = product->skus;
+    if ( !product->storeId || !product->title || !product->description || !product->language ||
+         !product->inAppOfferToken || !product->price.currencyCode || !sku )
+    {
+        entitled_snapshot_release( snapshot );
+        return NULL;
+    }
+    sku->skuId = strdup( "0010" );
+    sku->title = strdup( "Synthetic" );
+    sku->description = strdup( "" );
+    sku->language = strdup( "en-US" );
+    sku->price.currencyCode = strdup( "" );
+    sku->isInUserCollection = TRUE;
+    sku->collectionData.endDate = time( NULL ) + 3600;
+    if ( !sku->skuId || !sku->title || !sku->description || !sku->language || !sku->price.currencyCode )
+    {
+        entitled_snapshot_release( snapshot );
+        return NULL;
+    }
+    return snapshot;
+}
+
+static HRESULT can_acquire_fixture_fetch( const char *, LONG *canceled, struct entitled_snapshot **out )
+{
+    XStoreProductKind kind = can_acquire_fetch_mode == 2   ? XStoreProductKind::Consumable
+                             : can_acquire_fetch_mode == 3 ? XStoreProductKind::Game
+                                                           : XStoreProductKind::Durable;
+    *out = NULL;
+    if ( InterlockedCompareExchange( canceled, 0, 0 ) ) return E_ABORT;
+    if ( can_acquire_fetch_mode == 1 )
+    {
+        *out = static_cast<std::remove_reference_t<decltype( *out )>>( calloc( 1, sizeof( **out ) ) );
+        if ( !*out ) return E_OUTOFMEMORY;
+        ( *out )->refs = 1;
+        ( *out )->proof_until = time( NULL ) + 60;
+        return S_OK;
+    }
+    *out = can_acquire_fixture_snapshot( kind );
+    return *out ? S_OK : E_OUTOFMEMORY;
+}
+
+static void test_can_acquire_async_synthetic( void )
+{
+    IXThreadingImpl *threads = NULL;
+    XTaskQueueHandle queue = NULL;
+    XStoreContextHandle store = NULL;
+    XAsyncBlock block = { 0 };
+    XStoreCanAcquireLicenseResult result = {};
+    struct can_acquire_async *context;
+    UINT64 xuid;
+    CHECK( "can-acquire-synthetic-threading",
+           FixtureQueryApiImpl( CLSID_XThreadingImpl, IID_IXThreadingImpl, ( void ** )&threads ) == S_OK && threads );
+    if ( !threads ) return;
+    CHECK( "can-acquire-synthetic-queue", ( threads )->XTaskQueueCreate( XTaskQueueDispatchMode::Manual,
+                                                                         XTaskQueueDispatchMode::Manual, &queue ) == S_OK );
+    CHECK( "can-acquire-synthetic-context", entitled_store_create( NULL, &store ) == S_OK );
+    for ( unsigned mode = 0; mode < 4; ++mode )
+    {
+        can_acquire_fetch_mode = mode;
+        context = static_cast<std::remove_reference_t<decltype( context )>>( calloc( 1, sizeof( *context ) ) );
+        if ( !context ) continue;
+        context->store = store;
+        CHECK( "can-acquire-synthetic-serial",
+               entitled_store_identity( store, &xuid, &context->store_serial ) == S_OK );
+        strcpy( context->store_id, "B00000000001" );
+        strcpy( context->request, "synthetic" );
+        context->fetch = can_acquire_fixture_fetch;
+        memset( &block, 0, sizeof( block ) );
+        block.queue = queue;
+        CHECK( "can-acquire-synthetic-begin",
+               can_acquire_start( context, &block, &can_acquire_store_identity ) == S_OK );
+        CHECK( "can-acquire-synthetic-work", ( threads )->XTaskQueueDispatch( queue, XTaskQueuePort::Work, 0 ) );
+        can_acquire_dispatch( threads, queue, &block );
+        if ( mode == 0 || mode == 3 )
+        {
+            CHECK( "can-acquire-synthetic-status", ( threads )->XAsyncGetStatus( &block, FALSE ) == S_OK );
+            memset( &result, 0, sizeof( result ) );
+            CHECK( "can-acquire-synthetic-result",
+                   can_acquire_result( &block, &result, &can_acquire_store_identity ) == S_OK &&
+                       result.status == XStoreCanLicenseStatus::Licensable &&
+                       !strcmp( result.licensableSku, "0010" ) );
+            memset( &result, 0, sizeof( result ) );
+            result.status = XStoreCanLicenseStatus::Licensable;
+            strcpy( result.licensableSku, "0010" );
+            CHECK( "can-acquire-synthetic-wrong-family",
+                   can_acquire_result( &block, &result, &can_acquire_package_identity ) != S_OK );
+            CHECK( "can-acquire-synthetic-wrong-family-cleared",
+                   result.status != XStoreCanLicenseStatus::Licensable && !result.licensableSku[0] );
+        }
+        else
+        {
+            CHECK( "can-acquire-synthetic-unknown", ( threads )->XAsyncGetStatus( &block, FALSE ) == E_NOTIMPL );
+            CHECK( "can-acquire-synthetic-no-result",
+                   FAILED( can_acquire_result( &block, &result, &can_acquire_store_identity ) ) );
+        }
+    }
+    entitled_store_close( store );
+    ( threads )->XTaskQueueCloseHandle( queue );
+    ( threads )->Release();
+}
+
+static void test_can_acquire_async( void )
+{
+    IXThreadingImpl *threads = NULL;
+    XTaskQueueHandle queue = NULL;
+    XStoreContextHandle store = NULL;
+    XAsyncBlock block = { 0 };
+    XStoreCanAcquireLicenseResult result = {};
+    ULONGLONG start;
+    CHECK( "can-acquire-threading",
+           FixtureQueryApiImpl( CLSID_XThreadingImpl, IID_IXThreadingImpl, ( void ** )&threads ) == S_OK && threads );
+    if ( !threads ) return;
+    CHECK( "can-acquire-queue", ( threads )->XTaskQueueCreate( XTaskQueueDispatchMode::Manual,
+                                                               XTaskQueueDispatchMode::Manual, &queue ) == S_OK );
+    CHECK( "can-acquire-context", entitled_store_create( NULL, &store ) == S_OK );
+    CHECK( "can-acquire-invalid-context",
+           can_acquire_begin( ( void * )1, "B00000000001", &block, &can_acquire_store_identity ) == E_INVALIDARG );
+    CHECK( "can-acquire-invalid-id",
+           can_acquire_begin( store, "bad", &block, &can_acquire_store_identity ) == E_INVALIDARG );
+    CHECK( "can-acquire-null-id",
+           can_acquire_begin( store, NULL, &block, &can_acquire_store_identity ) == E_INVALIDARG );
+    CHECK( "can-acquire-null-async",
+           can_acquire_begin( store, "B00000000001", NULL, &can_acquire_store_identity ) == E_INVALIDARG );
+    CHECK( "can-acquire-package-unknown",
+           can_acquire_package_begin( store, "foreign-package", &block ) == E_GAMEPACKAGE_NO_PACKAGE_IDENTIFIER );
+    CHECK( "can-acquire-package-null", can_acquire_package_begin( store, NULL, &block ) == E_INVALIDARG );
+
+    memset( &block, 0, sizeof( block ) );
+    block.queue = queue;
+    CHECK( "can-acquire-begin",
+           can_acquire_begin( store, "B00000000001", &block, &can_acquire_store_identity ) == S_OK );
+    CHECK( "can-acquire-work", ( threads )->XTaskQueueDispatch( queue, XTaskQueuePort::Work, 0 ) );
+    CHECK( "can-acquire-worker", WaitForSingleObject( bridge_started, 2000 ) == WAIT_OBJECT_0 );
+    CHECK( "can-acquire-pending", ( threads )->XAsyncGetStatus( &block, FALSE ) == E_PENDING );
+    SetEvent( bridge_gate );
+    can_acquire_dispatch( threads, queue, &block );
+    CHECK( "can-acquire-bridge-error", ( threads )->XAsyncGetStatus( &block, FALSE ) == E_FAIL );
+    CHECK( "can-acquire-bridge-no-result",
+           FAILED( can_acquire_result( &block, &result, &can_acquire_store_identity ) ) );
+    start = GetTickCount64();
+    while ( bridge_active && GetTickCount64() - start < 2000 )
+        Sleep( 1 );
+
+    ResetEvent( bridge_started );
+    ResetEvent( bridge_gate );
+    memset( &block, 0, sizeof( block ) );
+    block.queue = queue;
+    CHECK( "can-acquire-package-begin",
+           can_acquire_package_begin( store, "00000001111122223333444444444444", &block ) == S_OK );
+    CHECK( "can-acquire-package-work", ( threads )->XTaskQueueDispatch( queue, XTaskQueuePort::Work, 0 ) );
+    CHECK( "can-acquire-package-worker", WaitForSingleObject( bridge_started, 2000 ) == WAIT_OBJECT_0 );
+    SetEvent( bridge_gate );
+    can_acquire_dispatch( threads, queue, &block );
+    CHECK( "can-acquire-package-bridge-error", ( threads )->XAsyncGetStatus( &block, FALSE ) == E_FAIL );
+    CHECK( "can-acquire-package-no-result", FAILED( can_acquire_result( &block, &result, &can_acquire_package_identity ) ) );
+    start = GetTickCount64();
+    while ( bridge_active && GetTickCount64() - start < 2000 )
+        Sleep( 1 );
+
+    ResetEvent( bridge_started );
+    ResetEvent( bridge_gate );
+    memset( &block, 0, sizeof( block ) );
+    block.queue = queue;
+    CHECK( "can-acquire-cancel-begin",
+           can_acquire_begin( store, "B00000000001", &block, &can_acquire_store_identity ) == S_OK );
+    ( threads )->XAsyncCancel( &block );
+    CHECK( "can-acquire-cancel-work", ( threads )->XTaskQueueDispatch( queue, XTaskQueuePort::Work, 0 ) );
+    can_acquire_dispatch( threads, queue, &block );
+    CHECK( "can-acquire-cancel-terminal", ( threads )->XAsyncGetStatus( &block, FALSE ) == E_ABORT );
+    CHECK( "can-acquire-cancel-no-result",
+           FAILED( can_acquire_result( &block, &result, &can_acquire_store_identity ) ) );
+
+    entitled_store_close( store );
+    ( threads )->XTaskQueueCloseHandle( queue );
+    ( threads )->Release();
+}
+
+/* New CanAcquire worker with fetch=NULL: real production entitled_fetch,
+ * signature verification, signed inventory and metadata. Positive and a
+ * tampered-signature failure only; no account, network or trust change. */
+static void test_can_acquire_signed( void )
+{
+    IXThreadingImpl *threads = NULL;
+    XTaskQueueHandle queue = NULL;
+    XStoreContextHandle store = NULL;
+    XAsyncBlock block = { 0 };
+    XStoreCanAcquireLicenseResult result = {};
+    CHECK( "can-acquire-signed-threading",
+           FixtureQueryApiImpl( CLSID_XThreadingImpl, IID_IXThreadingImpl, ( void ** )&threads ) == S_OK && threads );
+    if ( !threads ) return;
+    CHECK( "can-acquire-signed-queue", ( threads )->XTaskQueueCreate( XTaskQueueDispatchMode::Manual,
+                                                                      XTaskQueueDispatchMode::Manual, &queue ) == S_OK );
+    CHECK( "can-acquire-signed-context", entitled_store_create( NULL, &store ) == S_OK );
+
+    certificate_tamper = false;
+    memset( &block, 0, sizeof( block ) );
+    block.queue = queue;
+    CHECK( "can-acquire-signed-begin",
+           can_acquire_begin( store, "B00000000001", &block, &can_acquire_store_identity ) == S_OK );
+    CHECK( "can-acquire-signed-work", ( threads )->XTaskQueueDispatch( queue, XTaskQueuePort::Work, 0 ) );
+    can_acquire_dispatch( threads, queue, &block );
+    CHECK( "can-acquire-signed-status", ( threads )->XAsyncGetStatus( &block, FALSE ) == S_OK );
+    CHECK( "can-acquire-signed-result",
+           can_acquire_result( &block, &result, &can_acquire_store_identity ) == S_OK );
+    CHECK( "can-acquire-signed-licensable", result.status == XStoreCanLicenseStatus::Licensable &&
+                                                 !strcmp( result.licensableSku, "0010" ) );
+
+    certificate_tamper = true;
+    memset( &block, 0, sizeof( block ) );
+    block.queue = queue;
+    CHECK( "can-acquire-bad-signature-begin",
+           can_acquire_begin( store, "B00000000001", &block, &can_acquire_store_identity ) == S_OK );
+    CHECK( "can-acquire-bad-signature-work", ( threads )->XTaskQueueDispatch( queue, XTaskQueuePort::Work, 0 ) );
+    can_acquire_dispatch( threads, queue, &block );
+    CHECK( "can-acquire-bad-signature-fails", FAILED( ( threads )->XAsyncGetStatus( &block, FALSE ) ) );
+    memset( &result, 0, sizeof( result ) );
+    result.status = XStoreCanLicenseStatus::Licensable;
+    strcpy( result.licensableSku, "0010" );
+    CHECK( "can-acquire-bad-signature-no-result",
+           FAILED( can_acquire_result( &block, &result, &can_acquire_store_identity ) ) &&
+               result.status != XStoreCanLicenseStatus::Licensable );
+    certificate_tamper = false;
+
+    entitled_store_close( store );
+    ( threads )->XTaskQueueCloseHandle( queue );
+    ( threads )->Release();
+}
+
+static void test_can_acquire_signed_fixture( void )
+{
+    HCRYPTPROV provider = 0;
+    HCRYPTKEY key = 0;
+    CERT_NAME_BLOB name = { 0 };
+    CRYPT_ALGORITHM_IDENTIFIER algorithm = { szOID_RSA_SHA256RSA, { 0 } };
+    SYSTEMTIME start = { 2020, 1, 0, 1 }, end = { 2099, 1, 0, 1 };
+    PCCERT_CONTEXT cert = NULL;
+    BYTE digest[20];
+    DWORD size = sizeof( digest );
+    char cert_id[41];
+    CHECK( "can-acquire-signed-provider",
+           CryptAcquireContextW( &provider, NULL, MS_ENH_RSA_AES_PROV_W, PROV_RSA_AES, CRYPT_VERIFYCONTEXT ) );
+    if ( !provider ) return;
+    CHECK( "can-acquire-signed-key", CryptGenKey( provider, AT_SIGNATURE, ( 2048 << 16 ) | CRYPT_EXPORTABLE, &key ) );
+    if ( !key ) goto done;
+    CHECK( "can-acquire-signed-name-size", CertStrToNameW( X509_ASN_ENCODING, L"CN=Nexus synthetic can-acquire",
+                                                           CERT_X500_NAME_STR, NULL, NULL, &name.cbData, NULL ) );
+    name.pbData = static_cast<std::remove_reference_t<decltype( name.pbData )>>( malloc( name.cbData ) );
+    if ( !name.pbData ) goto done;
+    CHECK( "can-acquire-signed-name",
+           CertStrToNameW( X509_ASN_ENCODING, L"CN=Nexus synthetic can-acquire", CERT_X500_NAME_STR, NULL,
+                           name.pbData, &name.cbData, NULL ) );
+    cert = CertCreateSelfSignCertificate( provider, &name, CERT_CREATE_SELFSIGN_NO_KEY_INFO, NULL, &algorithm, &start,
+                                          &end, NULL );
+    CHECK( "can-acquire-signed-cert", cert != NULL );
+    if ( !cert ) goto done;
+    CHECK( "can-acquire-signed-thumbprint",
+           CryptHashCertificate( 0, CALG_SHA1, 0, cert->pbCertEncoded, cert->cbCertEncoded, digest, &size ) );
+    for ( unsigned i = 0; i < 20; ++i )
+        sprintf( cert_id + i * 2, "%02X", digest[i] );
+    certificate_provider = provider;
+    strcpy( certificate_id, cert_id );
+    certificate_document = certificate_json( cert );
+    if ( certificate_document.empty() ) goto done;
+    metadata_body = R"({"Products":[{"ProductId":"B00000000001","ProductType":"Durable","LocalizedProperties":[{"ProductTitle":"Synthetic","Language":"en-US"}],"DisplaySkuAvailabilities":[{"Sku":{"SkuId":"0010","Properties":{"IsTrial":false}}}]}]})";
+    metadata_mode = certificate_mode = true;
+    test_can_acquire_signed();
+    metadata_mode = certificate_mode = false;
+    certificate_tamper = false;
+    certificate_provider = 0;
+    certificate_document.clear();
+    certificate_nonce.clear();
+done:
+    if ( cert ) CertFreeCertificateContext( cert );
+    free( name.pbData );
+    if ( key ) CryptDestroyKey( key );
+    CryptReleaseContext( provider, 0 );
+}
+
 /* Result handoff must still belong to the Store context that initiated it.
  * The positive license is the same receipt-bound fixture used above. */
 static void test_package_result_context( void )
@@ -2366,6 +2836,40 @@ int main( int argc, char **argv )
         HRESULT init = RoInitialize( RO_INIT_MULTITHREADED );
         CHECK( "dlc-inputs-winrt", SUCCEEDED( init ) );
         test_gameaddon_kind();
+        if ( SUCCEEDED( init ) ) RoUninitialize();
+        printf( "CHECKS %u FAILURES %u\n", checks, failures );
+        return failures ? 1 : 0;
+    }
+    if ( argc == 2 && !strcmp( argv[1], "--can-acquire-signed-only" ) )
+    {
+        HMODULE dll = LoadLibraryA( "xgameruntime.dll" );
+        if ( !dll ||
+             !( runtime_query =
+                    reinterpret_cast<decltype( runtime_query )>( GetProcAddress( dll, "QueryApiImpl" ) ) ) )
+            return 2;
+        const auto init = RoInitialize( RO_INIT_MULTITHREADED );
+        CHECK( "can-acquire-signed-winrt", SUCCEEDED( init ) );
+        test_can_acquire_signed_fixture();
+        if ( SUCCEEDED( init ) ) RoUninitialize();
+        printf( "CHECKS %u FAILURES %u\n", checks, failures );
+        return failures ? 1 : 0;
+    }
+    if ( argc == 2 && !strcmp( argv[1], "--can-acquire-only" ) )
+    {
+        HMODULE dll = LoadLibraryA( "xgameruntime.dll" );
+        if ( !dll ||
+             !( runtime_query =
+                    reinterpret_cast<decltype( runtime_query )>( GetProcAddress( dll, "QueryApiImpl" ) ) ) )
+            return 2;
+        const auto init = RoInitialize( RO_INIT_MULTITHREADED );
+        CHECK( "can-acquire-winrt", SUCCEEDED( init ) );
+        bridge_started = CreateEventA( NULL, TRUE, FALSE, NULL );
+        bridge_gate = CreateEventA( NULL, TRUE, FALSE, NULL );
+        test_can_acquire_helpers();
+        test_can_acquire_async_synthetic();
+        test_can_acquire_async();
+        CloseHandle( bridge_started );
+        CloseHandle( bridge_gate );
         if ( SUCCEEDED( init ) ) RoUninitialize();
         printf( "CHECKS %u FAILURES %u\n", checks, failures );
         return failures ? 1 : 0;
