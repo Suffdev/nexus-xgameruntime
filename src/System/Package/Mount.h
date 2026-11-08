@@ -77,33 +77,119 @@ static BOOL package_mount_relative( const char *text, BOOL destination, std::wst
     return out.size() < MAX_PATH;
 }
 
+/* The package root is host-supplied and must be a real directory. Components
+ * below it use the shared bounded no-reparse walk from Content.h. */
 static BOOL package_mount_directory( const WCHAR *root, const std::wstring &relative, std::wstring &out )
 {
-    out = root;
-    DWORD attributes = GetFileAttributesW( out.c_str() );
+    WCHAR path[MAX_PATH];
+    DWORD attributes = GetFileAttributesW( root );
     if ( attributes == INVALID_FILE_ATTRIBUTES || !( attributes & FILE_ATTRIBUTE_DIRECTORY ) ||
          ( attributes & FILE_ATTRIBUTE_REPARSE_POINT ) )
         return FALSE;
-    SIZE_T offset = 0;
-    while ( offset < relative.size() )
-    {
-        SIZE_T end = relative.find( L'\\', offset );
-        if ( end == std::wstring::npos )
-            end = relative.size();
-        out += L'\\';
-        out.append( relative, offset, end - offset );
-        if ( out.size() >= MAX_PATH )
-            return FALSE;
-        attributes = GetFileAttributesW( out.c_str() );
-        if ( attributes == INVALID_FILE_ATTRIBUTES || !( attributes & FILE_ATTRIBUTE_DIRECTORY ) ||
-             ( attributes & FILE_ATTRIBUTE_REPARSE_POINT ) )
-            return FALSE;
-        offset = end + 1;
-    }
+    if ( !content_directory( root, relative.c_str(), path ) )
+        return FALSE;
+    out = path;
     return TRUE;
 }
 
-static HRESULT package_mount_collect( const WCHAR *root, xmlNodePtr node, UINT depth, package_mount_plan &plan )
+/* Exclude follows the launcher/layout rule: a relative component pattern with
+ * wildcards allowed per component, compared against the Include prefix and the
+ * matched leaf name. It never names a host path, so no filesystem walk occurs. */
+static BOOL package_mount_same_char( WCHAR a, WCHAR b )
+{
+    return CompareStringOrdinal( &a, 1, &b, 1, TRUE ) == CSTR_EQUAL;
+}
+
+static BOOL package_mount_pattern( const std::wstring &pattern, const std::wstring &value )
+{
+    SIZE_T p = 0, v = 0, star = std::wstring::npos, retry = 0;
+    while ( v < value.size() )
+    {
+        if ( p < pattern.size() &&
+             ( pattern[p] == L'?' || package_mount_same_char( pattern[p], value[v] ) ) )
+        {
+            ++p;
+            ++v;
+        }
+        else if ( p < pattern.size() && pattern[p] == L'*' )
+        {
+            star = p++;
+            retry = v;
+        }
+        else if ( star != std::wstring::npos )
+        {
+            p = star + 1;
+            v = ++retry;
+        }
+        else
+            return FALSE;
+    }
+    while ( p < pattern.size() && pattern[p] == L'*' )
+        ++p;
+    return p == pattern.size();
+}
+
+static BOOL package_mount_exclude_parts( const char *text, std::vector<std::wstring> &parts )
+{
+    WCHAR wide[MAX_PATH];
+    const WCHAR *p;
+    if ( !text || !*text || strlen( text ) >= MAX_PATH )
+        return FALSE;
+    if ( !MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, wide, MAX_PATH ) )
+        return FALSE;
+    if ( ( wide[0] == L'\\' || wide[0] == L'/' ) && ( wide[1] == L'\\' || wide[1] == L'/' ) )
+        return FALSE;
+    for ( p = wide; *p; ++p )
+        if ( *p < 32 || *p == L':' )
+            return FALSE;
+    p = wide;
+    while ( *p == L'\\' || *p == L'/' )
+        ++p;
+    while ( *p )
+    {
+        const WCHAR *end = p;
+        std::wstring part;
+        while ( *end && *end != L'\\' && *end != L'/' )
+            ++end;
+        part.assign( p, end );
+        if ( !part.empty() && part != L"." )
+        {
+            if ( part == L".." )
+                return FALSE;
+            parts.push_back( std::move( part ) );
+        }
+        p = *end ? end + 1 : end;
+    }
+    /* "." or a single root separator normalizes to no components, exactly like
+     * the launcher layoutParts result. That means no exclusions, not an error. */
+    return TRUE;
+}
+
+static BOOL package_mount_excluded( const std::vector<std::wstring> &parts, const std::wstring &directory,
+                                    const WCHAR *name )
+{
+    std::vector<std::wstring> relative;
+    SIZE_T i = 0;
+    while ( i < directory.size() )
+    {
+        SIZE_T end = directory.find( L'\\', i );
+        if ( end == std::wstring::npos )
+            end = directory.size();
+        if ( end > i )
+            relative.emplace_back( directory, i, end - i );
+        i = end + 1;
+    }
+    relative.emplace_back( name );
+    if ( parts.size() != relative.size() )
+        return FALSE;
+    for ( i = 0; i < parts.size(); ++i )
+        if ( !package_mount_pattern( parts[i], relative[i] ) )
+            return FALSE;
+    return TRUE;
+}
+
+static HRESULT package_mount_collect( const WCHAR *root, xmlNodePtr node, UINT depth, package_mount_plan &plan,
+                                      enum content_layout_coordinate coordinate )
 {
     if ( depth > 16 )
         return HRESULT_FROM_WIN32( ERROR_MORE_DATA );
@@ -117,15 +203,40 @@ static HRESULT package_mount_collect( const WCHAR *root, xmlNodePtr node, UINT d
             std::unique_ptr<xmlChar, xmlFreeFunc> destination( xmlGetProp( node, BAD_CAST "DestinationPath" ),
                                                                xmlFree );
             std::unique_ptr<xmlChar, xmlFreeFunc> exclude( xmlGetProp( node, BAD_CAST "Exclude" ), xmlFree );
+            std::vector<std::wstring> exclude_parts;
             std::wstring source_relative, destination_relative, include_directory, directory;
             if ( ++plan.groups > 256 )
                 return HRESULT_FROM_WIN32( ERROR_MORE_DATA );
-            if ( exclude )
-                return E_NOTIMPL;
-            if ( !destination || !content_text( node, "SourcePath", source, sizeof( source ) ) ||
-                 !content_text( node, "Include", include, sizeof( include ) ) || !content_relative( include, TRUE ) ||
-                 !package_mount_relative( source, FALSE, source_relative ) ||
-                 !package_mount_relative( ( char * )destination.get(), TRUE, destination_relative ) )
+            /* A producer may emit the optional attribute with an empty value.
+             * The launcher treats absent or empty Exclude as no exclusions. */
+            if ( exclude && *exclude.get() &&
+                 !package_mount_exclude_parts( ( const char * )exclude.get(), exclude_parts ) )
+                return E_INVALIDARG;
+            if ( !content_text( node, "Include", include, sizeof( include ) ) ||
+                 !content_relative( include, TRUE ) )
+                return E_INVALIDARG;
+            if ( destination )
+            {
+                if ( !*destination.get() ||
+                     !package_mount_relative( ( char * )destination.get(), TRUE, destination_relative ) )
+                    return E_INVALIDARG;
+            }
+            else if ( content_text( node, "SourcePath", source, sizeof( source ) ) )
+            {
+                /* No destination was declared: the deployed tree is the declared
+                 * source location, matching package chunk readiness. */
+                if ( !package_mount_relative( source, TRUE, destination_relative ) ) return E_INVALIDARG;
+            }
+            else
+                return E_INVALIDARG;
+            if ( coordinate == CONTENT_LAYOUT_DESTINATION )
+            {
+                /* An already deployed tree is projected onto its own destination
+                 * paths; SourcePath is the build-machine coordinate then. */
+                source_relative = destination_relative;
+            }
+            else if ( !content_text( node, "SourcePath", source, sizeof( source ) ) ||
+                      !package_mount_relative( source, TRUE, source_relative ) )
                 return E_INVALIDARG;
             char *last = strrchr( include, '\\' ), *slash = strrchr( include, '/' );
             if ( !last || ( slash && slash > last ) )
@@ -161,6 +272,9 @@ static HRESULT package_mount_collect( const WCHAR *root, xmlNodePtr node, UINT d
                     continue;
                 if ( found.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT )
                     return E_ACCESSDENIED;
+                if ( !exclude_parts.empty() &&
+                     package_mount_excluded( exclude_parts, include_directory, found.cFileName ) )
+                    continue;
                 std::wstring target = destination_relative;
                 if ( !target.empty() )
                     target += L'\\';
@@ -191,7 +305,7 @@ static HRESULT package_mount_collect( const WCHAR *root, xmlNodePtr node, UINT d
             if ( !any )
                 return HRESULT_FROM_WIN32( ERROR_FILE_NOT_FOUND );
         }
-        HRESULT hr = package_mount_collect( root, node->children, depth + 1, plan );
+        HRESULT hr = package_mount_collect( root, node->children, depth + 1, plan, coordinate );
         if ( FAILED( hr ) )
             return hr;
     }
@@ -223,7 +337,11 @@ static HRESULT package_mount_read_plan( const content_package &package, package_
         return E_INVALIDARG;
     try
     {
-        HRESULT hr = package_mount_collect( package.path, root->children, 0, plan );
+        enum content_layout_coordinate coordinate;
+        UINT groups = 0;
+        if ( !content_layout_coordinate( package.path, root->children, &coordinate, &groups ) )
+            return E_INVALIDARG;
+        HRESULT hr = package_mount_collect( package.path, root->children, 0, plan, coordinate );
         return FAILED( hr ) ? hr : plan.groups && !plan.files.empty() ? S_OK : E_INVALIDARG;
     }
     catch ( const std::bad_alloc & )

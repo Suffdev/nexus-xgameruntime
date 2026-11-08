@@ -21,6 +21,10 @@ static UINT32 catalog_kind ( const char *type )
 {
     if ( !type )
         return 0;
+    /* DisplayCatalog still labels some legacy add-ons GameAddOn. The XStore
+     * product kind has no such value; a GameAddOn is a Durable add-on. */
+    if ( !strcmp ( type, "GameAddOn" ) )
+        return 2;
     const char *names[] = { "Consumable", "Durable", "Game", "Pass", "UnmanagedConsumable" };
     for ( UINT32 i = 0; i < ARRAY_SIZE ( names ); ++i )
         if ( !strcmp ( type, names[i] ) )

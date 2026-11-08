@@ -31,7 +31,7 @@ UINT64 xuser_get_xuid( XUserHandle user )
 {
     return 1;
 }
-static bool certificate_mode, certificate_stage_only;
+static bool certificate_mode, certificate_stage_only, certificate_tamper;
 static HCRYPTPROV certificate_provider;
 static char certificate_id[41];
 static std::string certificate_document, certificate_nonce;
@@ -72,6 +72,11 @@ HRESULT xodus_store_license_xml( const char *request, SIZE_T size, char **out )
     {
         ++certificate_batches;
         *out = token( certificate_provider, certificate_id, 0, certificate_nonce.c_str() );
+        if ( *out && certificate_tamper )
+        {
+            char *signature = strrchr( *out, '.' ) + 1;
+            signature[0] = signature[0] == 'A' ? 'B' : 'A';
+        }
         if ( certificate_stop_after_reply && certificate_batches == 2 && certificate_cancel_target ) InterlockedExchange( certificate_cancel_target, 1 );
         return *out ? S_OK : E_OUTOFMEMORY;
     }
@@ -93,6 +98,20 @@ static const char *GetStoreProductId()
 static WCHAR public_path[256];
 static DWORD public_flags;
 static unsigned public_requests, public_sends;
+static bool associated_mode;
+static std::vector<std::string> associated_lookup_pages;
+static std::string associated_metadata_body;
+static unsigned associated_lookup_index;
+static std::vector<std::wstring> associated_public_paths;
+static bool associated_metadata_pending;
+static char associated_owned_product[13];
+static std::string associated_license_row( const std::string &id )
+{
+    return std::string( "{\"Products\":[{\"ProductId\":\"" ) + id +
+           "\",\"ProductType\":\"Durable\",\"LocalizedProperties\":[{\"ProductTitle\":\"Synthetic\","
+           "\"Language\":\"en-US\"}],\"DisplaySkuAvailabilities\":[{\"Sku\":{\"SkuId\":\"0010\","
+           "\"Properties\":{\"IsTrial\":false}}}]}]}";
+}
 static HINTERNET WINAPI FixturePublicOpenRequest( HINTERNET connection, LPCWSTR verb, LPCWSTR path,
                                                  LPCWSTR version, LPCWSTR referrer, LPCWSTR *accept, DWORD flags )
 {
@@ -101,6 +120,29 @@ static HINTERNET WINAPI FixturePublicOpenRequest( HINTERNET connection, LPCWSTR 
     public_path[0] = 0;
     if ( path && wcslen( path ) < ARRAY_SIZE( public_path ) ) wcscpy( public_path, path );
     public_cursor = 0; public_body = metadata_body;
+    if ( associated_mode && path && wcsstr( path, L"/v7/products/lookup?" ) )
+    {
+        associated_public_paths.push_back( path );
+        public_body = associated_lookup_index < associated_lookup_pages.size()
+                          ? associated_lookup_pages[associated_lookup_index] : std::string( "{}" );
+        ++associated_lookup_index;
+    }
+    else if ( associated_mode && path && wcsstr( path, L"/v7.0/products?" ) )
+    {
+        associated_public_paths.push_back( path );
+        if ( associated_metadata_pending )
+        {
+            associated_metadata_pending = false;
+            public_body = associated_metadata_body;
+        }
+        else
+        {
+            const WCHAR *start = wcsstr( path, L"bigIds=" ) + 7;
+            std::string id;
+            for ( unsigned i = 0; i < 12 && start[i]; ++i ) id.push_back( (char)start[i] );
+            public_body = associated_license_row( id );
+        }
+    }
     if ( certificate_mode && path && wcsstr( path, L"/v8.0/licenseToken/fullCertificate/" ) )
     {
         ++certificate_requests; public_body = certificate_document;
@@ -116,25 +158,25 @@ static BOOL WINAPI FixturePublicSendRequest( HINTERNET request, LPCWSTR headers,
                                             void *body, DWORD body_size, DWORD total_size, DWORD_PTR context )
 {
     ++public_sends;
-    if ( metadata_mode ) return TRUE;
+    if ( metadata_mode || associated_mode ) return TRUE;
     SetLastError( ERROR_CANCELLED );
     return FALSE;
 }
-static BOOL WINAPI FixturePublicReceive( HINTERNET, void * ) { return metadata_mode; }
+static BOOL WINAPI FixturePublicReceive( HINTERNET, void * ) { return metadata_mode || associated_mode; }
 static BOOL WINAPI FixturePublicHeaders( HINTERNET, DWORD, LPCWSTR, void *buffer, DWORD *size, DWORD * )
 {
-    if ( !metadata_mode || !buffer || !size || *size < sizeof( DWORD ) ) return FALSE;
+    if ( !( metadata_mode || associated_mode ) || !buffer || !size || *size < sizeof( DWORD ) ) return FALSE;
     *static_cast<DWORD *>( buffer ) = metadata_status; *size = sizeof( DWORD ); return TRUE;
 }
 static BOOL WINAPI FixturePublicAvailable( HINTERNET, DWORD *available )
 {
     *available = metadata_oversize ? 4 * 1024 * 1024 + 1 : static_cast<DWORD>( public_body.size() - public_cursor );
-    return metadata_mode;
+    return metadata_mode || associated_mode;
 }
 static BOOL WINAPI FixturePublicRead( HINTERNET, void *buffer, DWORD size, DWORD *read )
 {
     *read = std::min<SIZE_T>( size, public_body.size() - public_cursor );
-    memcpy( buffer, public_body.data() + public_cursor, *read ); public_cursor += *read; return metadata_mode;
+    memcpy( buffer, public_body.data() + public_cursor, *read ); public_cursor += *read; return metadata_mode || associated_mode;
 }
 static LONG WINAPI FixtureCertificateTime( LPFILETIME when, PCERT_INFO info )
 {
@@ -178,6 +220,8 @@ HRESULT xpackage_query_content_store( const char *identifier, SIZE_T size, char 
 }
 #include "../../src/System/Store/Catalog.h"
 #include "../../src/System/Store/PackageLicense.h"
+#include "../../src/System/Store/CanAcquireLicense.h"
+#include "../../src/System/Store/AssociatedProducts.h"
 #include "../../src/System/Store/AddonLicense.h"
 #include "../../src/System/Store/StoreLicenseProjection.h"
 
@@ -315,6 +359,13 @@ static char *token( HCRYPTPROV provider, const char *cert_id, int variant, const
         rows.insert( rows.size() - 2,
             ",{\"productId\":\"B00000000002\",\"skuId\":\"0010\",\"endDate\":\"9999-12-31T23:59:59Z\"},"
             "{\"productId\":\"B00000000001\",\"skuId\":\"0020\",\"endDate\":\"9999-12-31T23:59:59Z\"}" );
+    if ( associated_owned_product[0] )
+    {
+        char row[160];
+        snprintf( row, sizeof( row ), ",{\"productId\":\"%s\",\"skuId\":\"0010\",\"endDate\":\"9999-12-31T23:59:59Z\"}",
+                  associated_owned_product );
+        rows.insert( rows.size() - 2, row );
+    }
     c = encode( ( BYTE * )rows.data(), rows.size(), FALSE );
     if ( !c ) goto done;
     snprintf( payload, sizeof( payload ),
@@ -770,6 +821,62 @@ static struct entitled_snapshot *test_metadata( void )
     snapshot->products =
         static_cast<std::remove_reference_t<decltype( snapshot->products )>>( calloc( 3, sizeof( XStoreProduct ) ) );
     return snapshot;
+}
+
+/* DisplayCatalog can still label a add-on as GameAddOn. The XStore kind has
+ * no GameAddOn value, so it must project to Durable exactly; unknown types keep
+ * failing closed and never create a row. */
+static void test_gameaddon_kind( void )
+{
+    const char *json = "{\"Products\":[{\"ProductId\":\"B00000000001\",\"ProductType\":\"GameAddOn\","
+        "\"Properties\":{\"InAppOfferToken\":\"Synthetic add-on\"},"
+        "\"LocalizedProperties\":[{\"ProductTitle\":\"Synthetic add-on\",\"Language\":\"en-US\"}],"
+        "\"DisplaySkuAvailabilities\":[{\"Sku\":{\"SkuId\":\"0010\",\"Properties\":{\"IsTrial\":false}}}]}]}";
+    const char *unknown = "{\"Products\":[{\"ProductId\":\"B00000000001\",\"ProductType\":\"FutureAddOn\","
+        "\"Properties\":{\"InAppOfferToken\":\"Synthetic add-on\"},"
+        "\"LocalizedProperties\":[{\"ProductTitle\":\"Synthetic add-on\",\"Language\":\"en-US\"}],"
+        "\"DisplaySkuAvailabilities\":[{\"Sku\":{\"SkuId\":\"0010\",\"Properties\":{\"IsTrial\":false,\"Packages\":[{}]}}}]}]}";
+    struct receipt_license license = { "B00000000001", "0010", 0 };
+    struct entitled_snapshot *snapshot = NULL;
+    xmlDocPtr doc;
+    xmlNodePtr root;
+    xmlChar *bytes;
+    int size;
+    license.expiry = time( NULL ) + 3600;
+    CHECK( "catalog-kind-gameaddon", catalog_kind( "GameAddOn" ) == 2 );
+    doc = xmlNewDoc( BAD_CAST "1.0" );
+    root = xmlNewNode( NULL, BAD_CAST "Response" );
+    xmlDocSetRootElement( doc, root );
+    CHECK( "gameaddon-metadata-row",
+           receipt_metadata_parse( &license, 31, ( BYTE * )json, strlen( json ), root ) == S_OK );
+    {
+        char until[32];
+        xmlNewTextChild( root, NULL, BAD_CAST "HResult", BAD_CAST "0" );
+        snprintf( until, sizeof( until ), "%llu", ( unsigned long long )time( NULL ) + 60 );
+        xmlNewTextChild( root, NULL, BAD_CAST "ValidUntil", BAD_CAST until );
+    }
+    xmlDocDumpMemory( doc, &bytes, &size );
+    CHECK( "gameaddon-entitled",
+           entitled_parse( ( char * )bytes, size, &snapshot ) == S_OK && snapshot && snapshot->count == 1 );
+    if ( snapshot )
+    {
+        CHECK( "gameaddon-product-row", snapshot->count == 1 && snapshot->products );
+        if ( snapshot->count == 1 && snapshot->products )
+        {
+            CHECK( "gameaddon-durable-kind", snapshot->products[0].productKind == XStoreProductKind::Durable );
+            CHECK( "gameaddon-no-digital-download", !snapshot->products[0].hasDigitalDownload );
+        }
+        entitled_snapshot_release( snapshot );
+        snapshot = NULL;
+    }
+    xmlFree( bytes );
+    xmlFreeDoc( doc );
+    doc = xmlNewDoc( BAD_CAST "1.0" );
+    root = xmlNewNode( NULL, BAD_CAST "Response" );
+    xmlDocSetRootElement( doc, root );
+    CHECK( "unknown-addon-type-fails-closed",
+           receipt_metadata_parse( &license, 31, ( BYTE * )unknown, strlen( unknown ), root ) == E_NOTIMPL );
+    xmlFreeDoc( doc );
 }
 
 static BOOLEAN CALLBACK enumerate( const XStoreProduct *product, void *context )
@@ -1228,6 +1335,470 @@ done:
     if ( immediate ) ( threads )->XTaskQueueCloseHandle( immediate );
     if ( queue ) ( threads )->XTaskQueueCloseHandle( queue );
     ( threads )->Release();
+}
+
+/* CanAcquire is a positive-only preview: a verified signed row for the exact
+ * product and a supported kind is Licensable; missing or unsupported evidence
+ * stays an error, never a fabricated NotLicensableToUser/status 2. */
+static void can_acquire_dispatch( IXThreadingImpl *threads, XTaskQueueHandle queue, XAsyncBlock *block )
+{
+    ULONGLONG start = GetTickCount64();
+    do
+    {
+        ( threads )->XTaskQueueDispatch( queue, XTaskQueuePort::Completion, 0 );
+        Sleep( 1 );
+    } while ( ( threads )->XAsyncGetStatus( block, FALSE ) == E_PENDING && GetTickCount64() - start < 3000 );
+}
+
+static void test_can_acquire_helpers( void )
+{
+    XStoreSku sku = {};
+    XStoreProduct product = {};
+    struct entitled_snapshot snapshot = {};
+    XStoreCanAcquireLicenseResult result = {};
+    UINT64 until = 0;
+    UINT32 kind;
+    sku.skuId = "0010";
+    sku.isInUserCollection = TRUE;
+    sku.collectionData.endDate = time( NULL ) + 3600;
+    product.storeId = "B00000000001";
+    product.productKind = XStoreProductKind::Durable;
+    product.isInUserCollection = TRUE;
+    product.skus = &sku;
+    product.skusCount = 1;
+    snapshot.count = 1;
+    snapshot.products = &product;
+    snapshot.proof_until = time( NULL ) + 60;
+    result.status = XStoreCanLicenseStatus::LicenseActionNotApplicableToProduct;
+    CHECK( "can-acquire-durable-package-free",
+           can_acquire_from_snapshot( &snapshot, product.storeId, &result, &until ) == S_OK &&
+               result.status == XStoreCanLicenseStatus::Licensable && !strcmp( result.licensableSku, "0010" ) &&
+               until == snapshot.proof_until );
+    product.hasDigitalDownload = TRUE;
+    result = {};
+    result.status = XStoreCanLicenseStatus::LicenseActionNotApplicableToProduct;
+    CHECK( "can-acquire-durable-package-bits",
+           can_acquire_from_snapshot( &snapshot, product.storeId, &result, &until ) == S_OK &&
+               result.status == XStoreCanLicenseStatus::Licensable );
+    product.productKind = XStoreProductKind::Game;
+    result = {};
+    result.status = XStoreCanLicenseStatus::LicenseActionNotApplicableToProduct;
+    CHECK( "can-acquire-game",
+           can_acquire_from_snapshot( &snapshot, product.storeId, &result, &until ) == S_OK &&
+               result.status == XStoreCanLicenseStatus::Licensable );
+    product.productKind = XStoreProductKind::Durable;
+    product.isInUserCollection = FALSE;
+    result = {};
+    result.status = XStoreCanLicenseStatus::LicenseActionNotApplicableToProduct;
+    CHECK( "can-acquire-product-not-collection-unknown",
+           can_acquire_from_snapshot( &snapshot, product.storeId, &result, &until ) == E_NOTIMPL &&
+               result.status == XStoreCanLicenseStatus::LicenseActionNotApplicableToProduct );
+    product.isInUserCollection = TRUE;
+    sku.isTrial = TRUE;
+    result = {};
+    result.status = XStoreCanLicenseStatus::LicenseActionNotApplicableToProduct;
+    CHECK( "can-acquire-trial-unknown",
+           can_acquire_from_snapshot( &snapshot, product.storeId, &result, &until ) == E_NOTIMPL &&
+               result.status == XStoreCanLicenseStatus::LicenseActionNotApplicableToProduct );
+    sku.isTrial = FALSE;
+    product.skus = NULL;
+    result = {};
+    CHECK( "can-acquire-null-skus-denied",
+           can_acquire_from_snapshot( &snapshot, product.storeId, &result, &until ) == E_UNEXPECTED );
+    product.skus = &sku;
+    for ( kind = 0; kind < 3; ++kind )
+    {
+        product.productKind = kind == 0   ? XStoreProductKind::Consumable
+                              : kind == 1 ? XStoreProductKind::Pass
+                                          : XStoreProductKind::UnmanagedConsumable;
+        result = {};
+        result.status = XStoreCanLicenseStatus::LicenseActionNotApplicableToProduct;
+        CHECK( "can-acquire-unsupported-kind-unknown",
+               can_acquire_from_snapshot( &snapshot, product.storeId, &result, &until ) == E_NOTIMPL &&
+                   result.status == XStoreCanLicenseStatus::LicenseActionNotApplicableToProduct );
+    }
+    product.productKind = XStoreProductKind::Durable;
+    result = {};
+    CHECK( "can-acquire-absent-unknown",
+           can_acquire_from_snapshot( &snapshot, "B00000000002", &result, &until ) == E_NOTIMPL );
+    result = {};
+    CHECK( "can-acquire-no-proof-denied",
+           ( snapshot.proof_until = 0, can_acquire_from_snapshot( &snapshot, product.storeId, &result, &until ) ==
+                                            E_ACCESSDENIED ) );
+    snapshot.proof_until = time( NULL ) + 60;
+    sku.isInUserCollection = FALSE;
+    result = {};
+    CHECK( "can-acquire-not-collection-unknown",
+           can_acquire_from_snapshot( &snapshot, product.storeId, &result, &until ) == E_NOTIMPL );
+    sku.isInUserCollection = TRUE;
+    sku.collectionData.endDate = time( NULL );
+    result = {};
+    CHECK( "can-acquire-expired-unknown",
+           can_acquire_from_snapshot( &snapshot, product.storeId, &result, &until ) == E_NOTIMPL );
+    sku.skuId = "BAD";
+    sku.collectionData.endDate = time( NULL ) + 3600;
+    result = {};
+    CHECK( "can-acquire-malformed-sku-denied",
+           can_acquire_from_snapshot( &snapshot, product.storeId, &result, &until ) == E_UNEXPECTED );
+    sku.skuId = "0010";
+    CHECK( "can-acquire-null-output", can_acquire_from_snapshot( &snapshot, product.storeId, NULL, &until ) ==
+                                          E_INVALIDARG );
+    {
+        XStoreContextHandle store = NULL;
+        struct can_acquire_async context = {};
+        XAsyncProviderData data = {};
+        XStoreCanAcquireLicenseResult out = {};
+        UINT64 xuid;
+        CHECK( "can-acquire-result-context", entitled_store_create( NULL, &store ) == S_OK );
+        context.store = store;
+        CHECK( "can-acquire-result-serial", entitled_store_identity( store, &xuid, &context.store_serial ) == S_OK );
+        context.until = time( NULL ) + 60;
+        context.result.status = XStoreCanLicenseStatus::Licensable;
+        strcpy( context.result.licensableSku, "0010" );
+        data.context = &context;
+        data.buffer = &out;
+        data.bufferSize = sizeof( out );
+        CHECK( "can-acquire-result-copy",
+               can_acquire_provider( XAsyncOp::GetResult, &data ) == S_OK &&
+                   out.status == XStoreCanLicenseStatus::Licensable && !strcmp( out.licensableSku, "0010" ) );
+        data.bufferSize = sizeof( out ) - 1;
+        CHECK( "can-acquire-result-small-buffer",
+               can_acquire_provider( XAsyncOp::GetResult, &data ) == E_INVALIDARG );
+        data.bufferSize = sizeof( out );
+        context.store_serial++;
+        CHECK( "can-acquire-result-wrong-serial",
+               can_acquire_provider( XAsyncOp::GetResult, &data ) == E_INVALIDARG );
+        context.store_serial--;
+        context.until = time( NULL ) - 1;
+        CHECK( "can-acquire-result-expired",
+               can_acquire_provider( XAsyncOp::GetResult, &data ) == E_ACCESSDENIED );
+        context.until = time( NULL ) + 60;
+        entitled_store_close( store );
+        CHECK( "can-acquire-result-closed",
+               can_acquire_provider( XAsyncOp::GetResult, &data ) == E_INVALIDARG );
+        {
+            XAsyncBlock fresh = {};
+            XStoreCanAcquireLicenseResult prefilled = {};
+            prefilled.status = XStoreCanLicenseStatus::Licensable;
+            strcpy( prefilled.licensableSku, "0010" );
+            CHECK( "can-acquire-result-default-block",
+                   can_acquire_result( &fresh, &prefilled, &can_acquire_store_identity ) != S_OK );
+            CHECK( "can-acquire-result-default-cleared",
+                   prefilled.status != XStoreCanLicenseStatus::Licensable && !prefilled.licensableSku[0] );
+        }
+    }
+}
+
+/* Synthetic read-only fetch for the async state machine. No signed receipt,
+ * no account and no network: it exercises positive, unknown and unsupported
+ * result mapping without the public metadata path. */
+static unsigned can_acquire_fetch_mode;
+
+static struct entitled_snapshot *can_acquire_fixture_snapshot( XStoreProductKind kind )
+{
+    struct entitled_snapshot *snapshot =
+        static_cast<std::remove_reference_t<decltype( snapshot )>>( calloc( 1, sizeof( *snapshot ) ) );
+    XStoreProduct *product;
+    XStoreSku *sku;
+    if ( !snapshot ) return NULL;
+    snapshot->refs = 1;
+    snapshot->proof_until = time( NULL ) + 60;
+    snapshot->count = 1;
+    snapshot->products =
+        static_cast<std::remove_reference_t<decltype( snapshot->products )>>( calloc( 1, sizeof( *snapshot->products ) ) );
+    if ( !snapshot->products )
+    {
+        free( snapshot );
+        return NULL;
+    }
+    product = &snapshot->products[0];
+    product->storeId = strdup( "B00000000001" );
+    product->title = strdup( "Synthetic" );
+    product->description = strdup( "" );
+    product->language = strdup( "en-US" );
+    product->inAppOfferToken = strdup( "synthetic-offer" );
+    product->price.currencyCode = strdup( "" );
+    product->productKind = kind;
+    product->isInUserCollection = TRUE;
+    product->hasDigitalDownload = kind == XStoreProductKind::Durable;
+    product->skusCount = 1;
+    product->skus = static_cast<std::remove_reference_t<decltype( product->skus )>>( calloc( 1, sizeof( *product->skus ) ) );
+    sku = product->skus;
+    if ( !product->storeId || !product->title || !product->description || !product->language ||
+         !product->inAppOfferToken || !product->price.currencyCode || !sku )
+    {
+        entitled_snapshot_release( snapshot );
+        return NULL;
+    }
+    sku->skuId = strdup( "0010" );
+    sku->title = strdup( "Synthetic" );
+    sku->description = strdup( "" );
+    sku->language = strdup( "en-US" );
+    sku->price.currencyCode = strdup( "" );
+    sku->isInUserCollection = TRUE;
+    sku->collectionData.endDate = time( NULL ) + 3600;
+    if ( !sku->skuId || !sku->title || !sku->description || !sku->language || !sku->price.currencyCode )
+    {
+        entitled_snapshot_release( snapshot );
+        return NULL;
+    }
+    return snapshot;
+}
+
+static HRESULT can_acquire_fixture_fetch( const char *, LONG *canceled, struct entitled_snapshot **out )
+{
+    XStoreProductKind kind = can_acquire_fetch_mode == 2   ? XStoreProductKind::Consumable
+                             : can_acquire_fetch_mode == 3 ? XStoreProductKind::Game
+                                                           : XStoreProductKind::Durable;
+    *out = NULL;
+    if ( InterlockedCompareExchange( canceled, 0, 0 ) ) return E_ABORT;
+    if ( can_acquire_fetch_mode == 1 )
+    {
+        *out = static_cast<std::remove_reference_t<decltype( *out )>>( calloc( 1, sizeof( **out ) ) );
+        if ( !*out ) return E_OUTOFMEMORY;
+        ( *out )->refs = 1;
+        ( *out )->proof_until = time( NULL ) + 60;
+        return S_OK;
+    }
+    *out = can_acquire_fixture_snapshot( kind );
+    return *out ? S_OK : E_OUTOFMEMORY;
+}
+
+static void test_can_acquire_async_synthetic( void )
+{
+    IXThreadingImpl *threads = NULL;
+    XTaskQueueHandle queue = NULL;
+    XStoreContextHandle store = NULL;
+    XAsyncBlock block = { 0 };
+    XStoreCanAcquireLicenseResult result = {};
+    struct can_acquire_async *context;
+    UINT64 xuid;
+    CHECK( "can-acquire-synthetic-threading",
+           FixtureQueryApiImpl( CLSID_XThreadingImpl, IID_IXThreadingImpl, ( void ** )&threads ) == S_OK && threads );
+    if ( !threads ) return;
+    CHECK( "can-acquire-synthetic-queue", ( threads )->XTaskQueueCreate( XTaskQueueDispatchMode::Manual,
+                                                                         XTaskQueueDispatchMode::Manual, &queue ) == S_OK );
+    CHECK( "can-acquire-synthetic-context", entitled_store_create( NULL, &store ) == S_OK );
+    for ( unsigned mode = 0; mode < 4; ++mode )
+    {
+        can_acquire_fetch_mode = mode;
+        context = static_cast<std::remove_reference_t<decltype( context )>>( calloc( 1, sizeof( *context ) ) );
+        if ( !context ) continue;
+        context->store = store;
+        CHECK( "can-acquire-synthetic-serial",
+               entitled_store_identity( store, &xuid, &context->store_serial ) == S_OK );
+        strcpy( context->store_id, "B00000000001" );
+        strcpy( context->request, "synthetic" );
+        context->fetch = can_acquire_fixture_fetch;
+        memset( &block, 0, sizeof( block ) );
+        block.queue = queue;
+        CHECK( "can-acquire-synthetic-begin",
+               can_acquire_start( context, &block, &can_acquire_store_identity ) == S_OK );
+        CHECK( "can-acquire-synthetic-work", ( threads )->XTaskQueueDispatch( queue, XTaskQueuePort::Work, 0 ) );
+        can_acquire_dispatch( threads, queue, &block );
+        if ( mode == 0 || mode == 3 )
+        {
+            CHECK( "can-acquire-synthetic-status", ( threads )->XAsyncGetStatus( &block, FALSE ) == S_OK );
+            memset( &result, 0, sizeof( result ) );
+            CHECK( "can-acquire-synthetic-result",
+                   can_acquire_result( &block, &result, &can_acquire_store_identity ) == S_OK &&
+                       result.status == XStoreCanLicenseStatus::Licensable &&
+                       !strcmp( result.licensableSku, "0010" ) );
+            memset( &result, 0, sizeof( result ) );
+            result.status = XStoreCanLicenseStatus::Licensable;
+            strcpy( result.licensableSku, "0010" );
+            CHECK( "can-acquire-synthetic-wrong-family",
+                   can_acquire_result( &block, &result, &can_acquire_package_identity ) != S_OK );
+            CHECK( "can-acquire-synthetic-wrong-family-cleared",
+                   result.status != XStoreCanLicenseStatus::Licensable && !result.licensableSku[0] );
+        }
+        else
+        {
+            CHECK( "can-acquire-synthetic-unknown", ( threads )->XAsyncGetStatus( &block, FALSE ) == E_NOTIMPL );
+            CHECK( "can-acquire-synthetic-no-result",
+                   FAILED( can_acquire_result( &block, &result, &can_acquire_store_identity ) ) );
+        }
+    }
+    entitled_store_close( store );
+    ( threads )->XTaskQueueCloseHandle( queue );
+    ( threads )->Release();
+}
+
+static void test_can_acquire_async( void )
+{
+    IXThreadingImpl *threads = NULL;
+    XTaskQueueHandle queue = NULL;
+    XStoreContextHandle store = NULL;
+    XAsyncBlock block = { 0 };
+    XStoreCanAcquireLicenseResult result = {};
+    ULONGLONG start;
+    CHECK( "can-acquire-threading",
+           FixtureQueryApiImpl( CLSID_XThreadingImpl, IID_IXThreadingImpl, ( void ** )&threads ) == S_OK && threads );
+    if ( !threads ) return;
+    CHECK( "can-acquire-queue", ( threads )->XTaskQueueCreate( XTaskQueueDispatchMode::Manual,
+                                                               XTaskQueueDispatchMode::Manual, &queue ) == S_OK );
+    CHECK( "can-acquire-context", entitled_store_create( NULL, &store ) == S_OK );
+    CHECK( "can-acquire-invalid-context",
+           can_acquire_begin( ( void * )1, "B00000000001", &block, &can_acquire_store_identity ) == E_INVALIDARG );
+    CHECK( "can-acquire-invalid-id",
+           can_acquire_begin( store, "bad", &block, &can_acquire_store_identity ) == E_INVALIDARG );
+    CHECK( "can-acquire-null-id",
+           can_acquire_begin( store, NULL, &block, &can_acquire_store_identity ) == E_INVALIDARG );
+    CHECK( "can-acquire-null-async",
+           can_acquire_begin( store, "B00000000001", NULL, &can_acquire_store_identity ) == E_INVALIDARG );
+    CHECK( "can-acquire-package-unknown",
+           can_acquire_package_begin( store, "foreign-package", &block ) == E_GAMEPACKAGE_NO_PACKAGE_IDENTIFIER );
+    CHECK( "can-acquire-package-null", can_acquire_package_begin( store, NULL, &block ) == E_INVALIDARG );
+
+    memset( &block, 0, sizeof( block ) );
+    block.queue = queue;
+    CHECK( "can-acquire-begin",
+           can_acquire_begin( store, "B00000000001", &block, &can_acquire_store_identity ) == S_OK );
+    CHECK( "can-acquire-work", ( threads )->XTaskQueueDispatch( queue, XTaskQueuePort::Work, 0 ) );
+    CHECK( "can-acquire-worker", WaitForSingleObject( bridge_started, 2000 ) == WAIT_OBJECT_0 );
+    CHECK( "can-acquire-pending", ( threads )->XAsyncGetStatus( &block, FALSE ) == E_PENDING );
+    SetEvent( bridge_gate );
+    can_acquire_dispatch( threads, queue, &block );
+    CHECK( "can-acquire-bridge-error", ( threads )->XAsyncGetStatus( &block, FALSE ) == E_FAIL );
+    CHECK( "can-acquire-bridge-no-result",
+           FAILED( can_acquire_result( &block, &result, &can_acquire_store_identity ) ) );
+    start = GetTickCount64();
+    while ( bridge_active && GetTickCount64() - start < 2000 )
+        Sleep( 1 );
+
+    ResetEvent( bridge_started );
+    ResetEvent( bridge_gate );
+    memset( &block, 0, sizeof( block ) );
+    block.queue = queue;
+    CHECK( "can-acquire-package-begin",
+           can_acquire_package_begin( store, "00000001111122223333444444444444", &block ) == S_OK );
+    CHECK( "can-acquire-package-work", ( threads )->XTaskQueueDispatch( queue, XTaskQueuePort::Work, 0 ) );
+    CHECK( "can-acquire-package-worker", WaitForSingleObject( bridge_started, 2000 ) == WAIT_OBJECT_0 );
+    SetEvent( bridge_gate );
+    can_acquire_dispatch( threads, queue, &block );
+    CHECK( "can-acquire-package-bridge-error", ( threads )->XAsyncGetStatus( &block, FALSE ) == E_FAIL );
+    CHECK( "can-acquire-package-no-result", FAILED( can_acquire_result( &block, &result, &can_acquire_package_identity ) ) );
+    start = GetTickCount64();
+    while ( bridge_active && GetTickCount64() - start < 2000 )
+        Sleep( 1 );
+
+    ResetEvent( bridge_started );
+    ResetEvent( bridge_gate );
+    memset( &block, 0, sizeof( block ) );
+    block.queue = queue;
+    CHECK( "can-acquire-cancel-begin",
+           can_acquire_begin( store, "B00000000001", &block, &can_acquire_store_identity ) == S_OK );
+    ( threads )->XAsyncCancel( &block );
+    CHECK( "can-acquire-cancel-work", ( threads )->XTaskQueueDispatch( queue, XTaskQueuePort::Work, 0 ) );
+    can_acquire_dispatch( threads, queue, &block );
+    CHECK( "can-acquire-cancel-terminal", ( threads )->XAsyncGetStatus( &block, FALSE ) == E_ABORT );
+    CHECK( "can-acquire-cancel-no-result",
+           FAILED( can_acquire_result( &block, &result, &can_acquire_store_identity ) ) );
+
+    entitled_store_close( store );
+    ( threads )->XTaskQueueCloseHandle( queue );
+    ( threads )->Release();
+}
+
+/* New CanAcquire worker with fetch=NULL: real production entitled_fetch,
+ * signature verification, signed inventory and metadata. Positive and a
+ * tampered-signature failure only; no account, network or trust change. */
+static void test_can_acquire_signed( void )
+{
+    IXThreadingImpl *threads = NULL;
+    XTaskQueueHandle queue = NULL;
+    XStoreContextHandle store = NULL;
+    XAsyncBlock block = { 0 };
+    XStoreCanAcquireLicenseResult result = {};
+    CHECK( "can-acquire-signed-threading",
+           FixtureQueryApiImpl( CLSID_XThreadingImpl, IID_IXThreadingImpl, ( void ** )&threads ) == S_OK && threads );
+    if ( !threads ) return;
+    CHECK( "can-acquire-signed-queue", ( threads )->XTaskQueueCreate( XTaskQueueDispatchMode::Manual,
+                                                                      XTaskQueueDispatchMode::Manual, &queue ) == S_OK );
+    CHECK( "can-acquire-signed-context", entitled_store_create( NULL, &store ) == S_OK );
+
+    certificate_tamper = false;
+    memset( &block, 0, sizeof( block ) );
+    block.queue = queue;
+    CHECK( "can-acquire-signed-begin",
+           can_acquire_begin( store, "B00000000001", &block, &can_acquire_store_identity ) == S_OK );
+    CHECK( "can-acquire-signed-work", ( threads )->XTaskQueueDispatch( queue, XTaskQueuePort::Work, 0 ) );
+    can_acquire_dispatch( threads, queue, &block );
+    CHECK( "can-acquire-signed-status", ( threads )->XAsyncGetStatus( &block, FALSE ) == S_OK );
+    CHECK( "can-acquire-signed-result",
+           can_acquire_result( &block, &result, &can_acquire_store_identity ) == S_OK );
+    CHECK( "can-acquire-signed-licensable", result.status == XStoreCanLicenseStatus::Licensable &&
+                                                 !strcmp( result.licensableSku, "0010" ) );
+
+    certificate_tamper = true;
+    memset( &block, 0, sizeof( block ) );
+    block.queue = queue;
+    CHECK( "can-acquire-bad-signature-begin",
+           can_acquire_begin( store, "B00000000001", &block, &can_acquire_store_identity ) == S_OK );
+    CHECK( "can-acquire-bad-signature-work", ( threads )->XTaskQueueDispatch( queue, XTaskQueuePort::Work, 0 ) );
+    can_acquire_dispatch( threads, queue, &block );
+    CHECK( "can-acquire-bad-signature-fails", FAILED( ( threads )->XAsyncGetStatus( &block, FALSE ) ) );
+    memset( &result, 0, sizeof( result ) );
+    result.status = XStoreCanLicenseStatus::Licensable;
+    strcpy( result.licensableSku, "0010" );
+    CHECK( "can-acquire-bad-signature-no-result",
+           FAILED( can_acquire_result( &block, &result, &can_acquire_store_identity ) ) &&
+               result.status != XStoreCanLicenseStatus::Licensable );
+    certificate_tamper = false;
+
+    entitled_store_close( store );
+    ( threads )->XTaskQueueCloseHandle( queue );
+    ( threads )->Release();
+}
+
+static void test_can_acquire_signed_fixture( void )
+{
+    HCRYPTPROV provider = 0;
+    HCRYPTKEY key = 0;
+    CERT_NAME_BLOB name = { 0 };
+    CRYPT_ALGORITHM_IDENTIFIER algorithm = { szOID_RSA_SHA256RSA, { 0 } };
+    SYSTEMTIME start = { 2020, 1, 0, 1 }, end = { 2099, 1, 0, 1 };
+    PCCERT_CONTEXT cert = NULL;
+    BYTE digest[20];
+    DWORD size = sizeof( digest );
+    char cert_id[41];
+    CHECK( "can-acquire-signed-provider",
+           CryptAcquireContextW( &provider, NULL, MS_ENH_RSA_AES_PROV_W, PROV_RSA_AES, CRYPT_VERIFYCONTEXT ) );
+    if ( !provider ) return;
+    CHECK( "can-acquire-signed-key", CryptGenKey( provider, AT_SIGNATURE, ( 2048 << 16 ) | CRYPT_EXPORTABLE, &key ) );
+    if ( !key ) goto done;
+    CHECK( "can-acquire-signed-name-size", CertStrToNameW( X509_ASN_ENCODING, L"CN=Nexus synthetic can-acquire",
+                                                           CERT_X500_NAME_STR, NULL, NULL, &name.cbData, NULL ) );
+    name.pbData = static_cast<std::remove_reference_t<decltype( name.pbData )>>( malloc( name.cbData ) );
+    if ( !name.pbData ) goto done;
+    CHECK( "can-acquire-signed-name",
+           CertStrToNameW( X509_ASN_ENCODING, L"CN=Nexus synthetic can-acquire", CERT_X500_NAME_STR, NULL,
+                           name.pbData, &name.cbData, NULL ) );
+    cert = CertCreateSelfSignCertificate( provider, &name, CERT_CREATE_SELFSIGN_NO_KEY_INFO, NULL, &algorithm, &start,
+                                          &end, NULL );
+    CHECK( "can-acquire-signed-cert", cert != NULL );
+    if ( !cert ) goto done;
+    CHECK( "can-acquire-signed-thumbprint",
+           CryptHashCertificate( 0, CALG_SHA1, 0, cert->pbCertEncoded, cert->cbCertEncoded, digest, &size ) );
+    for ( unsigned i = 0; i < 20; ++i )
+        sprintf( cert_id + i * 2, "%02X", digest[i] );
+    certificate_provider = provider;
+    strcpy( certificate_id, cert_id );
+    certificate_document = certificate_json( cert );
+    if ( certificate_document.empty() ) goto done;
+    metadata_body = R"({"Products":[{"ProductId":"B00000000001","ProductType":"Durable","LocalizedProperties":[{"ProductTitle":"Synthetic","Language":"en-US"}],"DisplaySkuAvailabilities":[{"Sku":{"SkuId":"0010","Properties":{"IsTrial":false}}}]}]})";
+    metadata_mode = certificate_mode = true;
+    test_can_acquire_signed();
+    metadata_mode = certificate_mode = false;
+    certificate_tamper = false;
+    certificate_provider = 0;
+    certificate_document.clear();
+    certificate_nonce.clear();
+done:
+    if ( cert ) CertFreeCertificateContext( cert );
+    free( name.pbData );
+    if ( key ) CryptDestroyKey( key );
+    CryptReleaseContext( provider, 0 );
 }
 
 /* Result handoff must still belong to the Store context that initiated it.
@@ -2301,8 +2872,414 @@ static void test_public_catalog()
     entitled_store_close( store );
 }
 
+
+static std::string associated_lookup( const std::vector<std::string> &ids, bool has_more, int total,
+                                      const char *conflict_root = nullptr, const char *extra_root = nullptr )
+{
+    std::string big = "[", products = "[";
+    for ( size_t i = 0; i < ids.size(); ++i )
+    {
+        if ( i ) { big += ","; products += ","; }
+        big += "\"" + ids[i] + "\"";
+        std::string root = conflict_root && i == 0 ? conflict_root : "B00000000001";
+        std::string relations = "{\"RelatedProductId\":\"" + root + "\",\"RelationshipType\":\"SellableBy\"},"
+                                "{\"RelatedProductId\":\"" + root + "\",\"RelationshipType\":\"addOnParent\"}";
+        if ( extra_root && i == 0 )
+            relations += ",{\"RelatedProductId\":\"" + std::string( extra_root ) +
+                         "\",\"RelationshipType\":\"SellableBy\"}";
+        products += "{\"ProductId\":\"" + ids[i] + "\",\"MarketProperties\":[{\"RelatedProducts\":[" +
+                    relations + "]}]}";
+    }
+    char total_text[32];
+    snprintf( total_text, sizeof( total_text ), "%d", total );
+    return "{\"BigIds\":" + big + "],\"HasMorePages\":" + ( has_more ? "true" : "false" ) +
+           ",\"Products\":" + products + "],\"TotalResultCount\":" + total_text + "}";
+}
+
+static std::string associated_catalog_product( const char *id, const char *platform, const char *action )
+{
+    return std::string( "{\"ProductId\":\"" ) + id + "\",\"ProductType\":\"Durable\","
+           "\"Properties\":{\"InAppOfferToken\":\"offer-" + std::string( id ) + "\"},"
+           "\"LocalizedProperties\":[{\"ProductTitle\":\"Title " + std::string( id ) + "\","
+           "\"ProductDescription\":\"d\",\"Language\":\"en-US\"}],"
+           "\"DisplaySkuAvailabilities\":[{\"Sku\":{\"SkuId\":\"0010\",\"Properties\":{\"IsTrial\":false,\"Packages\":[{}]}},"
+           "\"Availabilities\":[{\"AvailabilityId\":\"A00000000001\",\"Actions\":[\"" + std::string( action ) + "\",\"Details\"],"
+           "\"Conditions\":{\"StartDate\":\"1753-01-01T00:00:00.0000000Z\",\"EndDate\":\"9998-12-30T00:00:00.0000000Z\","
+           "\"ClientConditions\":{\"AllowedPlatforms\":[{\"PlatformName\":\"" + std::string( platform ) + "\"}]}},"
+           "\"OrderManagementData\":{\"Price\":{\"CurrencyCode\":\"USD\",\"ListPrice\":1.99,\"MSRP\":1.99}}}]}]}";
+}
+
+static std::string associated_metadata( const std::vector<std::string> &products )
+{
+    std::string body = "{\"Products\":[";
+    for ( size_t i = 0; i < products.size(); ++i ) { if ( i ) body += ","; body += products[i]; }
+    return body + "]}";
+}
+
+static bool associated_has_path( const std::wstring &needle )
+{
+    for ( const auto &path : associated_public_paths )
+        if ( path.find( needle ) != std::wstring::npos ) return true;
+    return false;
+}
+
+static void associated_reset( void )
+{
+    associated_mode = false;
+    associated_lookup_pages.clear();
+    associated_metadata_body.clear();
+    associated_lookup_index = 0;
+    associated_public_paths.clear();
+    associated_metadata_pending = false;
+    memset( associated_owned_product, 0, sizeof( associated_owned_product ) );
+    certificate_tamper = false;
+    metadata_status = 200;
+}
+
+static HRESULT associated_direct( const std::vector<std::string> &pages, const std::string &metadata,
+                                  struct entitled_snapshot **snapshot, const char *owned = nullptr,
+                                  bool tamper = false, LONG *canceled = nullptr )
+{
+    associated_reset();
+    associated_mode = true;
+    certificate_mode = true;
+    associated_metadata_pending = true;
+    associated_lookup_pages = pages;
+    associated_metadata_body = metadata;
+    if ( owned ) strcpy( associated_owned_product, owned );
+    certificate_tamper = tamper;
+    char request[512];
+    snprintf( request, sizeof( request ),
+              "<Request><ParentProductId>B00000000001</ParentProductId><ProductKinds>31</ProductKinds>"
+              "<Market>US</Market><Language>en-US</Language></Request>" );
+    LONG local = 0;
+    HRESULT hr = associated_fetch( request, canceled ? canceled : &local, snapshot );
+    associated_mode = false;
+    return hr;
+}
+
+static void test_associated_cases( void )
+{
+    struct entitled_snapshot *snapshot = NULL;
+
+    {
+        std::vector<std::string> pages = { associated_lookup( {}, true, 1 ),
+                                           associated_lookup( { "B00000000002" }, false, 1 ) };
+        std::string metadata =
+            associated_metadata( { associated_catalog_product( "B00000000002", "Windows.Desktop", "Purchase" ) } );
+        CHECK( "associated-empty-nonterminal", associated_direct( pages, metadata, &snapshot ) == S_OK && snapshot &&
+               snapshot->count == 1 && !strcmp( snapshot->products[0].storeId, "B00000000002" ) );
+        CHECK( "associated-empty-nonterminal-paths", associated_has_path( L"$top=25&$skip=0" ) &&
+               associated_has_path( L"$top=25&$skip=25" ) );
+        if ( snapshot ) entitled_snapshot_release( snapshot );
+        snapshot = NULL;
+    }
+    {
+        std::vector<std::string> pages = { associated_lookup( { "B00000000002", "B00000000003" }, true, 4 ),
+                                           associated_lookup( { "B00000000003", "B00000000004", "B00000000005" }, false, 4 ) };
+        std::string metadata = associated_metadata( {
+            associated_catalog_product( "B00000000002", "Windows.Desktop", "Purchase" ),
+            associated_catalog_product( "B00000000003", "Windows.Desktop", "Purchase" ),
+            associated_catalog_product( "B00000000004", "Windows.Xbox", "Purchase" ),
+            associated_catalog_product( "B00000000005", "Windows.Desktop", "License" ) } );
+        CHECK( "associated-dedupe-pc-purchase", associated_direct( pages, metadata, &snapshot ) == S_OK && snapshot &&
+               snapshot->count == 2 && !strcmp( snapshot->products[0].storeId, "B00000000002" ) &&
+               !strcmp( snapshot->products[1].storeId, "B00000000003" ) );
+        CHECK( "associated-metadata-bigids", associated_has_path(
+               L"/v7.0/products?bigIds=B00000000002,B00000000003,B00000000004,B00000000005&market=US&languages=en-US" ) );
+        if ( snapshot ) entitled_snapshot_release( snapshot );
+        snapshot = NULL;
+    }
+    {
+        std::vector<std::string> pages = { associated_lookup( { "B00000000002", "B00000000003" }, false, 2 ) };
+        std::string metadata = associated_metadata( {
+            associated_catalog_product( "B00000000002", "Windows.Desktop", "Purchase" ),
+            associated_catalog_product( "B00000000003", "Windows.Desktop", "Purchase" ) } );
+        CHECK( "associated-owned-unowned", associated_direct( pages, metadata, &snapshot, "B00000000002" ) == S_OK &&
+               snapshot && snapshot->count == 2 && snapshot->valid_until > (UINT64)time( NULL ) &&
+               snapshot->products[0].isInUserCollection && snapshot->products[0].skus[0].isInUserCollection &&
+               !snapshot->products[1].isInUserCollection );
+        if ( snapshot ) entitled_snapshot_release( snapshot );
+        snapshot = NULL;
+    }
+    {
+        std::vector<std::string> pages = { associated_lookup( { "B00000000002" }, false, 1 ) };
+        std::string metadata =
+            associated_metadata( { associated_catalog_product( "B00000000002", "Windows.Desktop", "Purchase" ) } );
+        CHECK( "associated-tampered-token", FAILED( associated_direct( pages, metadata, &snapshot, "B00000000002", true ) ) &&
+               !snapshot );
+    }
+    {
+        std::vector<std::string> missing = { "{\"BigIds\":[],\"Products\":[]}" };
+        CHECK( "associated-missing-hasmore", FAILED( associated_direct( missing, "", &snapshot ) ) && !snapshot );
+        std::vector<std::string> nonbool = { "{\"BigIds\":[],\"Products\":[],\"HasMorePages\":\"yes\"}" };
+        CHECK( "associated-nonbool-hasmore", FAILED( associated_direct( nonbool, "", &snapshot ) ) && !snapshot );
+        std::vector<std::string> conflict = { associated_lookup( { "B00000000002" }, false, 1, "B00000000099" ) };
+        CHECK( "associated-inverse-contradiction", FAILED( associated_direct( conflict, "", &snapshot ) ) && !snapshot );
+        std::vector<std::string> multi = { associated_lookup( { "B00000000002" }, false, 1, nullptr, "B00000000099" ) };
+        std::string multi_meta =
+            associated_metadata( { associated_catalog_product( "B00000000002", "Windows.Desktop", "Purchase" ) } );
+        CHECK( "associated-multiparent-positive", associated_direct( multi, multi_meta, &snapshot ) == S_OK && snapshot &&
+               snapshot->count == 1 );
+        if ( snapshot ) entitled_snapshot_release( snapshot );
+        snapshot = NULL;
+        std::string nonascii;
+        for ( int i = 0; i < 12; ++i ) nonascii += "\xC5\x81"; /* U+0141, truncates to 'A' if cast blindly */
+        std::vector<std::string> bad_id = { "{\"BigIds\":[\"" + nonascii +
+            "\"],\"Products\":[{}],\"HasMorePages\":false,\"TotalResultCount\":1}" };
+        CHECK( "associated-nonascii-bigid", FAILED( associated_direct( bad_id, "", &snapshot ) ) && !snapshot );
+        std::vector<std::string> repeated = { associated_lookup( { "B00000000002" }, true, 2 ),
+                                              associated_lookup( { "B00000000002" }, true, 2 ),
+                                              associated_lookup( { "B00000000002" }, false, 2 ) };
+        std::string repeat_meta =
+            associated_metadata( { associated_catalog_product( "B00000000002", "Windows.Desktop", "Purchase" ) } );
+        CHECK( "associated-repeat-terminal", associated_direct( repeated, repeat_meta, &snapshot ) == S_OK && snapshot &&
+               snapshot->count == 1 );
+        if ( snapshot ) entitled_snapshot_release( snapshot );
+        snapshot = NULL;
+        std::vector<std::string> infinite( 1024, associated_lookup( {}, true, 2000 ) );
+        CHECK( "associated-infinite-hasmore-cap", FAILED( associated_direct( infinite, "", &snapshot ) ) && !snapshot );
+    }
+    {
+        std::vector<std::string> pages;
+        for ( unsigned page = 0; page < 5; ++page )
+        {
+            std::vector<std::string> ids;
+            for ( unsigned i = 0; i < 25; ++i )
+            {
+                char id[13];
+                snprintf( id, sizeof( id ), "B%011u", 100 + page * 25 + i );
+                ids.push_back( id );
+            }
+            pages.push_back( associated_lookup( ids, page != 4, 125 ) );
+        }
+        CHECK( "associated-cap", associated_direct( pages, "", &snapshot ) == HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER ) &&
+               !snapshot );
+    }
+    {
+        std::vector<std::string> pages = { associated_lookup( {}, false, 0 ) };
+        CHECK( "associated-empty-success", associated_direct( pages, "", &snapshot ) == S_OK && snapshot && !snapshot->count );
+        CHECK( "associated-empty-no-fake-proof", snapshot && !snapshot->proof_until && snapshot->valid_until > (UINT64)time( NULL ) );
+        CHECK( "associated-empty-no-metadata", !associated_has_path( L"/v7.0/products?" ) );
+        if ( snapshot ) entitled_snapshot_release( snapshot );
+        snapshot = NULL;
+    }
+    {
+        LONG canceled = 1;
+        std::vector<std::string> pages = { associated_lookup( { "B00000000002" }, false, 1 ) };
+        CHECK( "associated-precancel", associated_direct( pages, "", &snapshot, nullptr, false, &canceled ) == E_ABORT &&
+               !snapshot && associated_public_paths.empty() );
+    }
+}
+
+static void test_associated_paging( void )
+{
+    struct entitled_snapshot *snapshot = NULL;
+    std::vector<std::string> pages = { associated_lookup( { "B00000000002", "B00000000003" }, false, 2 ) };
+    std::string metadata = associated_metadata( {
+        associated_catalog_product( "B00000000002", "Windows.Desktop", "Purchase" ),
+        associated_catalog_product( "B00000000003", "Windows.Desktop", "Purchase" ) } );
+    CHECK( "associated-paging-fixture", associated_direct( pages, metadata, &snapshot ) == S_OK && snapshot &&
+           snapshot->count == 2 );
+    if ( !snapshot ) return;
+    struct entitled_page *page = static_cast<std::remove_reference_t<decltype( page )>>( calloc( 1, sizeof( *page ) ) );
+    page->refs = 1;
+    page->snapshot = snapshot;
+    page->size = 1;
+    page->next = entitled_pages;
+    entitled_pages = page;
+    enumerated = 0;
+    CHECK( "associated-page1", entitled_enumerate( page, NULL, enumerate ) == S_OK && enumerated == 1 );
+    CHECK( "associated-page1-more", entitled_has_more( page ) );
+    IXThreadingImpl *threads = NULL;
+    XTaskQueueHandle queue = NULL;
+    XAsyncBlock block = {};
+    CHECK( "associated-paging-threading",
+           FixtureQueryApiImpl( CLSID_XThreadingImpl, IID_IXThreadingImpl, (void **)&threads ) == S_OK );
+    CHECK( "associated-paging-queue", ( threads )->XTaskQueueCreate( XTaskQueueDispatchMode::Manual,
+                                                                     XTaskQueueDispatchMode::Manual, &queue ) == S_OK );
+    block.queue = queue;
+    block.callback = complete;
+    callbacks = 0;
+    CHECK( "associated-next-begin", entitled_next( page, &block ) == S_OK );
+    entitled_page_close( page );
+    CHECK( "associated-next-work", ( threads )->XTaskQueueDispatch( queue, XTaskQueuePort::Work, 0 ) );
+    dispatch_until_complete( threads, queue, &block );
+    XStoreProductQueryHandle next = NULL;
+    CHECK( "associated-next-result", entitled_result( &block, &next, TRUE ) == S_OK && next );
+    if ( next )
+    {
+        enumerated = 0;
+        CHECK( "associated-page2", entitled_enumerate( next, NULL, enumerate ) == S_OK && enumerated == 1 );
+        CHECK( "associated-page2-end", !entitled_has_more( next ) );
+        entitled_page_close( next );
+    }
+    ( threads )->XTaskQueueCloseHandle( queue );
+    ( threads )->Release();
+}
+
+static void test_associated_async( void )
+{
+    IXThreadingImpl *threads = NULL;
+    XTaskQueueHandle queue = NULL;
+    XStoreContextHandle store = NULL;
+    CHECK( "associated-async-threading",
+           FixtureQueryApiImpl( CLSID_XThreadingImpl, IID_IXThreadingImpl, (void **)&threads ) == S_OK );
+    CHECK( "associated-async-queue", ( threads )->XTaskQueueCreate( XTaskQueueDispatchMode::Manual,
+                                                                    XTaskQueueDispatchMode::Manual, &queue ) == S_OK );
+    CHECK( "associated-async-store", entitled_store_create( NULL, &store ) == S_OK );
+    associated_reset();
+    XAsyncBlock block = {};
+    CHECK( "associated-wrong-family", associated_begin( store, NULL, 32, 10, &block ) == E_INVALIDARG );
+    CHECK( "associated-zero-page", associated_begin( store, NULL, 31, 0, &block ) == E_INVALIDARG );
+    CHECK( "associated-forstore-null", associated_store_begin( store, NULL, 31, 10, &block ) == E_INVALIDARG );
+    CHECK( "associated-foreign-root", associated_store_begin( store, "B00000000009", 31, 10, &block ) == E_NOTIMPL );
+    CHECK( "associated-foreign-no-request", associated_public_paths.empty() );
+    entitled_store_close( store );
+    for ( unsigned mode = 0; mode < 2; ++mode )
+    {
+        associated_reset();
+        associated_mode = true;
+        certificate_mode = true;
+        associated_metadata_pending = true;
+        CHECK( "associated-async-store", entitled_store_create( NULL, &store ) == S_OK );
+        associated_lookup_pages = { associated_lookup( { "B00000000002", "B00000000003" }, false, 2 ) };
+        associated_metadata_body = associated_metadata( {
+            associated_catalog_product( "B00000000002", "Windows.Desktop", "Purchase" ),
+            associated_catalog_product( "B00000000003", "Windows.Desktop", "Purchase" ) } );
+        memset( &block, 0, sizeof( block ) );
+        block.queue = queue;
+        block.callback = complete;
+        callbacks = 0;
+        CHECK( "associated-async-begin", associated_begin( store, NULL, 31, 1, &block ) == S_OK );
+        if ( mode ) entitled_store_close( store );
+        CHECK( "associated-async-work", ( threads )->XTaskQueueDispatch( queue, XTaskQueuePort::Work, 0 ) );
+        dispatch_until_complete( threads, queue, &block );
+        XStoreProductQueryHandle handle = NULL;
+        HRESULT hr = catalog_result( &block, &handle, &associated_identity );
+        if ( !mode )
+        {
+            CHECK( "associated-async-result", hr == S_OK && handle );
+            if ( handle )
+            {
+                enumerated = 0;
+                CHECK( "associated-async-enumerate",
+                       entitled_enumerate( handle, NULL, enumerate ) == S_OK && enumerated == 1 );
+                CHECK( "associated-async-has-more", entitled_has_more( handle ) );
+                entitled_page_close( handle );
+            }
+            entitled_store_close( store );
+        }
+        else CHECK( "associated-async-closed-context", FAILED( hr ) && !handle );
+        associated_mode = false;
+    }
+    if ( queue ) ( threads )->XTaskQueueCloseHandle( queue );
+    ( threads )->Release();
+}
+
+static void test_associated_only( void )
+{
+    HCRYPTPROV provider = 0;
+    HCRYPTKEY key = 0;
+    CERT_NAME_BLOB name = { 0 };
+    CRYPT_ALGORITHM_IDENTIFIER algorithm = { szOID_RSA_SHA256RSA, { 0 } };
+    SYSTEMTIME start = { 2020, 1, 0, 1 }, end = { 2099, 1, 0, 1 };
+    PCCERT_CONTEXT cert = NULL;
+    BYTE digest[20];
+    DWORD size = sizeof( digest );
+    char cert_id[41];
+    if ( !CryptAcquireContextW( &provider, NULL, MS_ENH_RSA_AES_PROV_W, PROV_RSA_AES, CRYPT_VERIFYCONTEXT ) ) return;
+    if ( !CryptGenKey( provider, AT_SIGNATURE, ( 2048 << 16 ) | CRYPT_EXPORTABLE, &key ) ) goto done;
+    if ( !CertStrToNameW( X509_ASN_ENCODING, L"CN=Nexus synthetic associated test", CERT_X500_NAME_STR, NULL, NULL,
+                          &name.cbData, NULL ) )
+        goto done;
+    name.pbData = static_cast<std::remove_reference_t<decltype( name.pbData )>>( malloc( name.cbData ) );
+    if ( !name.pbData ) goto done;
+    if ( !CertStrToNameW( X509_ASN_ENCODING, L"CN=Nexus synthetic associated test", CERT_X500_NAME_STR, NULL,
+                          name.pbData, &name.cbData, NULL ) )
+        goto done;
+    cert = CertCreateSelfSignCertificate( provider, &name, CERT_CREATE_SELFSIGN_NO_KEY_INFO, NULL, &algorithm, &start,
+                                          &end, NULL );
+    if ( !cert ) goto done;
+    if ( !CryptHashCertificate( 0, CALG_SHA1, 0, cert->pbCertEncoded, cert->cbCertEncoded, digest, &size ) ) goto done;
+    for ( unsigned i = 0; i < 20; ++i ) sprintf( cert_id + i * 2, "%02X", digest[i] );
+    certificate_provider = provider;
+    strcpy( certificate_id, cert_id );
+    certificate_document = certificate_json( cert );
+    test_associated_cases();
+    test_associated_paging();
+    test_associated_async();
+done:
+    associated_reset();
+    certificate_mode = false;
+    if ( cert ) CertFreeCertificateContext( cert );
+    free( name.pbData );
+    if ( key ) CryptDestroyKey( key );
+    if ( provider ) CryptReleaseContext( provider, 0 );
+}
+
+
 int main( int argc, char **argv )
 {
+    if ( argc == 2 && !strcmp( argv[1], "--dlc-inputs-only" ) )
+    {
+        HMODULE dll = LoadLibraryA( "xgameruntime.dll" );
+        CHECK( "dlc-inputs-dll", dll != NULL );
+        HRESULT init = RoInitialize( RO_INIT_MULTITHREADED );
+        CHECK( "dlc-inputs-winrt", SUCCEEDED( init ) );
+        test_gameaddon_kind();
+        if ( SUCCEEDED( init ) ) RoUninitialize();
+        printf( "CHECKS %u FAILURES %u\n", checks, failures );
+        return failures ? 1 : 0;
+    }
+    if ( argc == 2 && !strcmp( argv[1], "--can-acquire-signed-only" ) )
+    {
+        HMODULE dll = LoadLibraryA( "xgameruntime.dll" );
+        if ( !dll ||
+             !( runtime_query =
+                    reinterpret_cast<decltype( runtime_query )>( GetProcAddress( dll, "QueryApiImpl" ) ) ) )
+            return 2;
+        const auto init = RoInitialize( RO_INIT_MULTITHREADED );
+        CHECK( "can-acquire-signed-winrt", SUCCEEDED( init ) );
+        test_can_acquire_signed_fixture();
+        if ( SUCCEEDED( init ) ) RoUninitialize();
+        printf( "CHECKS %u FAILURES %u\n", checks, failures );
+        return failures ? 1 : 0;
+    }
+    if ( argc == 2 && !strcmp( argv[1], "--can-acquire-only" ) )
+    {
+        HMODULE dll = LoadLibraryA( "xgameruntime.dll" );
+        if ( !dll ||
+             !( runtime_query =
+                    reinterpret_cast<decltype( runtime_query )>( GetProcAddress( dll, "QueryApiImpl" ) ) ) )
+            return 2;
+        const auto init = RoInitialize( RO_INIT_MULTITHREADED );
+        CHECK( "can-acquire-winrt", SUCCEEDED( init ) );
+        bridge_started = CreateEventA( NULL, TRUE, FALSE, NULL );
+        bridge_gate = CreateEventA( NULL, TRUE, FALSE, NULL );
+        test_can_acquire_helpers();
+        test_can_acquire_async_synthetic();
+        test_can_acquire_async();
+        CloseHandle( bridge_started );
+        CloseHandle( bridge_gate );
+        if ( SUCCEEDED( init ) ) RoUninitialize();
+        printf( "CHECKS %u FAILURES %u\n", checks, failures );
+        return failures ? 1 : 0;
+    }
+    if ( argc == 2 && !strcmp( argv[1], "--associated-only" ) )
+    {
+        HMODULE dll = LoadLibraryA( "xgameruntime.dll" );
+        if ( !dll ||
+             !( runtime_query =
+                    reinterpret_cast<decltype( runtime_query )>( GetProcAddress( dll, "QueryApiImpl" ) ) ) )
+            return 2;
+        const auto init = RoInitialize( RO_INIT_MULTITHREADED );
+        CHECK( "associated-winrt", SUCCEEDED( init ) );
+        test_associated_only();
+        if ( SUCCEEDED( init ) ) RoUninitialize();
+        printf( "CHECKS %u FAILURES %u\n", checks, failures );
+        return failures ? 1 : 0;
+    }
     test_store_time_abi();
     if ( argc == 2 && !strcmp( argv[1], "--store-time-abi" ) )
     {
@@ -2452,6 +3429,7 @@ int main( int argc, char **argv )
     test_related_hints();
     test_receipts();
     test_async( test_metadata() );
+    test_gameaddon_kind();
     test_package_licenses();
     test_package_result_context();
     test_durable_acquisition();

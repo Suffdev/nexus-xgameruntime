@@ -23,6 +23,7 @@
 #include "User/Presence.h"
 #include "User/OfflineIdentity.h"
 #include "../Runtime/Configuration.h"
+#include "../Runtime/TitleIdentityDiagnostics.h"
 #include <afunix.h>
 #include <libxml/parser.h>
 #include <libxml/tree.h>
@@ -461,6 +462,59 @@ static HRESULT xsts_authorize_privilege( XUserHandle user, const char *relyingPa
 static char *hstring_to_utf8( HSTRING string );
 static WCHAR *utf8_to_wide( const char *string );
 
+/* Server title claims carry a decimal title id, either as a JSON number or as
+ * a canonical decimal string. Reject hex, signs, leading zeroes, fractions and
+ * values outside the runtime's 32-bit title id. */
+static bool canonical_title_claim_id( const WCHAR *text, UINT32 length, UINT32 *titleId )
+{
+    UINT64 value = 0;
+    if ( !text || !length || length > 10 || !titleId ) return false;
+    for ( UINT32 i = 0; i < length; ++i )
+    {
+        if ( text[i] < L'0' || text[i] > L'9' ) return false;
+        if ( i == 0 && text[i] == L'0' ) return false;
+        value = value * 10 + ( text[i] - L'0' );
+        if ( value > MAXDWORD ) return false;
+    }
+    if ( !value ) return false;
+    *titleId = static_cast<UINT32>( value );
+    return true;
+}
+
+/* The title token is opaque; only its documented DisplayClaims.xti.tid field
+ * establishes which title the server issued it for. Missing or malformed
+ * claims never establish a binding. */
+static HRESULT title_token_claim_title( IJsonObject *titleToken, UINT32 *titleId )
+{
+    IJsonObject *claims = nullptr, *xti = nullptr;
+    HSTRING text = nullptr;
+    DOUBLE number = 0;
+    HRESULT hr;
+    if ( !titleToken || !titleId ) return E_INVALIDARG;
+    *titleId = 0;
+    if ( FAILED( hr = get_json_object( titleToken, L"DisplayClaims", &claims ) ) ) goto done;
+    if ( FAILED( hr = get_json_object( claims, L"xti", &xti ) ) ) goto done;
+    hr = get_json_string( xti, L"tid", &text );
+    if ( SUCCEEDED( hr ) )
+    {
+        UINT32 length = 0;
+        const WCHAR *raw = text ? WindowsGetStringRawBuffer( text, &length ) : nullptr;
+        hr = canonical_title_claim_id( raw, length, titleId ) ? S_OK : E_INVALIDARG;
+    }
+    else if ( SUCCEEDED( hr = get_json_number( xti, L"tid", &number ) ) )
+    {
+        if ( std::isfinite( number ) && number > 0 && number <= MAXDWORD && std::floor( number ) == number )
+            *titleId = static_cast<UINT32>( number );
+        else
+            hr = E_INVALIDARG;
+    }
+done:
+    if ( xti ) xti->Release();
+    if ( claims ) claims->Release();
+    if ( text ) WindowsDeleteString( text );
+    return hr;
+}
+
 static HRESULT sisu_auth( XUserHandle user, const char *userTicket, const char *deviceToken, WCHAR **auth )
 {
     static const char requestTemplate[] = "{\"Sandbox\":\"RETAIL\",\"UseModernGamertag\":true,\"DeviceToken\":\"";
@@ -475,7 +529,17 @@ static HRESULT sisu_auth( XUserHandle user, const char *userTicket, const char *
     const WCHAR *stringBuffer;
     IJsonArray *xui = NULL;
     BYTE *buffer = NULL;
+    const nexus::GameConfiguration *configuration;
+    UINT32 claimedTitle = 0;
+    HRESULT claimResult = E_FAIL;
+    const char *binding = "missing";
     HRESULT hr;
+
+    /* A new SISU exchange replaces the title proof. Never retain a token from
+     * an earlier attempt when this response omits, malforms or changes it. */
+    free( user->titleToken );
+    user->titleToken = NULL;
+    user->titleTokenTitleId = 0;
 
     if ( !( body = static_cast<std::remove_reference_t<decltype( body )>>( calloc( 1, size ) ) ) ) return E_OUTOFMEMORY;
     strcpy( body, requestTemplate );
@@ -504,12 +568,40 @@ static HRESULT sisu_auth( XUserHandle user, const char *userTicket, const char *
     }
     if ( !WideCharToMultiByte( CP_UTF8, WC_ERR_INVALID_CHARS, stringBuffer, -1, user->userToken, size, NULL, NULL ) )
         goto error;
-    if ( SUCCEEDED( get_json_object( object, L"TitleToken", &titleObject ) ) &&
-         SUCCEEDED( get_json_string( titleObject, L"Token", &titleToken ) ) )
+    configuration = nexus::GetGameConfiguration();
+    binding = configuration ? ( configuration->titleId ? "missing" : "no-title" ) : "no-config";
+    if ( configuration && configuration->titleId )
     {
-        free( user->titleToken );
-        user->titleToken = hstring_to_utf8( titleToken );
+        if ( SUCCEEDED( get_json_object( object, L"TitleToken", &titleObject ) ) )
+        {
+            if ( SUCCEEDED( get_json_string( titleObject, L"Token", &titleToken ) ) )
+            {
+                claimResult = title_token_claim_title( titleObject, &claimedTitle );
+                if ( FAILED( claimResult ) )
+                    binding = claimResult == WEB_E_JSON_VALUE_NOT_FOUND ? "missing" : "malformed";
+                else if ( claimedTitle != configuration->titleId )
+                    binding = "mismatch";
+                else
+                {
+                    auto bound = hstring_to_utf8( titleToken );
+                    if ( bound && *bound )
+                    {
+                        user->titleToken = bound;
+                        user->titleTokenTitleId = claimedTitle;
+                        binding = "bound";
+                    }
+                    else
+                    {
+                        free( bound );
+                        binding = "malformed";
+                    }
+                }
+            }
+            else
+                binding = "malformed";
+        }
     }
+    nexus::title_identity::WriteBinding( configuration, claimResult, claimedTitle, binding );
     if ( FAILED( hr = get_json_object( object, L"AuthorizationToken", &authObject ) ) ) goto cleanup;
     if ( FAILED( hr = get_json_object( authObject, L"DisplayClaims", &claims ) ) ) goto cleanup;
     if ( FAILED( hr = get_json_array( claims, L"xui", &xui ) ) ) goto cleanup;
@@ -916,6 +1008,7 @@ void XUser::ResetNetworkState() noexcept
     deviceToken = nullptr;
     free( titleToken );
     titleToken = nullptr;
+    titleTokenTitleId = 0;
     free( deviceAuth );
     deviceAuth = nullptr;
     free( deviceAuthAudience );
@@ -3078,11 +3171,14 @@ cleanup:
     return hr;
 }
 
-HRESULT XUser::GetPresenceAuthorization( const char *url, char **auth, UINT32 *signatureVersion )
+HRESULT XUser::GetPresenceAuthorization( const char *url, char **auth, UINT32 *signatureVersion, UINT32 expectedTitle )
 {
     if ( !auth || !signatureVersion ) return E_POINTER;
     *auth = nullptr; *signatureVersion = 0;
     if ( !url || !titleToken || !*titleToken || !xuid || cancelled ) return E_GAMEUSER_NO_AUTH_USER;
+    /* The token's server claim and the caller's title metadata must identify
+     * the same configured title. A bridge field alone never grants presence. */
+    if ( !expectedTitle || expectedTitle != titleTokenTitleId ) return E_GAMEUSER_NO_AUTH_USER;
     try
     {
         const auto expected = "https://userpresence.xboxlive.com/users/xuid(" + std::to_string( xuid ) + ")/devices/current/titles/current";

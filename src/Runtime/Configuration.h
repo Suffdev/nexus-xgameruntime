@@ -5,6 +5,20 @@
 
 namespace nexus
 {
+enum class GameConfigSource
+{
+    Default,
+    Inline,
+    File,
+};
+
+enum class MsaAppIdSource
+{
+    None,
+    Explicit,
+    Legacy,
+};
+
 struct GameConfiguration
 {
     XmlNode game;
@@ -13,6 +27,8 @@ struct GameConfiguration
     bool fullTrust = false;
     std::wstring directory;
     std::vector<std::string> relatedProducts;
+    GameConfigSource configSource = GameConfigSource::Default;
+    MsaAppIdSource msaAppIdSource = MsaAppIdSource::None;
 };
 inline bool UsesLegacyFullTrust( const GameConfiguration &config ) noexcept
 {

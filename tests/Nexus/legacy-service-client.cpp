@@ -79,5 +79,59 @@ int main()
     const auto *published=nexus::GetGameConfiguration();
     CHECK(published && published->titleId==0x1234 && published->msaAppId=="000000001234ABcd");
     CHECK(DeleteFileW(manifest.c_str()) && DeleteFileW(path.c_str()) && RemoveDirectoryW(directory));
+    /* Declared executable directory lookup. */
+    {
+        WCHAR temp2[MAX_PATH],root[MAX_PATH];
+        CHECK(GetTempPathW(MAX_PATH,temp2)>0 && GetTempFileNameW(temp2,L"xsc",0,root)>0);
+        CHECK(DeleteFileW(root) && CreateDirectoryW(root,nullptr));
+        std::wstring gameDir=std::wstring(root)+L"\\Game";
+        std::wstring binaries=gameDir+L"\\Binaries";
+        std::wstring win=binaries+L"\\WinGDK";
+        CHECK(CreateDirectoryW(gameDir.c_str(),nullptr));
+        CHECK(CreateDirectoryW(binaries.c_str(),nullptr));
+        CHECK(CreateDirectoryW(win.c_str(),nullptr));
+        auto writeAt=[&](const std::wstring &target,const char *data){
+            HANDLE f=CreateFileW(target.c_str(),GENERIC_WRITE,0,nullptr,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,nullptr);
+            DWORD written=0;CHECK(f!=INVALID_HANDLE_VALUE);
+            CHECK(WriteFile(f,data,strlen(data),&written,nullptr)&&written==strlen(data));CloseHandle(f);
+        };
+        const std::string exeClient=R"({"TitleId":4660,"ClientId":"00000000AAAAAAA1"})";
+        const std::string rootClient=R"({"TitleId":4660,"ClientId":"00000000BBBBBBB2"})";
+        auto load=[&](const char *manifestText,const WCHAR *module,HRESULT expected,const char *expectedClient){
+            nexus::GameConfiguration c;c.directory=root;c.titleId=0x1234;
+            CHECK(nexus::ParseXml(manifestText,c.game)==S_OK);
+            c.msaAppId.clear();c.msaAppIdSource=nexus::MsaAppIdSource::None;
+            const HRESULT hr=nexus::LoadLegacyServiceClientForModule(c,module);
+            CHECK(expected==E_FAIL?FAILED(hr):hr==expected);
+            CHECK(c.msaAppId==(expectedClient?expectedClient:""));
+            if(SUCCEEDED(hr))CHECK(c.msaAppIdSource==(c.msaAppId.empty()?nexus::MsaAppIdSource::None:nexus::MsaAppIdSource::Legacy));
+        };
+        const std::wstring module=win+L"\\Game.exe";
+        const auto rootConfig=std::wstring(root)+L"\\xboxservices.config";
+        const char *declared="<Game configVersion='0'><TitleId>1234</TitleId><ExecutableList><Executable Name='Game/Binaries/WinGDK/Game.exe'/></ExecutableList></Game>";
+        writeAt(win+L"\\xboxservices.config",exeClient.c_str());
+        load(declared,module.c_str(),S_OK,"00000000AAAAAAA1");
+        const char *declaredBackslash="<Game configVersion='0'><TitleId>1234</TitleId><ExecutableList><Executable Name='Game\\Binaries\\WinGDK\\Game.exe'/></ExecutableList></Game>";
+        load(declaredBackslash,module.c_str(),S_OK,"00000000AAAAAAA1");
+        writeAt(rootConfig,exeClient.c_str());
+        load(declared,module.c_str(),S_OK,"00000000AAAAAAA1");
+        writeAt(rootConfig,rootClient.c_str());
+        load(declared,module.c_str(),E_INVALIDARG,nullptr);
+        writeAt(rootConfig,"malformed");
+        load(declared,module.c_str(),E_FAIL,nullptr);
+        CHECK(DeleteFileW(rootConfig.c_str()));
+        const char *other="<Game configVersion='0'><TitleId>1234</TitleId><ExecutableList><Executable Name='Other/Game.exe'/></ExecutableList></Game>";
+        load(other,module.c_str(),S_OK,nullptr);
+        const char *traversal="<Game configVersion='0'><TitleId>1234</TitleId><ExecutableList><Executable Name='../Game.exe'/></ExecutableList></Game>";
+        load(traversal,module.c_str(),S_OK,nullptr);
+        const char *absolute="<Game configVersion='0'><TitleId>1234</TitleId><ExecutableList><Executable Name='C:\\\\Game.exe'/></ExecutableList></Game>";
+        load(absolute,module.c_str(),S_OK,nullptr);
+        CHECK(DeleteFileW((win+L"\\xboxservices.config").c_str()));
+        writeAt(rootConfig,exeClient.c_str());
+        const char *rootExecutable="<Game configVersion='0'><TitleId>1234</TitleId><ExecutableList><Executable Name='Game.exe'/></ExecutableList></Game>";
+        load(rootExecutable,(std::wstring(root)+L"\\Game.exe").c_str(),S_OK,"00000000AAAAAAA1");
+        CHECK(DeleteFileW(rootConfig.c_str()));
+        CHECK(RemoveDirectoryW(win.c_str())&&RemoveDirectoryW(binaries.c_str())&&RemoveDirectoryW(gameDir.c_str())&&RemoveDirectoryW(root));
+    }
     printf("CHECKS %u FAILURES %u\n",checks,failures);return failures?1:0;
 }

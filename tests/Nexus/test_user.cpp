@@ -3,6 +3,8 @@
 #include "../../src/System/User/XUserImpl.h"
 #include "../../src/System/User/Presence.h"
 #include "../../src/System/User/OfflineIdentity.h"
+#include "../../src/Runtime/Configuration.h"
+#include "../../src/Runtime/TitleIdentityDiagnostics.h"
 #include <wincrypt.h>
 #include <string>
 #include <vector>
@@ -10,15 +12,22 @@
 #include <cstring>
 #include <thread>
 #include <future>
+#include <fstream>
+#include <iterator>
 
 namespace
 {
+constexpr UINT32 PresenceTitle = 0x1234;
 class RuntimeEnvironment final : public testing::Environment
 {
 public:
     void SetUp() override
     {
         InitializeLogging();
+        constexpr char gameConfig[] = "<Game><Identity Name='Nexus.Init.Inline' Publisher='CN=NexusProbe'/>"
+                                      "<TitleId>1234</TitleId></Game>";
+        INITIALIZE_OPTIONS options{ 1, TRUE, gameConfig };
+        ASSERT_EQ( nexus::InitializeGameConfiguration( &options ), S_OK );
     }
 };
 const auto environment = testing::AddGlobalTestEnvironment( new RuntimeEnvironment );
@@ -71,6 +80,8 @@ public:
         if ( retrySliceDelayMs ) Sleep( retrySliceDelayMs );
     }
     bool currentFails = false, titleToken = true;
+    std::string titleTokenValue = "synthetic-title-token";
+    std::string titleTokenClaim = R"(,"DisplayClaims":{"xti":{"tid":4660}})";
     std::string currentEndpoints = Endpoints();
     unsigned blockedHttpStage = 0;
     HANDLE httpEntered = CreateEventW( nullptr, TRUE, FALSE, nullptr );
@@ -184,7 +195,7 @@ public:
         {
             if ( FAILED( measuredSisuFailure ) ) return measuredSisuFailure;
             std::string response = R"({"UserToken":{"Token":"synthetic-user-token"},)";
-            if ( titleToken ) response += R"("TitleToken":{"Token":"synthetic-title-token"},)";
+            if ( titleToken ) response += R"("TitleToken":{"Token":")" + titleTokenValue + R"(")" + titleTokenClaim + "},";
             response += R"("AuthorizationToken":{"Token":"synthetic-authorization","DisplayClaims":{"xui":[{"xid":")" +
                         xid + R"(","gtg":"Synthetic","mgt":"Synthetic","mgs":"","umg":"Synthetic","agg":"Adult"}]}}})";
             return Reply( response, output, length );
@@ -259,9 +270,9 @@ TEST( NexusPresence, UsesGenuineTitleDeviceAndMatchingUserAndSignsOnlyCurrentTit
     ASSERT_EQ( user->InitializeNetwork( XUserAddOptions::AddDefaultUserSilently ), S_OK );
     user->initDone = 1; user->initResult = S_OK;
     std::vector<std::string> fields;
-    ASSERT_EQ( nexus::presence::Prepare( user.get(), 123, fields ), S_OK );
+    ASSERT_EQ( nexus::presence::Prepare( user.get(), PresenceTitle, fields ), S_OK );
     ASSERT_EQ( fields.size(), 6u );
-    EXPECT_EQ( fields[0], "presence" ); EXPECT_EQ( fields[1], transport.xid ); EXPECT_EQ( fields[2], "123" );
+    EXPECT_EQ( fields[0], "presence" ); EXPECT_EQ( fields[1], transport.xid ); EXPECT_EQ( fields[2], "4660" );
     EXPECT_EQ( fields[3], "XBL3.0 x=synthetic-user-hash;synthetic-xsts" );
     ASSERT_EQ( transport.signedBodies.size(), 1u );
     for ( const auto field : { "\"TitleToken\":\"synthetic-title-token\"", "\"DeviceToken\":\"synthetic-device-token\"", "\"UserTokens\":[\"synthetic-user-token\"]", "\"RelyingParty\":\"http://xboxlive.com\"", "\"SandboxId\":\"RETAIL\"" } )
@@ -290,9 +301,156 @@ TEST( NexusPresence, MissingTitleTokenNeverFallsBackToOrdinaryUserAuthorization 
     auto user = CreateUser( transport ); ASSERT_EQ( user->InitializeNetwork( XUserAddOptions::AddDefaultUserSilently ), S_OK );
     user->initDone = 1; user->initResult = S_OK;
     std::vector<std::string> fields{ "must-clear" };
-    EXPECT_TRUE( FAILED( nexus::presence::Prepare( user.get(), 123, fields ) ) );
+    EXPECT_TRUE( FAILED( nexus::presence::Prepare( user.get(), PresenceTitle, fields ) ) );
     EXPECT_TRUE( fields.empty() ); EXPECT_EQ( transport.rawCalls, 0u );
     EXPECT_STREQ( user->userToken, "synthetic-user-token" ); EXPECT_EQ( user->initResult, S_OK );
+}
+TEST( NexusPresence, PlatformFallbackKeepsLocalUserButForeignTitleClaimNeverPublishesOrSignsAsTitle )
+{
+    Apartment apartment; SyntheticTransport transport; transport.currentEndpoints = PresenceEndpoints();
+    const auto *config = nexus::GetGameConfiguration();
+    ASSERT_NE( config, nullptr ); ASSERT_TRUE( config->msaAppId.empty() );
+    transport.titleTokenClaim = R"(,"DisplayClaims":{"xti":{"tid":896928775}})";
+    auto user = CreateUser( transport ); ASSERT_EQ( user->InitializeNetwork( XUserAddOptions::AddDefaultUserSilently ), S_OK );
+    user->initDone = 1; user->initResult = S_OK;
+    EXPECT_EQ( user->xuid, 1234567890123456ull );
+    EXPECT_EQ( user->titleToken, nullptr );
+    EXPECT_EQ( user->titleTokenTitleId, 0u );
+    EXPECT_STREQ( user->userToken, "synthetic-user-token" );
+    std::vector<std::string> fields{ "must-clear" };
+    EXPECT_TRUE( FAILED( nexus::presence::Prepare( user.get(), PresenceTitle, fields ) ) );
+    EXPECT_TRUE( fields.empty() ); EXPECT_EQ( transport.rawCalls, 0u );
+    WCHAR *auth = nullptr; ASSERT_EQ( user->GetAuthorization( L"https://service.example.invalid/", &auth ), S_OK );
+    free( auth );
+    ASSERT_EQ( transport.signedBodies.size(), 1u );
+    EXPECT_EQ( transport.signedBodies[0].find( "TitleToken" ), std::string::npos );
+    EXPECT_EQ( user->initResult, S_OK ); EXPECT_EQ( transport.unexpected, 0u );
+}
+TEST( NexusPresence, MissingOrMalformedTitleClaimsFailClosedWithoutBreakingSignIn )
+{
+    Apartment apartment;
+    for ( const std::string claim : {
+              "",
+              R"(,"DisplayClaims":{})",
+              R"(,"DisplayClaims":{"xti":{}})",
+              R"(,"DisplayClaims":{"xti":{"tid":0}})",
+              R"(,"DisplayClaims":{"xti":{"tid":4661}})",
+              R"(,"DisplayClaims":{"xti":{"tid":"04660"}})",
+              R"(,"DisplayClaims":{"xti":{"tid":"0x1234"}})",
+              R"(,"DisplayClaims":{"xti":{"tid":4660.5}})",
+              R"(,"DisplayClaims":{"xti":{"tid":4294967296}})",
+              R"(,"DisplayClaims":{"xti":{"tid":true}})",
+              R"(,"DisplayClaims":{"xti":[{"tid":4660}]})" } )
+    {
+        SyntheticTransport transport; transport.currentEndpoints = PresenceEndpoints();
+        transport.titleTokenClaim = claim;
+        auto user = CreateUser( transport );
+        ASSERT_EQ( user->InitializeNetwork( XUserAddOptions::AddDefaultUserSilently ), S_OK ) << claim;
+        EXPECT_EQ( user->titleToken, nullptr ) << claim;
+        EXPECT_EQ( user->titleTokenTitleId, 0u ) << claim;
+        user->initDone = 1; user->initResult = S_OK;
+        std::vector<std::string> fields{ "must-clear" };
+        EXPECT_TRUE( FAILED( nexus::presence::Prepare( user.get(), PresenceTitle, fields ) ) ) << claim;
+        EXPECT_TRUE( fields.empty() ) << claim;
+        EXPECT_EQ( user->initResult, S_OK ) << claim;
+        EXPECT_STREQ( user->userToken, "synthetic-user-token" ) << claim;
+        EXPECT_EQ( transport.rawCalls, 0u ) << claim;
+    }
+}
+TEST( NexusPresence, BoundTitleTokenRequiresTheConfiguredTitleNotCallerMetadata )
+{
+    Apartment apartment;
+    for ( const std::string claim : { R"(,"DisplayClaims":{"xti":{"tid":4660}})",
+                                      R"(,"DisplayClaims":{"xti":{"tid":"4660"}})" } )
+    {
+        SyntheticTransport transport; transport.currentEndpoints = PresenceEndpoints();
+        transport.titleTokenClaim = claim;
+        auto user = CreateUser( transport );
+        ASSERT_EQ( user->InitializeNetwork( XUserAddOptions::AddDefaultUserSilently ), S_OK );
+        ASSERT_NE( user->titleToken, nullptr );
+        EXPECT_EQ( user->titleTokenTitleId, PresenceTitle );
+        user->initDone = 1; user->initResult = S_OK;
+        std::vector<std::string> fields;
+        ASSERT_EQ( nexus::presence::Prepare( user.get(), PresenceTitle, fields ), S_OK );
+        EXPECT_EQ( fields.size(), 6u );
+        ASSERT_EQ( transport.signedBodies.size(), 1u );
+        EXPECT_NE( transport.signedBodies[0].find( "\"TitleToken\":\"synthetic-title-token\"" ), std::string::npos );
+        const auto raw = transport.rawCalls.load();
+        std::vector<std::string> refused{ "must-clear" };
+        EXPECT_TRUE( FAILED( nexus::presence::Prepare( user.get(), PresenceTitle + 1, refused ) ) );
+        EXPECT_TRUE( refused.empty() );
+        EXPECT_EQ( transport.rawCalls.load(), raw );
+        EXPECT_EQ( user->initResult, S_OK );
+    }
+}
+TEST( NexusPresence, EmptyTitleTokenNeverBindsPresence )
+{
+    Apartment apartment; SyntheticTransport transport; transport.currentEndpoints = PresenceEndpoints();
+    transport.titleTokenValue.clear();
+    auto user = CreateUser( transport ); ASSERT_EQ( user->InitializeNetwork( XUserAddOptions::AddDefaultUserSilently ), S_OK );
+    EXPECT_EQ( user->titleToken, nullptr );
+    EXPECT_EQ( user->titleTokenTitleId, 0u );
+    user->initDone = 1; user->initResult = S_OK;
+    std::vector<std::string> fields{ "must-clear" };
+    EXPECT_TRUE( FAILED( nexus::presence::Prepare( user.get(), PresenceTitle, fields ) ) );
+    EXPECT_TRUE( fields.empty() ); EXPECT_EQ( transport.rawCalls, 0u );
+    EXPECT_STREQ( user->userToken, "synthetic-user-token" );
+}
+TEST( NexusPresence, TitleIdentityDiagnosticRecordsSanitizedConfigAndBinding )
+{
+    Apartment apartment;
+    WCHAR temp[MAX_PATH], path[MAX_PATH];
+    ASSERT_GT( GetTempPathW( MAX_PATH, temp ), 0u );
+    ASSERT_GT( GetTempFileNameW( temp, L"tid", 0, path ), 0u );
+    std::string logPath;
+    ASSERT_EQ( nexus::ToUtf8( path, logPath ), S_OK );
+    ASSERT_TRUE( SetEnvironmentVariableA( "NEXUS_TITLE_IDENTITY_LOG", logPath.c_str() ) );
+    SyntheticTransport transport; transport.currentEndpoints = PresenceEndpoints();
+    auto user = CreateUser( transport );
+    ASSERT_EQ( user->InitializeNetwork( XUserAddOptions::AddDefaultUserSilently ), S_OK );
+    const auto *config = nexus::GetGameConfiguration();
+    ASSERT_NE( config, nullptr );
+    nexus::title_identity::WriteConfig( *config );
+    {
+        SyntheticTransport foreign; foreign.currentEndpoints = PresenceEndpoints();
+        foreign.titleTokenClaim = R"(,"DisplayClaims":{"xti":{"tid":896928775}})";
+        auto rejected = CreateUser( foreign );
+        ASSERT_EQ( rejected->InitializeNetwork( XUserAddOptions::AddDefaultUserSilently ), S_OK );
+    }
+    std::ifstream file( path, std::ios::binary );
+    ASSERT_TRUE( file.good() );
+    std::string log( ( std::istreambuf_iterator<char>( file ) ), std::istreambuf_iterator<char>() );
+    EXPECT_LE( log.size(), 32768u );
+    EXPECT_NE( log.find( "TITLE_IDENTITY_CONFIG source=inline version=none title=00001234 msa=none client=fallback "
+                         "legacy_root=none legacy_exe=missing" ),
+               std::string::npos );
+    EXPECT_NE( log.find( "TITLE_IDENTITY_BINDING source=inline client=fallback claim_hr=00000000 claimed=4660 "
+                         "binding=bound" ),
+               std::string::npos );
+    EXPECT_NE( log.find( "TITLE_IDENTITY_BINDING source=inline client=fallback claim_hr=00000000 claimed=896928775 "
+                         "binding=mismatch" ),
+               std::string::npos );
+    EXPECT_EQ( log.find( "synthetic-title-token" ), std::string::npos );
+    EXPECT_EQ( log.find( "synthetic-user-token" ), std::string::npos );
+    EXPECT_EQ( log.find( "1234567890123456" ), std::string::npos );
+    SetEnvironmentVariableA( "NEXUS_TITLE_IDENTITY_LOG", nullptr );
+    DeleteFileW( path );
+}
+TEST( NexusPresence, ReauthenticationClearsAnUnboundOrForeignTitleToken )
+{
+    Apartment apartment; SyntheticTransport transport; transport.currentEndpoints = PresenceEndpoints();
+    auto user = CreateUser( transport );
+    ASSERT_EQ( user->InitializeNetwork( XUserAddOptions::AddDefaultUserSilently ), S_OK );
+    ASSERT_NE( user->titleToken, nullptr );
+    EXPECT_EQ( user->titleTokenTitleId, PresenceTitle );
+    transport.titleTokenClaim = R"(,"DisplayClaims":{"xti":{"tid":896928775}})";
+    ASSERT_EQ( user->InitializeNetwork( XUserAddOptions::AddDefaultUserSilently ), S_OK );
+    EXPECT_EQ( user->titleToken, nullptr );
+    EXPECT_EQ( user->titleTokenTitleId, 0u );
+    transport.titleTokenClaim = R"(,"DisplayClaims":{"xti":{"tid":4660}})";
+    ASSERT_EQ( user->InitializeNetwork( XUserAddOptions::AddDefaultUserSilently ), S_OK );
+    ASSERT_NE( user->titleToken, nullptr );
+    EXPECT_EQ( user->titleTokenTitleId, PresenceTitle );
 }
 TEST( NexusPresence, WrongMalformedOrMissingAuthenticatedIdentityNeverPublishes )
 {
@@ -303,7 +461,7 @@ TEST( NexusPresence, WrongMalformedOrMissingAuthenticatedIdentityNeverPublishes 
         auto user = CreateUser( transport ); ASSERT_EQ( user->InitializeNetwork( XUserAddOptions::AddDefaultUserSilently ), S_OK );
         user->initDone = 1; user->initResult = S_OK;
         std::vector<std::string> fields{ "must-clear" };
-        EXPECT_TRUE( FAILED( nexus::presence::Prepare( user.get(), 123, fields ) ) ); EXPECT_TRUE( fields.empty() );
+        EXPECT_TRUE( FAILED( nexus::presence::Prepare( user.get(), PresenceTitle, fields ) ) ); EXPECT_TRUE( fields.empty() );
         EXPECT_EQ( user->initResult, S_OK ); EXPECT_STREQ( user->userToken, "synthetic-user-token" );
     }
 }
@@ -315,7 +473,7 @@ TEST( NexusPresence, MissingEndpointOrUnsupportedPolicyFailsClosedWithoutBreakin
         SyntheticTransport transport; transport.currentEndpoints = metadata;
         auto user = CreateUser( transport ); ASSERT_EQ( user->InitializeNetwork( XUserAddOptions::AddDefaultUserSilently ), S_OK );
         user->initDone = 1; user->initResult = S_OK;
-        std::vector<std::string> fields; EXPECT_TRUE( FAILED( nexus::presence::Prepare( user.get(), 123, fields ) ) );
+        std::vector<std::string> fields; EXPECT_TRUE( FAILED( nexus::presence::Prepare( user.get(), PresenceTitle, fields ) ) );
         EXPECT_TRUE( fields.empty() ); EXPECT_EQ( transport.rawCalls, 0u ); EXPECT_EQ( user->initResult, S_OK );
     }
 }
@@ -325,10 +483,10 @@ TEST( NexusPresence, DenialCancelledAndInvalidInputsHaveNoPresenceSideEffects )
     auto user = CreateUser( transport ); ASSERT_EQ( user->InitializeNetwork( XUserAddOptions::AddDefaultUserSilently ), S_OK );
     user->initDone = 1; user->initResult = S_OK;
     std::vector<std::string> fields;
-    EXPECT_TRUE( FAILED( nexus::presence::Prepare( user.get(), 123, fields ) ) ); EXPECT_TRUE( fields.empty() );
+    EXPECT_TRUE( FAILED( nexus::presence::Prepare( user.get(), PresenceTitle, fields ) ) ); EXPECT_TRUE( fields.empty() );
     EXPECT_EQ( transport.rawCalls, 1u );
-    user->cancelled = true; EXPECT_TRUE( FAILED( nexus::presence::Prepare( user.get(), 123, fields ) ) );
-    EXPECT_TRUE( FAILED( nexus::presence::Prepare( nullptr, 123, fields ) ) );
+    user->cancelled = true; EXPECT_TRUE( FAILED( nexus::presence::Prepare( user.get(), PresenceTitle, fields ) ) );
+    EXPECT_TRUE( FAILED( nexus::presence::Prepare( nullptr, PresenceTitle, fields ) ) );
     EXPECT_TRUE( FAILED( nexus::presence::Prepare( user.get(), 0, fields ) ) ); EXPECT_EQ( transport.rawCalls, 1u );
 }
 TEST( NexusAuthentication, CompleteHandshakeKeepsActualXboxAndDistinctMsaIdentities )

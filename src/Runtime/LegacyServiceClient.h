@@ -2,10 +2,15 @@
 // Older desktop packages declare the MSA client in xboxservices.config.
 // Only use a sibling declaration for the same title, never infer an identity.
 #pragma once
+#include "Configuration.h"
 #include <charconv>
 #include <cmath>
+#include <cstring>
+#include <cwchar>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 namespace nexus
 {
@@ -97,34 +102,159 @@ done:
     return hr;
 }
 
-inline HRESULT LoadLegacyServiceClient( GameConfiguration &config )
+/* A manifest executable name is a package-relative path. It may contain
+ * subdirectories, but never an absolute path, an empty, "." or ".." component,
+ * a drive, a wildcard or a control character. */
+inline bool ValidDeclaredExecutable( std::wstring_view name ) noexcept
 {
-    // Inline configurations have no trusted sibling directory. Explicit modern
-    // declarations always win, including when a legacy file is malformed.
-    if ( !config.msaAppId.empty() || config.game.attribute("configVersion") != "0" || config.directory.empty() )
-        return S_OK;
-    const auto path = config.directory + L"\\xboxservices.config";
-    std::string bytes(65536, '\0');
+    if ( name.empty() || name.size() > 32768 ) return false;
+    if ( name.front() == L'\\' || name.front() == L'/' ) return false;
+    size_t start = 0;
+    for ( ;; )
+    {
+        size_t end = name.find_first_of( L"\\/", start );
+        if ( end == std::wstring_view::npos ) end = name.size();
+        auto part = name.substr( start, end - start );
+        if ( part.empty() || part == L"." || part == L".." ||
+             part.find_first_of( L":<>\"|?*" ) != std::wstring_view::npos )
+            return false;
+        for ( wchar_t c : part )
+            if ( c < 0x20 ) return false;
+        if ( end == name.size() ) break;
+        start = end + 1;
+    }
+    return true;
+}
+
+inline bool DeclaredExecutablePath( const GameConfiguration &config, std::wstring_view name,
+                                    std::wstring &path )
+{
+    if ( !ValidDeclaredExecutable( name ) || config.directory.empty() ) return false;
+    std::wstring result = config.directory;
+    if ( result.back() != L'\\' && result.back() != L'/' ) result.push_back( L'\\' );
+    for ( wchar_t c : name ) result.push_back( c == L'/' ? L'\\' : c );
+    if ( result.size() >= 32768 ) return false;
+    path = std::move( result );
+    return true;
+}
+
+/* The manifest declares the package-relative executable paths. Return the
+ * directory of the declaration that names the currently running module. No
+ * other directory is inferred, searched or read. */
+inline HRESULT DeclaredExecutableDirectory( const GameConfiguration &config, const WCHAR *modulePath,
+                                            std::wstring &directory )
+{
+    directory.clear();
+    if ( !modulePath || !*modulePath || config.directory.empty() ) return S_OK;
+    bool matched = false;
+    for ( const auto &list : config.game.children )
+    {
+        if ( list.name != "ExecutableList" ) continue;
+        for ( const auto &executable : list.children )
+        {
+            if ( executable.name != "Executable" ) continue;
+            std::wstring name, path;
+            if ( FAILED( ToUtf16( executable.attribute( "Name" ), name ) ) ||
+                 !DeclaredExecutablePath( config, name, path ) )
+                continue;
+            if ( _wcsicmp( path.c_str(), modulePath ) ) continue;
+            auto slash = path.find_last_of( L"\\/" );
+            std::wstring candidate = slash == std::wstring::npos ? config.directory : path.substr( 0, slash );
+            if ( !matched )
+            {
+                directory = std::move( candidate );
+                matched = true;
+            }
+            else if ( _wcsicmp( directory.c_str(), candidate.c_str() ) )
+                return E_INVALIDARG;
+        }
+    }
+    return S_OK;
+}
+
+inline HRESULT ReadLegacyClientFile( const std::wstring &path, UINT32 expectedTitle, std::string &client,
+                                     bool &present )
+{
+    client.clear();
+    present = false;
     HANDLE file = CreateFileW( path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                                FILE_ATTRIBUTE_NORMAL, nullptr );
     if ( file == INVALID_HANDLE_VALUE )
     {
         DWORD error = GetLastError();
-        return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND ? S_OK : HRESULT_FROM_WIN32(error);
+        return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND ? S_OK : HRESULT_FROM_WIN32( error );
     }
+    present = true;
+    std::string bytes( 65536, '\0' );
     LARGE_INTEGER size;
     DWORD read = 0;
     HRESULT hr = E_INVALIDARG;
-    if ( GetFileType(file) == FILE_TYPE_DISK && GetFileSizeEx(file,&size) && size.QuadPart > 0 && size.QuadPart <= 65536 )
+    if ( GetFileType( file ) == FILE_TYPE_DISK && GetFileSizeEx( file, &size ) && size.QuadPart > 0 &&
+         size.QuadPart <= 65536 )
     {
-        bytes.resize( (size_t)size.QuadPart );
-        if ( ReadFile(file,bytes.data(),(DWORD)bytes.size(),&read,nullptr) && read == bytes.size() ) hr = S_OK;
+        bytes.resize( static_cast<size_t>( size.QuadPart ) );
+        if ( ReadFile( file, bytes.data(), static_cast<DWORD>( bytes.size() ), &read, nullptr ) &&
+             read == bytes.size() )
+            hr = S_OK;
     }
-    CloseHandle(file);
-    if ( FAILED(hr) ) return hr;
-    std::string client;
-    hr = ParseLegacyServiceClient(bytes.data(),bytes.size(),config.titleId,client);
-    if ( hr == S_OK ) config.msaAppId = std::move(client);
-    return hr == S_FALSE ? S_OK : hr;
+    CloseHandle( file );
+    if ( FAILED( hr ) ) return hr;
+    hr = ParseLegacyServiceClient( bytes.data(), bytes.size(), expectedTitle, client );
+    if ( hr == S_FALSE )
+    {
+        client.clear();
+        return S_OK;
+    }
+    return hr;
+}
+
+/* Load a legacy client from the manifest directory and, only when the manifest
+ * declares the running executable in a subdirectory, from that executable's
+ * directory. Both locations are package-owned and title-matched. A present but
+ * malformed file, or two different valid clients, fails closed. */
+inline HRESULT LoadLegacyServiceClientForModule( GameConfiguration &config, const WCHAR *modulePath )
+{
+    if ( !config.msaAppId.empty() || config.game.attribute( "configVersion" ) != "0" || config.directory.empty() )
+        return S_OK;
+    std::vector<std::wstring> directories;
+    directories.push_back( config.directory );
+    std::wstring executableDirectory;
+    HRESULT hr = DeclaredExecutableDirectory( config, modulePath, executableDirectory );
+    if ( FAILED( hr ) ) return hr;
+    if ( !executableDirectory.empty() && _wcsicmp( executableDirectory.c_str(), config.directory.c_str() ) )
+        directories.push_back( std::move( executableDirectory ) );
+    bool found = false;
+    std::string chosen;
+    for ( const auto &directory : directories )
+    {
+        std::string client;
+        bool present = false;
+        hr = ReadLegacyClientFile( directory + L"\\xboxservices.config", config.titleId, client, present );
+        if ( FAILED( hr ) ) return hr;
+        if ( !present || client.empty() ) continue;
+        if ( !found )
+        {
+            chosen = client;
+            found = true;
+        }
+        else if ( _stricmp( chosen.c_str(), client.c_str() ) )
+            return E_INVALIDARG;
+    }
+    if ( found )
+    {
+        config.msaAppId = std::move( chosen );
+        config.msaAppIdSource = MsaAppIdSource::Legacy;
+    }
+    return S_OK;
+}
+
+inline HRESULT LoadLegacyServiceClient( GameConfiguration &config )
+{
+    if ( !config.msaAppId.empty() || config.game.attribute( "configVersion" ) != "0" || config.directory.empty() )
+        return S_OK;
+    WCHAR modulePath[32768];
+    DWORD length = GetModuleFileNameW( nullptr, modulePath, ARRAYSIZE( modulePath ) );
+    if ( !length || length >= ARRAYSIZE( modulePath ) ) modulePath[0] = 0;
+    return LoadLegacyServiceClientForModule( config, modulePath );
 }
 }

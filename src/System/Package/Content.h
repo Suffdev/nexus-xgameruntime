@@ -196,27 +196,229 @@ static BOOL content_relative( const char *text, BOOL pattern )
     return TRUE;
 }
 
-static BOOL content_layout_files( const WCHAR *root, xmlNodePtr node, UINT depth, UINT *groups )
+/* Literal package component rules shared with Mount: Win32 trims trailing dots
+ * and spaces and resolves "..", so a literal location or include prefix must
+ * reject those forms plus invalid Windows characters. Valid Unicode bytes and
+ * case are preserved; "." is handled by the caller and canonicalizes to empty. */
+static BOOL content_component( const char *text, SIZE_T length )
 {
-    char source[MAX_PATH], include[MAX_PATH];
-    WCHAR relative[MAX_PATH], directory[MAX_PATH], pattern[MAX_PATH];
-    WIN32_FIND_DATAW data;
-    HANDLE find;
-    BOOL found;
+    SIZE_T i;
+    if ( !length || ( length == 2 && text[0] == '.' && text[1] == '.' ) ) return FALSE;
+    if ( text[length - 1] == '.' || text[length - 1] == ' ' ) return FALSE;
+    for ( i = 0; i < length; ++i )
+    {
+        unsigned char c = ( unsigned char )text[i];
+        if ( c < 32 || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|' )
+            return FALSE;
+    }
+    return TRUE;
+}
+
+/* Package layout locations and include prefixes are relative to the package
+ * image, never the host filesystem. One leading separator still names the
+ * package root; every literal component follows content_component. */
+static BOOL content_package_relative( const char *text, char *out, SIZE_T size )
+{
+    const char *p;
+    SIZE_T used = 0;
+    if ( !text || !out || !size ) return FALSE;
+    p = text;
+    if ( *p == '/' || *p == '\\' ) ++p;
+    if ( *p == '/' || *p == '\\' ) return FALSE;
+    while ( *p )
+    {
+        const char *end = p;
+        SIZE_T length;
+        while ( *end && *end != '/' && *end != '\\' ) ++end;
+        length = ( SIZE_T )( end - p );
+        if ( length && !( length == 1 && *p == '.' ) )
+        {
+            if ( !content_component( p, length ) ) return FALSE;
+            if ( used && used + 1 >= size ) return FALSE;
+            if ( used ) out[used++] = '\\';
+            if ( used + length >= size ) return FALSE;
+            memmove( out + used, p, length );
+            used += length;
+        }
+        p = end;
+        if ( *p ) ++p;
+    }
+    out[used] = 0;
+    return TRUE;
+}
+
+/* Canonical package-relative location without empty or "." components. */
+static BOOL content_layout_location( xmlNodePtr node, const char *attribute, char *out, SIZE_T size )
+{
+    char value[MAX_PATH];
+    const char *p;
+    SIZE_T used = 0;
+    if ( !out || !size || !content_text( node, attribute, value, sizeof( value ) ) ) return FALSE;
+    if ( !content_package_relative( value, value, sizeof( value ) ) ) return FALSE;
+    for ( p = value; ; )
+    {
+        const char *end = p;
+        SIZE_T length;
+        while ( *end && *end != '/' && *end != '\\' ) ++end;
+        length = ( SIZE_T )( end - p );
+        if ( length && !( length == 1 && *p == '.' ) )
+        {
+            if ( used && used + 1 >= size ) return FALSE;
+            if ( used ) out[used++] = '\\';
+            if ( used + length >= size ) return FALSE;
+            memmove( out + used, p, length );
+            used += length;
+        }
+        if ( !*end ) break;
+        p = end + 1;
+    }
+    out[used] = 0;
+    return TRUE;
+}
+
+/* Include may carry one literal directory prefix; wildcards are leaf-only. */
+static BOOL content_include_parts( const char *include, char *prefix, SIZE_T size, const char **leaf )
+{
+    const char *last = strrchr( include, '\\' ), *slash = strrchr( include, '/' );
+    if ( !last || ( slash && slash > last ) ) last = slash;
+    *leaf = last ? last + 1 : include;
+    prefix[0] = 0;
+    if ( !last ) return TRUE;
+    if ( ( SIZE_T )( last - include ) >= size ) return FALSE;
+    memcpy( prefix, include, ( SIZE_T )( last - include ) );
+    prefix[last - include] = 0;
+    return content_package_relative( prefix, prefix, size );
+}
+
+/* Every path component below the package root must be a real directory.
+ * Reparse points are never followed, so a layout cannot redirect the payload
+ * outside the extracted tree. The root itself is host-supplied. */
+static BOOL content_directory( const WCHAR *root, const WCHAR *relative, WCHAR *out )
+{
+    DWORD attributes;
+    SIZE_T used;
+    if ( !root || !relative || !out ) return FALSE;
+    used = wcslen( root );
+    if ( !used || used >= MAX_PATH ) return FALSE;
+    wcscpy( out, root );
+    attributes = GetFileAttributesW( out );
+    if ( attributes == INVALID_FILE_ATTRIBUTES || !( attributes & FILE_ATTRIBUTE_DIRECTORY ) ) return FALSE;
+    while ( *relative )
+    {
+        const WCHAR *end = relative;
+        SIZE_T length;
+        while ( *end && *end != L'\\' && *end != L'/' ) ++end;
+        length = ( SIZE_T )( end - relative );
+        if ( length )
+        {
+            if ( used + length + 2 > MAX_PATH ) return FALSE;
+            out[used++] = L'\\';
+            memcpy( out + used, relative, length * sizeof( WCHAR ) );
+            used += length;
+            out[used] = 0;
+            attributes = GetFileAttributesW( out );
+            if ( attributes == INVALID_FILE_ATTRIBUTES || !( attributes & FILE_ATTRIBUTE_DIRECTORY ) ||
+                 ( attributes & FILE_ATTRIBUTE_REPARSE_POINT ) )
+                return FALSE;
+        }
+        relative = *end ? end + 1 : end;
+    }
+    return TRUE;
+}
+
+/* A downloaded tree can be deployed at its declared destination or still hold
+ * the declared source coordinate. Exactly one interpretation is used for the
+ * whole package, so payload is never advertised from mixed coordinates. */
+enum content_layout_coordinate
+{
+    CONTENT_LAYOUT_SOURCE = 0,
+    CONTENT_LAYOUT_DESTINATION = 1
+};
+
+/* Validate every declared declaration before any tree is inspected, so an
+ * invalid path cannot hide behind the other coordinate. */
+static BOOL content_layout_declarations( xmlNodePtr node, UINT depth, UINT *groups )
+{
+    char include[MAX_PATH], prefix[MAX_PATH];
+    const char *leaf;
+    BOOL source, destination;
     if ( depth > 16 ) return FALSE;
     for ( ; node; node = node->next )
     {
         if ( node->type != XML_ELEMENT_NODE ) continue;
         if ( !strcmp( ( char * )node->name, "FileGroup" ) )
         {
-            if ( ++*groups > 256 || !content_text( node, "SourcePath", source, sizeof( source ) ) ||
-                 !content_text( node, "Include", include, sizeof( include ) ) || !content_relative( source, FALSE ) ||
+            source = xmlHasProp( node, ( xmlChar * )"SourcePath" ) != NULL;
+            destination = xmlHasProp( node, ( xmlChar * )"DestinationPath" ) != NULL;
+            if ( ++*groups > 256 || ( !source && !destination ) ||
+                 !content_text( node, "Include", include, sizeof( include ) ) ||
                  !content_relative( include, TRUE ) ||
-                 !MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, source, -1, relative, MAX_PATH ) ||
-                 !content_join( root, relative, directory ) ||
-                 !MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, include, -1, relative, MAX_PATH ) ||
-                 !content_join( directory, relative, pattern ) )
+                 !content_include_parts( include, prefix, sizeof( prefix ), &leaf ) || !*leaf ||
+                 ( source && !content_layout_location( node, "SourcePath", prefix, sizeof( prefix ) ) ) ||
+                 ( destination && !content_layout_location( node, "DestinationPath", prefix, sizeof( prefix ) ) ) )
                 return FALSE;
+        }
+        if ( !content_layout_declarations( node->children, depth + 1, groups ) ) return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL content_layout_files( const WCHAR *root, xmlNodePtr node, UINT depth, UINT *groups,
+                                  enum content_layout_coordinate coordinate )
+{
+    char include[MAX_PATH], prefix[MAX_PATH], location[MAX_PATH];
+    WCHAR relative[MAX_PATH], leaf[MAX_PATH], directory[MAX_PATH], pattern[MAX_PATH], *part;
+    WIN32_FIND_DATAW data;
+    HANDLE find;
+    BOOL found;
+    if ( depth > 16 ) return FALSE;
+    for ( ; node; node = node->next )
+    {
+        const char *suffix;
+        if ( node->type != XML_ELEMENT_NODE ) continue;
+        if ( !strcmp( ( char * )node->name, "FileGroup" ) )
+        {
+            if ( ++*groups > 256 || !content_text( node, "Include", include, sizeof( include ) ) ||
+                 !content_relative( include, TRUE ) ||
+                 !content_include_parts( include, prefix, sizeof( prefix ), &suffix ) || !*suffix )
+                return FALSE;
+            if ( coordinate == CONTENT_LAYOUT_SOURCE )
+            {
+                if ( !xmlHasProp( node, ( xmlChar * )"SourcePath" ) ||
+                     !content_layout_location( node, "SourcePath", location, sizeof( location ) ) )
+                    return FALSE;
+            }
+            else if ( xmlHasProp( node, ( xmlChar * )"DestinationPath" ) )
+            {
+                if ( !content_layout_location( node, "DestinationPath", location, sizeof( location ) ) )
+                    return FALSE;
+            }
+            else if ( xmlHasProp( node, ( xmlChar * )"SourcePath" ) )
+            {
+                /* No destination was declared: the deployed tree is the declared
+                 * source location, matching package chunk readiness. */
+                if ( !content_layout_location( node, "SourcePath", location, sizeof( location ) ) ) return FALSE;
+            }
+            else
+                return FALSE;
+            if ( !MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, location, -1, relative, MAX_PATH ) ) return FALSE;
+            for ( part = relative; *part; ++part )
+                if ( *part == '/' ) *part = '\\';
+            if ( prefix[0] )
+            {
+                WCHAR literal[MAX_PATH];
+                if ( !MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, prefix, -1, literal, MAX_PATH ) ) return FALSE;
+                for ( part = literal; *part; ++part )
+                    if ( *part == '/' ) *part = '\\';
+                if ( relative[0] && wcslen( relative ) + wcslen( literal ) + 2 > MAX_PATH ) return FALSE;
+                if ( relative[0] ) wcscat( relative, L"\\" );
+                wcscat( relative, literal );
+            }
+            if ( !content_directory( root, relative, directory ) ) return FALSE;
+            if ( !MultiByteToWideChar( CP_UTF8, MB_ERR_INVALID_CHARS, suffix, -1, leaf, MAX_PATH ) ) return FALSE;
+            for ( part = leaf; *part; ++part )
+                if ( *part == '/' ) *part = '\\';
+            if ( !content_join( directory, leaf, pattern ) ) return FALSE;
             if ( ( find = FindFirstFileW( pattern, &data ) ) == INVALID_HANDLE_VALUE ) return FALSE;
             found = FALSE;
             do
@@ -230,9 +432,34 @@ static BOOL content_layout_files( const WCHAR *root, xmlNodePtr node, UINT depth
             FindClose( find );
             if ( !found ) return FALSE;
         }
-        if ( !content_layout_files( root, node->children, depth + 1, groups ) ) return FALSE;
+        if ( !content_layout_files( root, node->children, depth + 1, groups, coordinate ) ) return FALSE;
     }
     return TRUE;
+}
+
+/* The deployed destination coordinate is authoritative because the installer
+ * materializes exactly those paths and package chunk readiness reads them.
+ * The declared source coordinate is only a fallback for a tree that was not
+ * remapped. */
+static BOOL content_layout_coordinate( const WCHAR *root, xmlNodePtr node,
+                                       enum content_layout_coordinate *coordinate, UINT *groups )
+{
+    UINT declared = 0, visited = 0;
+    if ( !content_layout_declarations( node, 0, &declared ) || !declared ) return FALSE;
+    if ( content_layout_files( root, node, 0, &visited, CONTENT_LAYOUT_DESTINATION ) && visited )
+    {
+        *coordinate = CONTENT_LAYOUT_DESTINATION;
+        if ( groups ) *groups = visited;
+        return TRUE;
+    }
+    visited = 0;
+    if ( content_layout_files( root, node, 0, &visited, CONTENT_LAYOUT_SOURCE ) && visited )
+    {
+        *coordinate = CONTENT_LAYOUT_SOURCE;
+        if ( groups ) *groups = visited;
+        return TRUE;
+    }
+    return FALSE;
 }
 
 static BOOL content_load_layout( struct content_package *package )
@@ -242,6 +469,7 @@ static BOOL content_load_layout( struct content_package *package )
     HANDLE find;
     xmlDocPtr doc;
     xmlNodePtr root;
+    enum content_layout_coordinate coordinate;
     UINT groups = 0, layouts = 0;
     BOOL valid = FALSE;
     if ( !content_join( package->path, L"layout_*.xml", pattern ) ||
@@ -259,7 +487,7 @@ static BOOL content_load_layout( struct content_package *package )
         doc = content_read_xml( path );
         root = doc ? xmlDocGetRootElement( doc ) : NULL;
         valid = root && !strcmp( ( char * )root->name, "Package" ) &&
-                content_layout_files( package->path, root->children, 0, &groups ) && groups;
+                content_layout_coordinate( package->path, root->children, &coordinate, &groups ) && groups;
         if ( doc ) xmlFreeDoc( doc );
         if ( !valid ) break;
     } while ( FindNextFileW( find, &data ) );
