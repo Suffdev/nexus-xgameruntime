@@ -3,6 +3,7 @@
 #include "../private.h"
 #include "Configuration.h"
 #include "LegacyServiceClient.h"
+#include "TitleIdentityDiagnostics.h"
 #include <bcrypt.h>
 #include <charconv>
 #include <atomic>
@@ -96,6 +97,7 @@ static HRESULT load( GameConfiguration &config, const INITIALIZE_OPTIONS *option
     if ( options && ( options->gameConfig || options->isInlineConfig ) )
     {
         if ( !options->gameConfig ) return E_GAMERUNTIME_GAMECONFIG_BAD_FORMAT;
+        config.configSource = options->isInlineConfig ? GameConfigSource::Inline : GameConfigSource::File;
         if ( options->isInlineConfig )
         {
             size_t length = strnlen( options->gameConfig, 4 * 1024 * 1024 + 1 );
@@ -166,8 +168,13 @@ static HRESULT load( GameConfiguration &config, const INITIALIZE_OPTIONS *option
             }
         }
     }
+    if ( !config.msaAppId.empty() && config.msaAppIdSource == MsaAppIdSource::None )
+        config.msaAppIdSource = MsaAppIdSource::Explicit;
+    if ( config.msaAppId.empty() ) config.msaAppIdSource = MsaAppIdSource::None;
     hr = LoadLegacyServiceClient( config );
     if ( FAILED( hr ) ) return hr == E_OUTOFMEMORY ? hr : E_GAMERUNTIME_GAMECONFIG_BAD_FORMAT;
+    if ( !config.msaAppId.empty() && config.msaAppIdSource == MsaAppIdSource::None )
+        config.msaAppIdSource = MsaAppIdSource::Explicit;
     // Launcher discovery hints cannot grant rights. Malformed hints are ignored
     // atomically, without discarding the manifest list or creating entitlements.
     char hint[256 * 13];
@@ -205,6 +212,7 @@ static HRESULT load( GameConfiguration &config, const INITIALIZE_OPTIONS *option
         }
         if ( valid ) config.relatedProducts = std::move( merged );
     }
+    title_identity::WriteConfig( config );
     return S_OK;
 }
 

@@ -4,6 +4,7 @@
 #include "../../src/System/User/Presence.h"
 #include "../../src/System/User/OfflineIdentity.h"
 #include "../../src/Runtime/Configuration.h"
+#include "../../src/Runtime/TitleIdentityDiagnostics.h"
 #include <wincrypt.h>
 #include <string>
 #include <vector>
@@ -11,6 +12,8 @@
 #include <cstring>
 #include <thread>
 #include <future>
+#include <fstream>
+#include <iterator>
 
 namespace
 {
@@ -392,6 +395,46 @@ TEST( NexusPresence, EmptyTitleTokenNeverBindsPresence )
     EXPECT_TRUE( FAILED( nexus::presence::Prepare( user.get(), PresenceTitle, fields ) ) );
     EXPECT_TRUE( fields.empty() ); EXPECT_EQ( transport.rawCalls, 0u );
     EXPECT_STREQ( user->userToken, "synthetic-user-token" );
+}
+TEST( NexusPresence, TitleIdentityDiagnosticRecordsSanitizedConfigAndBinding )
+{
+    Apartment apartment;
+    WCHAR temp[MAX_PATH], path[MAX_PATH];
+    ASSERT_GT( GetTempPathW( MAX_PATH, temp ), 0u );
+    ASSERT_GT( GetTempFileNameW( temp, L"tid", 0, path ), 0u );
+    std::string logPath;
+    ASSERT_EQ( nexus::ToUtf8( path, logPath ), S_OK );
+    ASSERT_TRUE( SetEnvironmentVariableA( "NEXUS_TITLE_IDENTITY_LOG", logPath.c_str() ) );
+    SyntheticTransport transport; transport.currentEndpoints = PresenceEndpoints();
+    auto user = CreateUser( transport );
+    ASSERT_EQ( user->InitializeNetwork( XUserAddOptions::AddDefaultUserSilently ), S_OK );
+    const auto *config = nexus::GetGameConfiguration();
+    ASSERT_NE( config, nullptr );
+    nexus::title_identity::WriteConfig( *config );
+    {
+        SyntheticTransport foreign; foreign.currentEndpoints = PresenceEndpoints();
+        foreign.titleTokenClaim = R"(,"DisplayClaims":{"xti":{"tid":896928775}})";
+        auto rejected = CreateUser( foreign );
+        ASSERT_EQ( rejected->InitializeNetwork( XUserAddOptions::AddDefaultUserSilently ), S_OK );
+    }
+    std::ifstream file( path, std::ios::binary );
+    ASSERT_TRUE( file.good() );
+    std::string log( ( std::istreambuf_iterator<char>( file ) ), std::istreambuf_iterator<char>() );
+    EXPECT_LE( log.size(), 32768u );
+    EXPECT_NE( log.find( "TITLE_IDENTITY_CONFIG source=inline version=none title=00001234 msa=none client=fallback "
+                         "legacy_root=none legacy_exe=missing" ),
+               std::string::npos );
+    EXPECT_NE( log.find( "TITLE_IDENTITY_BINDING source=inline client=fallback claim_hr=00000000 claimed=4660 "
+                         "binding=bound" ),
+               std::string::npos );
+    EXPECT_NE( log.find( "TITLE_IDENTITY_BINDING source=inline client=fallback claim_hr=00000000 claimed=896928775 "
+                         "binding=mismatch" ),
+               std::string::npos );
+    EXPECT_EQ( log.find( "synthetic-title-token" ), std::string::npos );
+    EXPECT_EQ( log.find( "synthetic-user-token" ), std::string::npos );
+    EXPECT_EQ( log.find( "1234567890123456" ), std::string::npos );
+    SetEnvironmentVariableA( "NEXUS_TITLE_IDENTITY_LOG", nullptr );
+    DeleteFileW( path );
 }
 TEST( NexusPresence, ReauthenticationClearsAnUnboundOrForeignTitleToken )
 {

@@ -2,6 +2,7 @@
 // Older desktop packages declare the MSA client in xboxservices.config.
 // Only use a sibling declaration for the same title, never infer an identity.
 #pragma once
+#include "Configuration.h"
 #include <charconv>
 #include <cmath>
 #include <string>
@@ -124,7 +125,11 @@ inline HRESULT LoadLegacyServiceClient( GameConfiguration &config )
     if ( FAILED(hr) ) return hr;
     std::string client;
     hr = ParseLegacyServiceClient(bytes.data(),bytes.size(),config.titleId,client);
-    if ( hr == S_OK ) config.msaAppId = std::move(client);
+    if ( hr == S_OK )
+    {
+        config.msaAppId = std::move(client);
+        config.msaAppIdSource = MsaAppIdSource::Legacy;
+    }
     return hr == S_FALSE ? S_OK : hr;
 }
 }

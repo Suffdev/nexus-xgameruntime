@@ -2,7 +2,10 @@
 #include <gtest/gtest.h>
 #include "../../src/private.h"
 #include "../../src/Runtime/Configuration.h"
+#include "../../src/Runtime/TitleIdentityDiagnostics.h"
 #include <atomic>
+#include <fstream>
+#include <iterator>
 #include <thread>
 #include <vector>
 
@@ -179,4 +182,70 @@ TEST( NexusConfiguration, InheritedConfigurationRejectsInvalidOrDuplicateXmlName
     root.attributes = { { "Name", "one" }, { "Name", "two" } };
     EXPECT_EQ( nexus::SerializeXml( root, bytes ), E_INVALIDARG );
     EXPECT_TRUE( bytes.empty() );
+}
+
+TEST( NexusConfiguration, TitleIdentityDiagnosticsAreBoundedSanitizedAndOptIn )
+{
+    SetEnvironmentVariableA( "NEXUS_TITLE_IDENTITY_LOG", nullptr );
+    EXPECT_FALSE( nexus::title_identity::Enabled() );
+    WCHAR temp[MAX_PATH], path[MAX_PATH];
+    ASSERT_GT( GetTempPathW( MAX_PATH, temp ), 0u );
+    ASSERT_GT( GetTempFileNameW( temp, L"tid", 0, path ), 0u );
+    std::string logPath;
+    ASSERT_EQ( nexus::ToUtf8( path, logPath ), S_OK );
+    nexus::GameConfiguration config;
+    config.configSource = nexus::GameConfigSource::Default;
+    config.titleId = 0x1234;
+    config.game.attributes = { { "configVersion", "0" } };
+    config.directory = L"Z:\\Nexus\\DiagnosticGate";
+    nexus::title_identity::WriteConfig( config );
+    config.directory.clear();
+    {
+        std::ifstream file( path, std::ios::binary );
+        ASSERT_TRUE( file.good() );
+        std::string empty( ( std::istreambuf_iterator<char>( file ) ), std::istreambuf_iterator<char>() );
+        EXPECT_TRUE( empty.empty() );
+    }
+    std::string overlong( MAX_PATH + 1, 'a' );
+    ASSERT_TRUE( SetEnvironmentVariableA( "NEXUS_TITLE_IDENTITY_LOG", overlong.c_str() ) );
+    EXPECT_FALSE( nexus::title_identity::Enabled() );
+    nexus::title_identity::WriteConfig( config );
+    {
+        std::ifstream file( path, std::ios::binary );
+        ASSERT_TRUE( file.good() );
+        std::string empty( ( std::istreambuf_iterator<char>( file ) ), std::istreambuf_iterator<char>() );
+        EXPECT_TRUE( empty.empty() );
+    }
+    ASSERT_TRUE( SetEnvironmentVariableA( "NEXUS_TITLE_IDENTITY_LOG", logPath.c_str() ) );
+    EXPECT_TRUE( nexus::title_identity::Enabled() );
+    config.msaAppId = "0000000040159362";
+    config.msaAppIdSource = nexus::MsaAppIdSource::Explicit;
+    nexus::title_identity::WriteConfig( config );
+    config.msaAppId = "not-a-client/path";
+    config.msaAppIdSource = nexus::MsaAppIdSource::Explicit;
+    config.game.attributes = { { "configVersion", "0\nXUID=1" } };
+    nexus::title_identity::WriteConfig( config );
+    nexus::title_identity::WriteBinding( &config, E_INVALIDARG, 0, "malformed" );
+    nexus::title_identity::WriteBinding( &config, S_OK, 0x9999, "mismatch" );
+    for ( int i = 0; i < 500; ++i ) nexus::title_identity::WriteConfig( config );
+    std::ifstream file( path, std::ios::binary );
+    ASSERT_TRUE( file.good() );
+    std::string log( ( std::istreambuf_iterator<char>( file ) ), std::istreambuf_iterator<char>() );
+    EXPECT_LE( log.size(), 32768u );
+    EXPECT_NE( log.find( "TITLE_IDENTITY_CONFIG source=default version=0 title=00001234 msa=0000000040159362 "
+                         "client=explicit legacy_root=none legacy_exe=missing" ),
+               std::string::npos );
+    EXPECT_NE( log.find( "TITLE_IDENTITY_CONFIG source=default version=invalid title=00001234 msa=invalid "
+                         "client=explicit legacy_root=none legacy_exe=missing" ),
+               std::string::npos );
+    EXPECT_EQ( log.find( "not-a-client" ), std::string::npos );
+    EXPECT_EQ( log.find( "XUID=1" ), std::string::npos );
+    EXPECT_NE( log.find( "TITLE_IDENTITY_BINDING source=default client=explicit claim_hr=80070057 claimed=none "
+                         "binding=malformed" ),
+               std::string::npos );
+    EXPECT_NE( log.find( "TITLE_IDENTITY_BINDING source=default client=explicit claim_hr=00000000 claimed=39321 "
+                         "binding=mismatch" ),
+               std::string::npos );
+    SetEnvironmentVariableA( "NEXUS_TITLE_IDENTITY_LOG", nullptr );
+    DeleteFileW( path );
 }

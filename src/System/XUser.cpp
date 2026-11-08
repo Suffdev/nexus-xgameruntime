@@ -23,6 +23,7 @@
 #include "User/Presence.h"
 #include "User/OfflineIdentity.h"
 #include "../Runtime/Configuration.h"
+#include "../Runtime/TitleIdentityDiagnostics.h"
 #include <afunix.h>
 #include <libxml/parser.h>
 #include <libxml/tree.h>
@@ -530,6 +531,8 @@ static HRESULT sisu_auth( XUserHandle user, const char *userTicket, const char *
     BYTE *buffer = NULL;
     const nexus::GameConfiguration *configuration;
     UINT32 claimedTitle = 0;
+    HRESULT claimResult = E_FAIL;
+    const char *binding = "missing";
     HRESULT hr;
 
     /* A new SISU exchange replaces the title proof. Never retain a token from
@@ -566,20 +569,39 @@ static HRESULT sisu_auth( XUserHandle user, const char *userTicket, const char *
     if ( !WideCharToMultiByte( CP_UTF8, WC_ERR_INVALID_CHARS, stringBuffer, -1, user->userToken, size, NULL, NULL ) )
         goto error;
     configuration = nexus::GetGameConfiguration();
-    if ( configuration && configuration->titleId && SUCCEEDED( get_json_object( object, L"TitleToken", &titleObject ) ) &&
-         SUCCEEDED( get_json_string( titleObject, L"Token", &titleToken ) ) &&
-         SUCCEEDED( title_token_claim_title( titleObject, &claimedTitle ) ) &&
-         claimedTitle == configuration->titleId )
+    binding = configuration ? ( configuration->titleId ? "missing" : "no-title" ) : "no-config";
+    if ( configuration && configuration->titleId )
     {
-        auto bound = hstring_to_utf8( titleToken );
-        if ( bound && *bound )
+        if ( SUCCEEDED( get_json_object( object, L"TitleToken", &titleObject ) ) )
         {
-            user->titleToken = bound;
-            user->titleTokenTitleId = claimedTitle;
+            if ( SUCCEEDED( get_json_string( titleObject, L"Token", &titleToken ) ) )
+            {
+                claimResult = title_token_claim_title( titleObject, &claimedTitle );
+                if ( FAILED( claimResult ) )
+                    binding = claimResult == WEB_E_JSON_VALUE_NOT_FOUND ? "missing" : "malformed";
+                else if ( claimedTitle != configuration->titleId )
+                    binding = "mismatch";
+                else
+                {
+                    auto bound = hstring_to_utf8( titleToken );
+                    if ( bound && *bound )
+                    {
+                        user->titleToken = bound;
+                        user->titleTokenTitleId = claimedTitle;
+                        binding = "bound";
+                    }
+                    else
+                    {
+                        free( bound );
+                        binding = "malformed";
+                    }
+                }
+            }
+            else
+                binding = "malformed";
         }
-        else
-            free( bound );
     }
+    nexus::title_identity::WriteBinding( configuration, claimResult, claimedTitle, binding );
     if ( FAILED( hr = get_json_object( object, L"AuthorizationToken", &authObject ) ) ) goto cleanup;
     if ( FAILED( hr = get_json_object( authObject, L"DisplayClaims", &claims ) ) ) goto cleanup;
     if ( FAILED( hr = get_json_array( claims, L"xui", &xui ) ) ) goto cleanup;
