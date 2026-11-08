@@ -40,6 +40,9 @@ public:
     char *userToken{};
     char *deviceToken{};
     char *titleToken{};
+    /* Title id asserted by the title token's server claims. Zero means no
+     * token is bound to this launch's configured title. */
+    UINT32 titleTokenTitleId{};
     char *deviceAuth{};
     char *deviceAuthAudience{};
     ULONGLONG deviceAuthTime{};
@@ -81,7 +84,7 @@ public:
     HRESULT WINAPI Initialize( const XUserAddOptions options );
     HRESULT WINAPI GetEndpointInfo( const char *url, struct endpoint *info );
     HRESULT WINAPI GetAuthorization( const WCHAR *relyingParty, WCHAR **auth, bool forceRefresh = false );
-    HRESULT GetPresenceAuthorization( const char *url, char **auth, UINT32 *signatureVersion );
+    HRESULT GetPresenceAuthorization( const char *url, char **auth, UINT32 *signatureVersion, UINT32 expectedTitle );
     HRESULT WINAPI GetSignature( UINT32 version, const char *method, const char *url, const char *auth, UINT32 bodySize,
                                  const void *body, char signature[104] );
 };

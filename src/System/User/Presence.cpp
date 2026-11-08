@@ -59,7 +59,7 @@ HRESULT Prepare( XUserHandle user, UINT32 title, std::vector<std::string> &field
         const auto url = "https://userpresence.xboxlive.com/users/xuid(" + std::to_string( user->xuid ) + ")/devices/current/titles/current";
         constexpr char body[] = "{\"state\":\"active\"}";
         UINT32 version = 0;
-        result = user->GetPresenceAuthorization( url.c_str(), &authorization, &version );
+        result = user->GetPresenceAuthorization( url.c_str(), &authorization, &version, title );
         if ( SUCCEEDED( result ) )
         {
             char post[104]{}, remove[104]{};
