@@ -2690,6 +2690,249 @@ HRESULT WINAPI XGameSaveImpl::XGameSaveSubmitUpdateResult( XAsyncBlock *async )
 
 #include "GameSave/Files.h"
 
+/*
+ * Explicit IXGameSaveImpl3 compatibility view.
+ *
+ * The installer-only observed legacy caller asks for IID3 and passes a null
+ * configurationId to InitializeProviderAsync. Only this view resolves null
+ * from the already parsed current package manifest. Explicit non-null values,
+ * the flat IXGameSaveImpl path, all other IIDs, async/state/cloud behavior and
+ * the real HRESULT path are unchanged and forwarded to the shared owner.
+ *
+ * The owner is the process-static XGameSaveImpl singleton from
+ * GetGameSaveInterface(). This view is intentionally retained for the owner's
+ * lifetime; AddRef/Release still follow normal COM reference accounting.
+ */
+class XGameSaveLegacyView final : public IXGameSaveImpl3
+{
+public:
+    explicit XGameSaveLegacyView( XGameSaveImpl *owner ) noexcept : owner_( owner ) {}
+
+    HRESULT WINAPI QueryInterface( REFIID iid, void **out ) noexcept override
+    {
+        if ( !out ) return E_POINTER;
+        *out = nullptr;
+        // QI(IID3) twice returns this same view. All other interfaces belong to
+        // the shared owner, preserving its COM identity/refcount.
+        if ( iid == __uuidof( IXGameSaveImpl3 ) )
+        {
+            *out = static_cast<IXGameSaveImpl3 *>( this );
+            AddRef();
+            return S_OK;
+        }
+        return owner_->QueryInterface( iid, out );
+    }
+    ULONG WINAPI AddRef() noexcept override { return owner_->AddRef(); }
+    ULONG WINAPI Release() noexcept override { return owner_->Release(); }
+
+    HRESULT WINAPI XGameSaveInitializeProvider( XUserHandle user, const char *configurationId, BOOLEAN syncOnDemand,
+                                                XGameSaveProviderHandle *provider ) override
+    {
+        if ( configurationId ) return owner_->XGameSaveInitializeProvider( user, configurationId, syncOnDemand, provider );
+        if ( provider ) *provider = nullptr;
+        std::string scid;
+        HRESULT hr = nexus::GetGameScid( scid );
+        if ( FAILED( hr ) ) return hr;
+        return owner_->XGameSaveInitializeProvider( user, scid.c_str(), syncOnDemand, provider );
+    }
+    HRESULT WINAPI XGameSaveInitializeProviderAsync( XUserHandle user, const char *configurationId, BOOLEAN syncOnDemand,
+                                                     XAsyncBlock *async ) override
+    {
+        if ( configurationId ) return owner_->XGameSaveInitializeProviderAsync( user, configurationId, syncOnDemand, async );
+        std::string scid;
+        HRESULT hr = nexus::GetGameScid( scid );
+        if ( FAILED( hr ) ) return hr;
+        return owner_->XGameSaveInitializeProviderAsync( user, scid.c_str(), syncOnDemand, async );
+    }
+    HRESULT WINAPI XGameSaveInitializeProviderResult( XAsyncBlock *async, XGameSaveProviderHandle *provider ) override
+    {
+        return owner_->XGameSaveInitializeProviderResult( async, provider );
+    }
+    void WINAPI XGameSaveCloseProvider( XGameSaveProviderHandle provider ) override
+    {
+        owner_->XGameSaveCloseProvider( provider );
+    }
+    HRESULT WINAPI XGameSaveGetRemainingQuota( XGameSaveProviderHandle provider, INT64 *remainingQuota ) override
+    {
+        return owner_->XGameSaveGetRemainingQuota( provider, remainingQuota );
+    }
+    HRESULT WINAPI XGameSaveGetRemainingQuotaAsync( XGameSaveProviderHandle provider, XAsyncBlock *async ) override
+    {
+        return owner_->XGameSaveGetRemainingQuotaAsync( provider, async );
+    }
+    HRESULT WINAPI XGameSaveGetRemainingQuotaResult( XAsyncBlock *async, INT64 *remainingQuota ) override
+    {
+        return owner_->XGameSaveGetRemainingQuotaResult( async, remainingQuota );
+    }
+    HRESULT WINAPI XGameSaveDeleteContainer( XGameSaveProviderHandle provider, const char *containerName ) override
+    {
+        return owner_->XGameSaveDeleteContainer( provider, containerName );
+    }
+    HRESULT WINAPI XGameSaveDeleteContainerAsync( XGameSaveProviderHandle provider, const char *containerName,
+                                                  XAsyncBlock *async ) override
+    {
+        return owner_->XGameSaveDeleteContainerAsync( provider, containerName, async );
+    }
+    HRESULT WINAPI XGameSaveDeleteContainerResult( XAsyncBlock *async ) override
+    {
+        return owner_->XGameSaveDeleteContainerResult( async );
+    }
+    HRESULT WINAPI XGameSaveGetContainerInfo( XGameSaveProviderHandle provider, const char *containerName, void *context,
+                                              XGameSaveContainerInfoCallback *callback ) override
+    {
+        return owner_->XGameSaveGetContainerInfo( provider, containerName, context, callback );
+    }
+    HRESULT WINAPI XGameSaveEnumerateContainerInfo( XGameSaveProviderHandle provider, void *context,
+                                                    XGameSaveContainerInfoCallback *callback ) override
+    {
+        return owner_->XGameSaveEnumerateContainerInfo( provider, context, callback );
+    }
+    HRESULT WINAPI XGameSaveEnumerateContainerInfoByName( XGameSaveProviderHandle provider, const char *containerNamePrefix,
+                                                          void *context,
+                                                          XGameSaveContainerInfoCallback *callback ) override
+    {
+        return owner_->XGameSaveEnumerateContainerInfoByName( provider, containerNamePrefix, context, callback );
+    }
+    HRESULT WINAPI XGameSaveCreateContainer( XGameSaveProviderHandle provider, const char *containerName,
+                                             XGameSaveContainerHandle *containerContext ) override
+    {
+        return owner_->XGameSaveCreateContainer( provider, containerName, containerContext );
+    }
+    void WINAPI XGameSaveCloseContainer( XGameSaveContainerHandle context ) override
+    {
+        owner_->XGameSaveCloseContainer( context );
+    }
+    HRESULT WINAPI XGameSaveEnumerateBlobInfo( XGameSaveContainerHandle container, void *context,
+                                               XGameSaveBlobInfoCallback *callback ) override
+    {
+        return owner_->XGameSaveEnumerateBlobInfo( container, context, callback );
+    }
+    HRESULT WINAPI XGameSaveEnumerateBlobInfoByName( XGameSaveContainerHandle container, const char *blobNamePrefix,
+                                                     void *context, XGameSaveBlobInfoCallback *callback ) override
+    {
+        return owner_->XGameSaveEnumerateBlobInfoByName( container, blobNamePrefix, context, callback );
+    }
+    HRESULT WINAPI XGameSaveReadBlobData( XGameSaveContainerHandle container, const char **blobNames, UINT32 *countOfBlobs,
+                                          SIZE_T blobsSize, XGameSaveBlob *blobData ) override
+    {
+        return owner_->XGameSaveReadBlobData( container, blobNames, countOfBlobs, blobsSize, blobData );
+    }
+    HRESULT WINAPI XGameSaveReadBlobDataAsync( XGameSaveContainerHandle container, const char **blobNames,
+                                               UINT32 countOfBlobs, XAsyncBlock *async ) override
+    {
+        return owner_->XGameSaveReadBlobDataAsync( container, blobNames, countOfBlobs, async );
+    }
+    HRESULT WINAPI XGameSaveReadBlobDataResult( XAsyncBlock *async, SIZE_T blobsSize, XGameSaveBlob *blobData,
+                                                UINT32 *countOfBlobs ) override
+    {
+        return owner_->XGameSaveReadBlobDataResult( async, blobsSize, blobData, countOfBlobs );
+    }
+    HRESULT WINAPI XGameSaveCreateUpdate( XGameSaveContainerHandle container, const char *containerDisplayName,
+                                          XGameSaveUpdateHandle *updateContext ) override
+    {
+        return owner_->XGameSaveCreateUpdate( container, containerDisplayName, updateContext );
+    }
+    void WINAPI XGameSaveCloseUpdate( XGameSaveUpdateHandle context ) override
+    {
+        owner_->XGameSaveCloseUpdate( context );
+    }
+    HRESULT WINAPI XGameSaveSubmitBlobWrite( XGameSaveUpdateHandle updateContext, const char *blobName, UINT8 *data,
+                                             SIZE_T byteCount ) override
+    {
+        return owner_->XGameSaveSubmitBlobWrite( updateContext, blobName, data, byteCount );
+    }
+    HRESULT WINAPI XGameSaveSubmitBlobDelete( XGameSaveUpdateHandle updateContext, const char *blobName ) override
+    {
+        return owner_->XGameSaveSubmitBlobDelete( updateContext, blobName );
+    }
+    HRESULT WINAPI XGameSaveSubmitUpdate( XGameSaveUpdateHandle updateContext ) override
+    {
+        return owner_->XGameSaveSubmitUpdate( updateContext );
+    }
+    HRESULT WINAPI XGameSaveSubmitUpdateAsync( XGameSaveUpdateHandle updateContext, XAsyncBlock *async ) override
+    {
+        return owner_->XGameSaveSubmitUpdateAsync( updateContext, async );
+    }
+    HRESULT WINAPI XGameSaveSubmitUpdateResult( XAsyncBlock *async ) override
+    {
+        return owner_->XGameSaveSubmitUpdateResult( async );
+    }
+    HRESULT WINAPI XGameSaveFilesGetFolderWithUiAsync( XUserHandle user, const char *scid, XAsyncBlock *async ) override
+    {
+        return owner_->XGameSaveFilesGetFolderWithUiAsync( user, scid, async );
+    }
+    HRESULT WINAPI XGameSaveFilesGetFolderWithUiResult( XAsyncBlock *async, SIZE_T size, char *folder ) override
+    {
+        return owner_->XGameSaveFilesGetFolderWithUiResult( async, size, folder );
+    }
+    HRESULT WINAPI XGameSaveFilesGetRemainingQuota( XUserHandle user, const char *scid, INT64 *quota ) override
+    {
+        return owner_->XGameSaveFilesGetRemainingQuota( user, scid, quota );
+    }
+
+    // The legacy IID3 pointer historically exposed the owner's defensive
+    // extension slots beyond the declared interface. Preserve the exact
+    // unknown0..unknown15 signatures/order and honest E_NOTIMPL behavior.
+    virtual HRESULT WINAPI Unknown0( void *a, void *b, void *c, void *d ) { return owner_->Unknown0( a, b, c, d ); }
+    virtual HRESULT WINAPI Unknown1( void *a, void *b, void *c, void *d ) { return owner_->Unknown1( a, b, c, d ); }
+    virtual HRESULT WINAPI Unknown2( void *a, void *b, void *c, void *d ) { return owner_->Unknown2( a, b, c, d ); }
+    virtual HRESULT WINAPI Unknown3( void *a, void *b, void *c, void *d ) { return owner_->Unknown3( a, b, c, d ); }
+    virtual HRESULT WINAPI Unknown4( void *a, void *b, void *c, void *d ) { return owner_->Unknown4( a, b, c, d ); }
+    virtual HRESULT WINAPI Unknown5( void *a, void *b, void *c, void *d ) { return owner_->Unknown5( a, b, c, d ); }
+    virtual HRESULT WINAPI Unknown6( void *a, void *b, void *c, void *d ) { return owner_->Unknown6( a, b, c, d ); }
+    virtual HRESULT WINAPI Unknown7( void *a, void *b, void *c, void *d ) { return owner_->Unknown7( a, b, c, d ); }
+    virtual HRESULT WINAPI Unknown8( void *a, void *b, void *c, void *d ) { return owner_->Unknown8( a, b, c, d ); }
+    virtual HRESULT WINAPI Unknown9( void *a, void *b, void *c, void *d ) { return owner_->Unknown9( a, b, c, d ); }
+    virtual HRESULT WINAPI Unknown10( void *a, void *b, void *c, void *d ) { return owner_->Unknown10( a, b, c, d ); }
+    virtual HRESULT WINAPI Unknown11( void *a, void *b, void *c, void *d ) { return owner_->Unknown11( a, b, c, d ); }
+    virtual HRESULT WINAPI Unknown12( void *a, void *b, void *c, void *d ) { return owner_->Unknown12( a, b, c, d ); }
+    virtual HRESULT WINAPI Unknown13( void *a, void *b, void *c, void *d ) { return owner_->Unknown13( a, b, c, d ); }
+    virtual HRESULT WINAPI Unknown14( void *a, void *b, void *c, void *d ) { return owner_->Unknown14( a, b, c, d ); }
+    virtual HRESULT WINAPI Unknown15( void *a, void *b, void *c, void *d ) { return owner_->Unknown15( a, b, c, d ); }
+
+private:
+    XGameSaveImpl *owner_;
+};
+
+XGameSaveImpl::XGameSaveImpl() noexcept = default;
+XGameSaveImpl::~XGameSaveImpl() noexcept = default;
+
+HRESULT WINAPI XGameSaveImpl::QueryInterface( REFIID iid, void **out ) noexcept
+{
+    if ( !out ) return E_POINTER;
+    *out = nullptr;
+    if ( iid == __uuidof( IXGameSaveImpl3 ) )
+    {
+        // One stable, owner-owned view per XGameSaveImpl instance. The view
+        // owns no independent reference: AddRef/Release delegate to this owner,
+        // preserving COM identity and accounting without a cycle.
+        try
+        {
+            std::lock_guard<std::mutex> lock( legacyMutex_ );
+            if ( !legacyView_ ) legacyView_ = std::make_unique<XGameSaveLegacyView>( this );
+            *out = static_cast<IXGameSaveImpl3 *>( legacyView_.get() );
+            AddRef();
+            return S_OK;
+        }
+        catch ( const std::bad_alloc & )
+        {
+            *out = nullptr;
+            return E_OUTOFMEMORY;
+        }
+        catch ( ... )
+        {
+            *out = nullptr;
+            return E_FAIL;
+        }
+    }
+    if ( iid != __uuidof( IUnknown ) && iid != __uuidof( IXGameSaveImpl ) && iid != __uuidof( IXGameSaveImpl2 ) &&
+         iid != __uuidof( IXGameSaveImpl4 ) )
+        return E_NOINTERFACE;
+    *out = static_cast<IXGameSaveImpl4 *>( this );
+    AddRef();
+    return S_OK;
+}
+
 IXGameSaveImpl *GetGameSaveInterface() noexcept
 {
     static XGameSaveImpl save;

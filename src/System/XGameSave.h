@@ -3,21 +3,17 @@
 #include "../private.h"
 #include <xgamesave.h>
 #include <atomic>
+#include <memory>
+#include <mutex>
+
+class XGameSaveLegacyView;
 
 class XGameSaveImpl final : public IXGameSaveImpl4
 {
 public:
-    HRESULT WINAPI QueryInterface( REFIID iid, void **out ) noexcept override
-    {
-        if ( !out ) return E_POINTER;
-        *out = nullptr;
-        if ( iid != __uuidof( IUnknown ) && iid != __uuidof( IXGameSaveImpl ) && iid != __uuidof( IXGameSaveImpl2 ) &&
-             iid != __uuidof( IXGameSaveImpl3 ) && iid != __uuidof( IXGameSaveImpl4 ) )
-            return E_NOINTERFACE;
-        *out = static_cast<IXGameSaveImpl4 *>( this );
-        AddRef();
-        return S_OK;
-    }
+    XGameSaveImpl() noexcept;
+    ~XGameSaveImpl() noexcept;
+    HRESULT WINAPI QueryInterface( REFIID iid, void **out ) noexcept override;
     ULONG WINAPI AddRef() noexcept override
     {
         return ++ref;
@@ -141,5 +137,7 @@ public:
 
 private:
     std::atomic<ULONG> ref{ 1 };
+    std::mutex legacyMutex_;
+    std::unique_ptr<XGameSaveLegacyView> legacyView_;
 };
 IXGameSaveImpl *GetGameSaveInterface() noexcept;
