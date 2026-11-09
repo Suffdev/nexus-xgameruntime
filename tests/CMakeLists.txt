@@ -81,6 +81,18 @@ target_compile_features(test_nexus_save PRIVATE cxx_std_23)
 target_link_options(test_nexus_save PRIVATE -static -static-libgcc -static-libstdc++)
 set_target_properties(test_nexus_save PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
+add_executable(test_nexus_save_iid3 Nexus/test_save_iid3.cpp)
+target_link_libraries(test_nexus_save_iid3 PRIVATE xgameruntime-impl GTest::gtest_main)
+target_compile_features(test_nexus_save_iid3 PRIVATE cxx_std_23)
+target_link_options(test_nexus_save_iid3 PRIVATE -static -static-libgcc -static-libstdc++)
+set_target_properties(test_nexus_save_iid3 PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
+add_executable(test_nexus_save_iid3_invalid Nexus/test_save_iid3_invalid.cpp)
+target_link_libraries(test_nexus_save_iid3_invalid PRIVATE xgameruntime-impl GTest::gtest_main)
+target_compile_features(test_nexus_save_iid3_invalid PRIVATE cxx_std_23)
+target_link_options(test_nexus_save_iid3_invalid PRIVATE -static -static-libgcc -static-libstdc++)
+set_target_properties(test_nexus_save_iid3_invalid PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
 add_executable(test_nexus_user Nexus/test_user.cpp)
 target_sources(test_nexus_user PRIVATE Nexus/test_base64.cpp)
 target_link_libraries(test_nexus_user PRIVATE xgameruntime-impl GTest::gtest_main)
