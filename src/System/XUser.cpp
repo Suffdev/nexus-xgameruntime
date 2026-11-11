@@ -1276,15 +1276,15 @@ static HRESULT user_wait_init( XUserHandle user )
 static BOOLEAN match_wildcard( const WCHAR *pat, UINT32 patLen, const WCHAR *inp, UINT32 inpLen )
 {
     UINT32 lastMatch = -1, lastWildcard = -1, patOff = 0, inpOff = 0;
-
-    while ( inpOff < inpLen && patOff < patLen )
+    while ( inpOff < inpLen )
     {
-        if ( pat[patOff] == '*' )
+        if ( patOff < patLen && pat[patOff] == '*' )
         {
             lastWildcard = patOff++;
             lastMatch = inpOff;
         }
-        else if ( pat[patOff] == '?' || pat[patOff] == inp[inpOff] )
+        else if ( patOff < patLen && (pat[patOff] == '?' ||
+                  !wcsnicmp( pat + patOff, inp + inpOff, 1 )) )
         {
             patOff++;
             inpOff++;
@@ -1294,11 +1294,10 @@ static BOOLEAN match_wildcard( const WCHAR *pat, UINT32 patLen, const WCHAR *inp
             patOff = lastWildcard + 1;
             inpOff = ++lastMatch;
         }
-        else
-            return FALSE;
+        else return FALSE;
     }
-
-    return inpOff == inpLen && patOff == patLen;
+    while ( patOff < patLen && pat[patOff] == '*' ) patOff++;
+    return patOff == patLen;
 }
 
 HRESULT WINAPI XUser::GetEndpointInfo( const char *url, struct endpoint *info )
